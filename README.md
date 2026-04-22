@@ -114,10 +114,15 @@ ollama serve
 ```
 
 Optional overrides:
-
+PC:
 ```powershell
 $env:OLLAMA_MODEL = "qwen3.5:9b"
 $env:OLLAMA_URL = "http://localhost:11434/api/generate"
+```
+Mac: Add to ~/.zshrc
+```
+export OLLAMA_MODEL="qwen3.5:9b"
+export OLLAMA_URL="http://localhost:11434/api/generate"
 ```
 
 ### 2. Start the backend
