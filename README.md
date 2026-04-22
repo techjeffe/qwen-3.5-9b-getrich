@@ -127,7 +127,7 @@ export OLLAMA_MODEL="qwen3.5:9b"
 export OLLAMA_URL="http://localhost:11434/api/generate"
 ```
 
-### 2. Start the backend
+### 2. Start the backend (ideally in a venv)
 
 ```powershell
 cd backend
