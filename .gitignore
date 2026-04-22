@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test/cache artifacts
+.pytest_cache/
+pytest-cache-files-*/
+
+# Local databases
+trading_system.db
+trading_system.db-shm
+trading_system.db-wal
+backend/trading_system.db
+backend/trading_system.db-shm
+backend/trading_system.db-wal
+
+# Frontend build artifacts
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+frontend/node_modules/
+backend/node_modules/
+
+# Virtual environments
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

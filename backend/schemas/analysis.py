@@ -223,6 +223,40 @@ class AnalysisRequest(BaseModel):
         return v
 
 
+class ModelInputArticle(BaseModel):
+    """Article/source item included in the compiled model input."""
+
+    source: str = Field(default="")
+    title: str = Field(default="")
+    description: str = Field(default="")
+    keywords: List[str] = Field(default_factory=list)
+
+
+class ModelInputDebug(BaseModel):
+    """Debug payload showing the context fed into the model."""
+
+    news_context: str = Field(
+        default="",
+        description="Compiled headline/detail text passed into the sentiment model"
+    )
+    validation_context: str = Field(
+        default="",
+        description="Structured validation summary passed into the sentiment model"
+    )
+    price_context: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Market price context supplied alongside the prompt"
+    )
+    articles: List[ModelInputArticle] = Field(
+        default_factory=list,
+        description="RSS/news articles included in the compiled model input"
+    )
+    per_symbol_prompts: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Exact compiled prompt text sent to each symbol specialist"
+    )
+
+
 class AnalysisResponse(BaseModel):
     """
     Response schema for analysis endpoint.
@@ -258,6 +292,17 @@ class AnalysisResponse(BaseModel):
         default=None,
         description="Generated trading signal"
     )
+
+    # Structured market validation inputs
+    market_validation: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Per-symbol structured validation data from pullable macro/market sources"
+    )
+
+    model_inputs: Optional[ModelInputDebug] = Field(
+        default=None,
+        description="Debug view of the compiled inputs supplied to the sentiment model"
+    )
     
     # Backtest results (optional)
     backtest_results: Optional[BacktestResults] = Field(
@@ -285,6 +330,15 @@ class AnalysisResponse(BaseModel):
                 },
                 "aggregated_sentiment": {...},
                 "trading_signal": {"signal_type": "LONG"},
+                "market_validation": {
+                    "QQQ": {"status": "ok", "summary": "10Y TIPS real yield 1.92% (down)"}
+                },
+                "model_inputs": {
+                    "validation_context": "QQQ [OK]: 10Y TIPS real yield 1.92% (down)",
+                    "articles": [
+                        {"source": "BBC World", "title": "Example headline", "description": "Example details", "keywords": ["rates", "fed"]}
+                    ]
+                },
                 "backtest_results": {"total_return": 12.5},
                 "processing_time_ms": 3420.5,
                 "status": "SUCCESS"

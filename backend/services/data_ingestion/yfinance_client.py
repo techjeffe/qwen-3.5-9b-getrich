@@ -231,6 +231,37 @@ class PriceClient:
             print(f"Error getting OHLCV for {symbol}: {e}")
         
         return None
+
+    def get_ohlcv_data_range(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        interval: str = "15m"
+    ) -> Optional[pd.DataFrame]:
+        """
+        Get OHLCV data for a symbol over an explicit datetime range.
+
+        Args:
+            symbol: Ticker symbol
+            start: Range start datetime
+            end: Range end datetime
+            interval: yfinance interval (e.g. 15m, 30m, 60m, 1d)
+
+        Returns:
+            DataFrame with OHLCV data or None on error
+        """
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start, end=end, interval=interval)
+
+            if not df.empty:
+                return df.sort_index()
+
+        except Exception as e:
+            print(f"Error getting OHLCV range for {symbol}: {e}")
+
+        return None
     
     def get_multiple_symbols_data(
         self,
