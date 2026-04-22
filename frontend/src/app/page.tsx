@@ -338,7 +338,7 @@ function SignalHero({
                 <div className="flex flex-wrap gap-2 mb-4">
                     {recommendations.map((r: Recommendation, i: number) => (
                         <RecommendationBadge
-                            key={i}
+                            key={`${r.symbol}-${r.action}-${r.leverage || "na"}-${i}`}
                             rec={r}
                             onClick={() => onRecommendationClick?.(r)}
                             hasExecution={trackedTrades?.some((trade) => trade.symbol === r.symbol && trade.action === r.action && !!trade.actual_execution)}
@@ -396,7 +396,7 @@ function SignalHero({
 
             {symbolWhyItems.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-5">
-                    {symbolWhyItems.map((item: { symbol: string; action: string; leverage: string; reasoning: string }) => {
+                    {symbolWhyItems.map((item: { symbol: string; action: string; leverage: string; reasoning: string }, index: number) => {
                         const tone = item.action === "BUY"
                             ? "border-emerald-500/25 bg-emerald-500/8"
                             : item.action === "SELL"
@@ -409,7 +409,7 @@ function SignalHero({
                                 : "text-slate-300";
 
                         return (
-                            <div key={item.symbol} className={`rounded-xl border p-4 ${tone}`}>
+                            <div key={item.symbol || `symbol-why-${index}`} className={`rounded-xl border p-4 ${tone}`}>
                                 <div className="flex items-center justify-between gap-3">
                                     <p className="text-base font-black text-white">{item.symbol}</p>
                                     <p className={`text-sm font-semibold ${labelColor}`}>
@@ -566,8 +566,8 @@ function AdvancedInputsPanel({
                     <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
                         <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">FRED / EIA Validation Blocks</p>
                         <div className="space-y-3">
-                            {validationEntries.map(([symbol, payload]) => (
-                                <div key={symbol} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                            {validationEntries.map(([symbol, payload], index) => (
+                                <div key={symbol || `validation-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
                                     <div className="flex items-center justify-between gap-3">
                                         <p className="text-sm font-black text-white">{symbol}</p>
                                         <span className="text-[10px] uppercase tracking-wider text-slate-400">{payload.status}</span>
@@ -597,8 +597,8 @@ function AdvancedInputsPanel({
                     <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
                         <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Per-Symbol Final Prompts</p>
                         <div className="space-y-3">
-                            {Object.entries(modelInputs?.per_symbol_prompts ?? {}).map(([symbol, prompt]) => (
-                                <div key={symbol} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                            {Object.entries(modelInputs?.per_symbol_prompts ?? {}).map(([symbol, prompt], index) => (
+                                <div key={symbol || `prompt-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
                                     <p className="text-sm font-black text-white mb-2">{symbol}</p>
                                     <pre className="max-h-72 overflow-auto text-xs text-slate-300 whitespace-pre-wrap break-words font-mono leading-relaxed">
                                         {prompt}
@@ -1226,7 +1226,7 @@ export default function Home() {
                         {/* Signal Hero (results) */}
                         <AnimatePresence>
                             {isAnalyzing && (
-                                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+                                <motion.div key="analysis-status" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
                                     <AnalysisStatusCard
                                         stageLabel={stageLabel}
                                         progressPct={progressPct}
@@ -1238,7 +1238,7 @@ export default function Home() {
                                 </motion.div>
                             )}
                             {result && (
-                                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-5">
+                                <motion.div key={`analysis-result-${result.request_id || "latest"}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-5">
                                     <SignalHero
                                         signal={result.trading_signal}
                                         sentimentScores={result.sentiment_scores}

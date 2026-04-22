@@ -56,7 +56,7 @@ export default function SentimentTicker({ data }: SentimentTickerProps) {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {Object.entries(data).map(([symbol, s], i) => (
                     <motion.div
-                        key={symbol}
+                        key={symbol || `sentiment-${i}`}
                         initial={{ opacity: 0, x: -12 }}
                         animate={{ opacity: 1, x: 0 }}
                         transition={{ delay: i * 0.08 }}
