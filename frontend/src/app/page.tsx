@@ -994,11 +994,6 @@ export default function Home() {
         return () => clearInterval(id);
     }, [fetchOllamaStatus]);
 
-    // Auto-scroll feed
-    useEffect(() => {
-        feedBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [feed]);
-
     const toggleArticle = (idx: number) => {
         setExpandedIdxs((prev) => {
             const next = new Set(prev);
