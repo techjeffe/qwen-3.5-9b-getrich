@@ -106,7 +106,7 @@ Note these instructions are intentionally vague - if you don't have the experien
 
 - Python 3.10+
 - Node.js 20.9+
-- [Ollama](https://ollama.com) with Qwen 3.5 9b
+- [Ollama](https://ollama.com) with Qwen 3.5 9b (or model of choice to fit your hardware speed - ensure you environment variables are set correctly if using a different model)
 
 ### 1. Start Ollama
 
