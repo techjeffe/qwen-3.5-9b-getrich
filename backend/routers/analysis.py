@@ -326,12 +326,15 @@ async def analyze_market(
     request: AnalysisRequest,
     db: Session = Depends(get_db)
 ):
-    import requests as _req, os as _os
-    ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
     try:
-        _req.get(f"{ollama_root}/api/tags", timeout=3)
+        ollama_status = get_ollama_status()
+        ollama_root = str(ollama_status.get("ollama_root") or "")
+        active_model = str(ollama_status.get("active_model") or "").strip() or "unknown model"
     except Exception:
-        model = _os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+        import os as _os
+
+        ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
+        model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Ollama is not running at {ollama_root}. Start it with: ollama run {model}"
@@ -348,7 +351,13 @@ async def analyze_market(
 
         posts = await _ingest_data(effective_request)
         price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
-        sentiment_results = await _analyze_sentiment(posts, effective_request.symbols, price_context, prompt_overrides)
+        sentiment_results = await _analyze_sentiment(
+            posts,
+            effective_request.symbols,
+            price_context,
+            prompt_overrides,
+            active_model,
+        )
         trading_signal = _generate_trading_signal(sentiment_results, quotes_by_symbol)
 
         backtest_results = None
@@ -475,12 +484,13 @@ async def _analyze_sentiment(
     symbols: List[str],
     price_context: Dict[str, Any],
     prompt_overrides: Optional[Dict[str, str]] = None,
+    model_name: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     aggregated = _build_aggregated_news_context(posts)
     if not aggregated.strip():
         raise ValueError("No post content available for sentiment analysis")
 
-    engine = SentimentEngine()
+    engine = SentimentEngine(model_name=model_name)
     engine.clear_cache()  # Ensure fresh analysis for each run
     analyses = await asyncio.gather(*[
         engine.analyze(

@@ -1,6 +1,9 @@
 """
-Truth Social Scraper using Playwright
-Scrapes geopolitical and market-related posts from Truth Social
+Truth Social direct scraper placeholder.
+
+Live Truth Social coverage in this app currently comes from the third-party
+`trumpstruth.org` RSS feed handled in `parser.py`, not from Playwright-driven
+browser scraping.
 """
 
 import asyncio
@@ -31,7 +34,7 @@ class TruthSocialPost:
 
 class TruthSocialScraper:
     """
-    Async scraper for Truth Social using Playwright.
+    Async scraper placeholder for direct Truth Social scraping via Playwright.
     
     Features:
     - Headless browser automation
@@ -79,9 +82,10 @@ class TruthSocialScraper:
         max_retries: int = 3
     ) -> List[TruthSocialPost]:
         """
-        Scrape Truth Social posts matching the query.
-        Requires a live Playwright browser session and authenticated account.
-        Returns empty list until real scraping is implemented.
+        Placeholder for direct Truth Social scraping.
+        Current production Truth Social intake comes from the third-party
+        `trumpstruth.org` RSS feed in the RSS parser. This method returns no
+        posts until a direct browser-based implementation is added.
         """
         # Real scraping requires: logged-in Truth Social session, Playwright
         # browser launched via __aenter__, and actual DOM parsing.

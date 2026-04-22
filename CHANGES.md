@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-04-22 - Runtime model visibility and Truth Social feed clarification
+
+### `backend/routers/analysis.py`
+- Finished the Ollama active-model plumbing so both stream and non-stream analysis paths resolve and use the same served model
+- Added a stable `GET /api/v1/ollama/status` system route for frontend polling
+
+### `backend/services/data_ingestion/scraper.py`
+- Clarified that direct Playwright scraping is still a placeholder
+- Documented that live Truth Social coverage currently comes from the third-party `trumpstruth.org` RSS feed path in the parser
+
+### `frontend/src/app/api/ollama/status/route.ts`
+- Added a frontend proxy route for Ollama runtime status polling
+
+### `frontend/src/app/page.tsx`
+- Replaced hardcoded `Qwen 3.5 9b` UI labels with the actual active served Ollama model
+- Added a runtime status block in Engine Config so users can see whether Ollama is reachable and which model is in use
+- Updated idle and error copy to reflect dynamic local model selection instead of one fixed model name
+
+### `README.md`
+- Updated setup and architecture notes to describe the dynamic Ollama model behavior
+- Clarified that Truth Social posts currently enter the system through a third-party RSS feed, not direct browser scraping
+- Documented the Ollama status endpoint
+
 ## 2026-04-21 - Validation routing, Advanced Mode, and symbol-specific specialist prompts
 
 ### `backend/routers/analysis.py`

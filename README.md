@@ -27,13 +27,14 @@ Frontend:
 Backend:
 - FastAPI analysis pipeline and config endpoints
 - RSS ingestion, yfinance price pulls, FRED/EIA validation bundle
-- Qwen symbol-specialist runs, signal generation, and rolling-window backtest
+- Local Ollama-served symbol-specialist runs, signal generation, and rolling-window backtest
 
 Model flow:
 - RSS items are filtered for relevance before analysis
 - Each symbol gets its own specialist prompt and its own narrowed validation context
 - `USO` uses `EIA` validation
 - `BITO`, `QQQ`, and `SPY` use `FRED` validation
+- The dashboard polls Ollama and shows the active served model instead of assuming a fixed model name
 
 ## Features
 
@@ -41,6 +42,7 @@ Model flow:
 - Live article feed with expandable cards and model reasoning
 - Market price panel for USO, BITO, QQQ, and SPY
 - Structured validation layer from official pullable sources
+- Runtime model status so the UI reflects whichever model Ollama is currently serving
 - Advanced Mode for inspecting:
 - RSS articles fed to the model
 - compiled news context
@@ -59,6 +61,12 @@ Model flow:
 - `SPY` - `FRED` `BAMLH0A0HYM2` and `BAMLC0A0CM` for credit spreads
 
 These validation signals are injected into the symbol specialist prompt as per-symbol context, not one shared generic block.
+
+## Feed Sources
+
+- Most geopolitical and market headlines come from standard RSS feeds
+- Truth Social coverage currently comes from the third-party RSS feed `https://trumpstruth.org/feed`
+- Direct Playwright scraping of Truth Social is not the active production path right now
 
 ## Signal Logic
 
@@ -108,7 +116,7 @@ Note these instructions are intentionally vague - if you don't have the experien
 
 - Python 3.10+
 - Node.js 20.9+
-- [Ollama](https://ollama.com) with Qwen 3.5 9b (or model of choice to fit your hardware speed - ensure you environment variables are set correctly if using a different model)
+- [Ollama](https://ollama.com) with any compatible local model you want to serve (Qwen 3.5 9b is one tested option)
 
 ### 1. Start Ollama
 
@@ -128,6 +136,8 @@ Mac: Add to ~/.zshrc
 export OLLAMA_MODEL="qwen3.5:9b"
 export OLLAMA_URL="http://localhost:11434/api/generate"
 ```
+
+If `OLLAMA_MODEL` is unset, the backend will use the first model currently being served by Ollama, and the dashboard will show that runtime model name after polling `/api/v1/ollama/status`.
 
 ### 2. Start the backend (ideally in a venv)
 
@@ -190,6 +200,10 @@ Example request:
 - `model_inputs.news_context` - compiled text sent into the model
 - `model_inputs.validation_context` - validation summary injected into the prompt
 - `model_inputs.per_symbol_prompts` - exact final prompt preview for each analyst
+
+### `GET /api/v1/ollama/status`
+
+Returns whether Ollama is reachable plus the active served model the backend will use for analysis.
 
 ### `GET /api/v1/prices`
 

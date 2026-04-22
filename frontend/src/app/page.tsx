@@ -90,6 +90,15 @@ type PnLSummary = {
     };
     trades: PnLTrade[];
 };
+type OllamaStatus = {
+    reachable: boolean;
+    ollama_root?: string;
+    configured_model?: string;
+    active_model?: string;
+    available_models?: string[];
+    resolution?: string;
+    error?: string;
+};
 
 type AnalysisStage = {
     key: string;
@@ -820,6 +829,7 @@ export default function Home() {
     const [latestLogMessage, setLatestLogMessage] = useState("");
     const [selectedRecommendation, setSelectedRecommendation] = useState<Recommendation | null>(null);
     const [advancedMode, setAdvancedMode] = useState(false);
+    const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
     const feedBottomRef = useRef<HTMLDivElement>(null);
     const articleCounter = useRef(0);
     const autoRunStartedRef = useRef(false);
@@ -917,6 +927,15 @@ export default function Home() {
         } catch {}
     }, []);
 
+    const fetchOllamaStatus = useCallback(async () => {
+        try {
+            const response = await fetch("/api/ollama/status", { cache: "no-store" });
+            if (response.ok) {
+                setOllamaStatus(await response.json());
+            }
+        } catch {}
+    }, []);
+
     useEffect(() => {
         const timerStart = streamStartedAt ?? analysisStartedAt;
         if (!isAnalyzing || !timerStart) return;
@@ -969,6 +988,12 @@ export default function Home() {
         fetchPnl();
     }, [fetchPnl]);
 
+    useEffect(() => {
+        void fetchOllamaStatus();
+        const id = setInterval(fetchOllamaStatus, 15_000);
+        return () => clearInterval(id);
+    }, [fetchOllamaStatus]);
+
     // Auto-scroll feed
     useEffect(() => {
         feedBottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -983,6 +1008,9 @@ export default function Home() {
     };
 
     const isOllamaError = error?.toLowerCase().includes("ollama");
+    const activeModelLabel = ollamaStatus?.active_model || ollamaStatus?.configured_model || "No model detected";
+    const ollamaCommandModel = ollamaStatus?.active_model || ollamaStatus?.configured_model || "the-first-model-you-served";
+    const feedCountLabel = "7 RSS sources incl. Trump Truth RSS";
     const currentRequestTrades = (pnlSummary?.trades ?? []).filter((trade) => trade.request_id === result?.request_id);
     const selectedTrade = selectedRecommendation
         ? currentRequestTrades.find((trade) => trade.symbol === selectedRecommendation.symbol && trade.action === selectedRecommendation.action)
@@ -1076,16 +1104,27 @@ export default function Home() {
                             <h2 className="text-sm font-semibold text-slate-300 mb-4">Engine Config</h2>
                             <div className="space-y-2.5 text-sm mb-5">
                                 {[
-                                    { label: "Model", val: "Qwen 3.5 9b", cls: "text-blue-300 font-mono text-xs" },
-                                    { label: "Feeds", val: "7 RSS Sources", cls: "font-mono text-xs" },
+                                    { label: "Model", val: activeModelLabel, cls: "text-blue-300 font-mono text-xs" },
+                                    { label: "Feeds", val: feedCountLabel, cls: "font-mono text-xs" },
                                     { label: "Symbols", val: trackedSymbols.join(", "), cls: "font-mono text-xs" },
-                                    { label: "Leverage", val: "3×", cls: "text-orange-400 font-mono text-xs font-bold" },
+                                    { label: "Leverage", val: "3x", cls: "text-orange-400 font-mono text-xs font-bold" },
                                 ].map(({ label, val, cls }) => (
                                     <div key={label} className="flex justify-between border-b border-slate-700/40 pb-2 last:border-0">
                                         <span className="text-slate-400">{label}</span>
                                         <span className={cls}>{val}</span>
                                     </div>
                                 ))}
+                            </div>
+                            <div className="mb-4 rounded-xl border border-slate-700/50 bg-slate-900/50 px-3 py-2 text-xs">
+                                <p className="text-slate-500 uppercase tracking-wider mb-1">Runtime</p>
+                                <p className={ollamaStatus?.reachable ? "text-emerald-300" : "text-orange-300"}>
+                                    {ollamaStatus?.reachable ? "Ollama reachable" : "Waiting for Ollama"}
+                                </p>
+                                <p className="text-slate-400 mt-1">
+                                    {ollamaStatus?.reachable
+                                        ? `Using served model: ${activeModelLabel}`
+                                        : "The dashboard will use whichever local model Ollama is currently serving."}
+                                </p>
                             </div>
                             <button
                                 type="button"
@@ -1176,7 +1215,7 @@ export default function Home() {
                                         <p className="text-sm mt-0.5 opacity-80">{error}</p>
                                         {isOllamaError && (
                                             <code className="text-xs mt-2 block bg-black/40 px-3 py-1.5 rounded font-mono">
-                                                ollama run qwen3.5:9b
+                                                ollama run {ollamaCommandModel}
                                             </code>
                                         )}
                                     </div>
@@ -1226,8 +1265,8 @@ export default function Home() {
                                         Geopolitical Sentiment → Trade Signal
                                     </h2>
                                     <p className="text-slate-500 text-sm max-w-md mx-auto">
-                                        Fetches live headlines, runs Qwen 3.5 9b sentiment analysis,
-                                        generates BUY/SELL signals for {trackedSymbols.join(", ")} — backtests on 6 months of data.
+                                        Fetches live headlines, runs local Ollama sentiment analysis with {activeModelLabel},
+                                        generates BUY/SELL signals for {trackedSymbols.join(", ")} and backtests on 6 months of data.
                                     </p>
                                     <p className="text-slate-600 text-xs mt-4">
                                         {config.auto_run_enabled ? `Auto-runs in ${mm}:${ss.toString().padStart(2, "0")}` : "Auto-run disabled in admin settings"}
