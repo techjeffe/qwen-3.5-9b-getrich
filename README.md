@@ -100,11 +100,13 @@ qwen-3.5-9b-getrich/
 
 ## Setup
 
+Note these instructions are intentionally vague - if you don't have the experience (or know how to ask a LLM) to set this up - you should probably not be giving it money to trade stocks. 
+
 ### Prerequisites
 
 - Python 3.10+
 - Node.js 20.9+
-- [Ollama](https://ollama.com) with Qwen 3.5 9b
+- [Ollama](https://ollama.com) with Qwen 3.5 9b (or model of choice to fit your hardware speed - ensure you environment variables are set correctly if using a different model)
 
 ### 1. Start Ollama
 
@@ -114,13 +116,18 @@ ollama serve
 ```
 
 Optional overrides:
-
+PC:
 ```powershell
 $env:OLLAMA_MODEL = "qwen3.5:9b"
 $env:OLLAMA_URL = "http://localhost:11434/api/generate"
 ```
+Mac: Add to ~/.zshrc
+```
+export OLLAMA_MODEL="qwen3.5:9b"
+export OLLAMA_URL="http://localhost:11434/api/generate"
+```
 
-### 2. Start the backend
+### 2. Start the backend (ideally in a venv)
 
 ```powershell
 cd backend
