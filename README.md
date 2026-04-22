@@ -100,6 +100,8 @@ qwen-3.5-9b-getrich/
 
 ## Setup
 
+Note these instructions are intentionally vague - if you don't have the experience (or know how to ask a LLM) to set this up - you should probably not be giving it money to trade stocks. 
+
 ### Prerequisites
 
 - Python 3.10+
