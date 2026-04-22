@@ -3,6 +3,7 @@ Sentiment Engine using Ollama Llama-3-70b
 Analyzes geopolitical text for market bluster vs policy changes
 """
 
+import os
 import json
 import time
 from datetime import datetime
@@ -64,11 +65,11 @@ class SentimentEngine:
     - Fallback handling
     """
     
-    # Configuration
-    MODEL_NAME = "llama3"  # or "llama3.2:90b" if available
-    TEMPERATURE = 0.1  # Low temperature for deterministic output
-    MAX_TOKENS = 512
-    API_URL = "http://localhost:11434/api/generate"
+    # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
+    MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+    TEMPERATURE = 0.1
+    MAX_TOKENS = 2048
+    API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     
     # Caching
     _cache: Dict[str, SentimentAnalysisResponse] = {}
@@ -111,35 +112,14 @@ class SentimentEngine:
             if (datetime.utcnow() - cached.timestamp).total_seconds() < self._cache_ttl:
                 return cached
         
-        try:
-            # Determine which prompt to use
-            if include_context and context_data:
-                response = await self._analyze_with_context(
-                    text, text_source, context_data
-                )
-            else:
-                response = await self._analyze_text(text, text_source)
-            
-            # Cache the result
-            self._cache[cache_key] = response
-            
-            return response
-            
-        except Exception as e:
-            print(f"Error analyzing text: {e}")
-            return SentimentAnalysisResponse(
-                request_id="",
-                timestamp=datetime.utcnow(),
-                is_bluster=False,
-                bluster_score=0.0,
-                bluster_indicators=[],
-                is_policy_change=False,
-                policy_score=0.0,
-                policy_indicators=[],
-                impact_severity="low",
-                confidence=0.0,
-                reasoning=f"Analysis failed: {str(e)}"
-            )
+        # Let exceptions propagate — callers must handle Ollama being unavailable
+        if include_context and context_data:
+            response = await self._analyze_with_context(text, text_source, context_data)
+        else:
+            response = await self._analyze_text(text, text_source)
+
+        self._cache[cache_key] = response
+        return response
     
     async def _analyze_text(
         self,
@@ -184,20 +164,18 @@ class SentimentEngine:
         
         return self._parse_response(response_data, text_source)
     
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove <think>...</think> blocks emitted by Qwen3 models."""
+        import re
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
     async def _call_ollama(self, prompt: str) -> Dict[str, Any]:
-        """
-        Call Ollama API to generate response.
-        
-        Args:
-            prompt: Formatted prompt to send
-            
-        Returns:
-            Parsed JSON response from Ollama
-        """
         payload = {
             "model": self.MODEL_NAME,
             "prompt": prompt,
             "stream": False,
+            "think": False,  # Disables Qwen3 thinking mode; response goes to "response" field
             "options": {
                 "temperature": self.TEMPERATURE,
                 "num_predict": self.MAX_TOKENS,
@@ -247,7 +225,8 @@ class SentimentEngine:
         """
         # Extract the JSON from the LLM response
         raw_text = ollama_response.get("response", "")
-        
+        raw_text = self._strip_thinking(raw_text)
+
         try:
             # Try to find JSON in the response
             json_start = raw_text.find("{")
@@ -261,13 +240,9 @@ class SentimentEngine:
                 data = json.loads(raw_text)
                 
         except json.JSONDecodeError:
-            # If JSON parsing fails, return default response
-            print("Warning: Could not parse LLM response as JSON")
-            data = {
-                "market_bluster": {"is_bluster": False, "bluster_score": 0.0, "confidence": 0.5},
-                "policy_change": {"is_policy_change": False, "policy_score": 0.0, "confidence": 0.5},
-                "trading_signal": {"signal_type": "HOLD", "confidence_score": 0.0}
-            }
+            raise ValueError(
+                f"Model did not return valid JSON. Raw response:\n{raw_text[:500]}"
+            )
         
         # Extract fields from parsed data
         bluster = data.get("market_bluster", {})

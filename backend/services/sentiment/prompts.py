@@ -220,11 +220,12 @@ def format_context_aware_prompt(
     recent_sentiment: str = ""
 ) -> str:
     """Format the context-aware prompt with market data."""
-    return CONTEXT_AWARE_PROMPT.format(
-        date=date,
-        uso_price=uso_price,
-        bito_price=bito_price,
-        spy_price=spy_price,
-        recent_sentiment=recent_sentiment,
-        text=text
-    )
+    result = CONTEXT_AWARE_PROMPT
+    result = result.replace("{date}", date)
+    result = result.replace("{uso_price}", str(uso_price))
+    result = result.replace("{bito_price}", str(bito_price))
+    result = result.replace("{spy_price}", str(spy_price))
+    result = result.replace("{recent_sentiment}", recent_sentiment)
+    result = result.replace("{text}", text)
+    result = result.replace("{{", "{").replace("}}", "}")
+    return result

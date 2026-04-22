@@ -9,18 +9,14 @@ from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 
-# Import schemas
-from .schemas.analysis import AnalysisRequest, AnalysisResponse
-from .database.engine import get_db
-from .database.models import init_db, Base
+from database.models import init_db
 
 # Import routers
-from .routers import analysis_router
+from routers import router as analysis_router
 
 
 @asynccontextmanager
@@ -94,35 +90,6 @@ async def get_metrics():
         "avg_latency_ms": 0.0,  # Would be tracked in production
         "database_status": "connected"
     }
-
-
-# Main analysis endpoint (delegated to router)
-@app.post(
-    "/analyze",
-    response_model=AnalysisResponse,
-    tags=["Analysis"],
-    summary="Run full sentiment analysis pipeline",
-    description="""
-Trigger the complete analysis pipeline:
-1. Scrape social media and news feeds
-2. Analyze sentiment using Llama-3-70b
-3. Generate trading signals
-4. Run rolling window backtest (optional)
-    """,
-    response_class=JSONResponse
-)
-async def analyze_market(
-    request: AnalysisRequest,
-    db = Depends(get_db)
-):
-    """
-    Execute the full analysis pipeline and return trading signal.
-    
-    This endpoint is handled by the analysis router.
-    """
-    # The actual implementation is in backend/routers/analysis.py
-    # This endpoint delegates to the router's analyze_market function
-    pass
 
 
 # Include routers

@@ -1,261 +1,163 @@
-# 3x Leveraged Sentiment-Driven Trading System
+# Sentiment Trading Alpha
 
-A sentiment-driven trading system that analyzes geopolitical and social media data to generate trading signals for 3x leveraged ETFs (USO, BITO).
+Geopolitical sentiment pipeline that ingests live RSS headlines, runs them through Qwen 3.5 9b, and generates specific BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY with configurable leverage. Auto-runs every 30 minutes.
 
-## Architecture Overview
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Frontend (Next.js)                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ Single Button│  │Sentiment Ticker│ │ Rolling Window Chart │  │
-│  │   Dashboard  │  │              │  │                      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↕ HTTP/REST
-┌─────────────────────────────────────────────────────────────────┐
-│                      Backend API (FastAPI)                      │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │              /api/v1/analyze (Main Endpoint)             │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↕ Async Pipeline
-┌─────────────────────────────────────────────────────────────────┐
-│                    Data Ingestion Layer                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ Playwright   │  │ BeautifulSoup│  │ yfinance Client      │  │
-│  │ Scraper      │  │ RSS Parser   │  │ (SPY/USO/BITO)       │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↕ Sentiment Analysis
-┌─────────────────────────────────────────────────────────────────┐
-│                    Sentiment Engine (Ollama)                    │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Llama-3-70b: Market Bluster vs Policy Change Detection  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↕ Signal Generation
-┌─────────────────────────────────────────────────────────────────┐
-│                    Backtesting Engine (VectorBT)                │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Rolling Window Optimization (14-day lookback)            │  │
-│  │ Walk-forward analysis with performance metrics           │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↕ Storage
-┌─────────────────────────────────────────────────────────────────┐
-│                    Database (SQLite)                            │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Analysis Results, Sentiment Data, Trading Signals        │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                     Frontend (Next.js)                      │
+│  Sidebar: Engine Config · Market Prices · Signal Logic      │
+│  Main: BUY/SELL Recommendations · Article Feed · Charts     │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ SSE + REST
+┌─────────────────────────────────────────────────────────────┐
+│                   Backend (FastAPI)                         │
+│  POST /api/v1/analyze/stream   — SSE pipeline               │
+│  POST /api/v1/analyze          — batch                      │
+│  GET  /api/v1/prices           — live quotes                │
+│  GET  /health  GET /metrics                                  │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ Async pipeline
+┌─────────────────────────────────────────────────────────────┐
+│                  Data Ingestion                             │
+│  RSS Parser (7 feeds incl. Trump Truth Social)              │
+│  yfinance fast_info — USO · BITO · QQQ · SPY               │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ One LLM call
+┌─────────────────────────────────────────────────────────────┐
+│         Ollama — Qwen 3.5 9b  (think: false)               │
+│  Bluster score (−1→+1) · Policy score (0→1)                │
+│  Trading signal + per-symbol recommendations               │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ Signal + backtest
+┌─────────────────────────────────────────────────────────────┐
+│             Rolling Window Optimizer + SQLite               │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **Real-time Sentiment Analysis**: Uses Ollama Llama-3-70b to detect market bluster vs genuine policy changes
-- **Multi-Source Data Ingestion**: Scrapes Truth Social and RSS feeds for geopolitical news
-- **Rolling Window Backtesting**: VectorBT-powered walk-forward optimization with 14-day lookback
-- **Single-Button Execution**: Simplified dashboard for rapid trade triggering
-- **Risk Management**: Built-in stop-loss (2%) and take-profit (3%) calculations
-- **Performance Tracking**: Sharpe ratio, max drawdown, win rate metrics
+- **Specific trade recommendations** — `BUY QQQ 3x`, `SELL USO 1x`, etc., with confidence-based leverage
+- **Live article feed** — expandable cards show full text + model reasoning per article
+- **Market price panel** — live USO, BITO, QQQ, SPY quotes with % change; refreshes every 60 s
+- **Auto-run every 30 minutes** — countdown timer in the sidebar; triggers automatically
+- **7 RSS sources** — Trump Truth Social, BBC World, Al Jazeera, NYT World, MarketWatch, NPR, Guardian — each gets a fair article cap so no single source starves the others
+- **Full article text in sentiment** — both headline and body fed to the LLM; Trump Truth full post text included
+- **One LLM call per run** — result shared across all 4 symbols (fast, ~5 s on 9b model)
+- **Rolling window backtest** — 14-day lookback, 6 months of price history
+
+## Signal Logic
+
+| Bluster Score | Policy Score | Signal | Leverage |
+|---------------|--------------|--------|----------|
+| < −0.5        | < 0.3        | SELL   | 3× if confidence > 75% |
+| Any           | > 0.7        | BUY    | 3× if confidence > 75% |
+| Otherwise     | Otherwise    | HOLD   | — |
 
 ## Project Structure
 
 ```
-qwen-booking-app/
+qwen-3.5-9b-getrich/
 ├── backend/
-│   ├── __init__.py
-│   ├── main.py                    # FastAPI application entry point
+│   ├── main.py                          # FastAPI app
 │   ├── routers/
-│   │   ├── __init__.py
-│   │   └── analysis.py            # /analyze endpoint implementation
+│   │   └── analysis.py                  # /analyze/stream · /analyze · /prices
 │   ├── schemas/
-│   │   ├── __init__.py
-│   │   ├── analysis.py            # Pydantic models for requests/responses
-│   │   ├── sentiment.py           # Sentiment score models
-│   │   └── trading.py             # Trading signal models
+│   │   └── analysis.py                  # Pydantic models (TradingSignal.recommendations)
 │   ├── database/
-│   │   ├── __init__.py
-│   │   ├── engine.py              # SQLAlchemy session management
-│   │   └── models.py              # Database models (AnalysisResult)
+│   │   ├── engine.py                    # SQLAlchemy session
+│   │   └── models.py                    # Post, AnalysisResult
 │   └── services/
 │       ├── data_ingestion/
-│       │   ├── __init__.py
-│       │   ├── scraper.py         # Playwright Truth Social scraper
-│       │   ├── parser.py          # BeautifulSoup RSS feed parser
-│       │   └── yfinance_client.py # yfinance price data client
+│       │   ├── parser.py                # feedparser RSS (7 feeds)
+│       │   ├── scraper.py               # Truth Social stub (replaced by RSS feed)
+│       │   └── yfinance_client.py       # fast_info quotes + historical data
 │       ├── sentiment/
-│       │   ├── __init__.py
-│       │   ├── engine.py          # Ollama Llama-3-70b sentiment analysis
-│       │   └── prompts.py         # Geopolitical risk detection prompts
+│       │   ├── engine.py                # Ollama call (think:false, 2048 tokens)
+│       │   └── prompts.py               # Bluster + policy prompts
 │       └── backtesting/
-│           ├── __init__.py
-│           ├── vectorbt_engine.py # VectorBT integration
-│           └── optimization.py    # Rolling window optimization
+│           └── optimization.py          # Rolling window optimizer
 ├── frontend/
-│   ├── package.json
-│   ├── next.config.js
+│   ├── postcss.config.js                # Required for Tailwind CSS
 │   ├── tailwind.config.js
-│   ├── tsconfig.json
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── page.tsx           # Main dashboard page
-│   │   │   └── api/
-│   │   │       └── analyze/
-│   │   │           └── route.ts    # API proxy to backend
-│   │   └── components/
-│   │       └── Dashboard/
-│   │           ├── SingleButton.tsx      # Main action button
-│   │           ├── SentimentTicker.tsx   # Real-time sentiment display
-│   │           ├── RiskGauge.tsx         # Risk assessment visualization
-│   │           └── RollingWindowChart.tsx # Backtest results chart
-├── requirements.txt               # Python dependencies
-└── README.md                      # This file
+│   └── src/
+│       ├── app/
+│       │   ├── page.tsx                 # Main dashboard (sidebar + article feed + results)
+│       │   ├── layout.tsx
+│       │   ├── globals.css
+│       │   └── api/
+│       │       ├── analyze/stream/route.ts   # SSE proxy
+│       │       └── prices/route.ts           # Price proxy
+│       └── components/Dashboard/
+│           ├── SentimentTicker.tsx      # Animated bluster/policy bar charts
+│           └── RollingWindowChart.tsx   # Backtest recharts bar chart
+├── CHANGES.md
+├── test-qwen.md                         # Requirements log
+└── README.md
 ```
 
-## Setup Instructions
+## Setup
 
 ### Prerequisites
 
 - Python 3.10+
 - Node.js 18+
-- Ollama with Llama-3-70b model installed
-- Playwright browsers (for scraping)
+- [Ollama](https://ollama.com) with Qwen 3.5 9b
 
-### Backend Setup
+### 1 — Start Ollama
 
-1. **Install Python dependencies:**
-   ```bash
-   cd backend
-   pip install -r requirements.txt
-   ```
+```powershell
+ollama pull qwen3.5:9b
+ollama serve
+```
 
-2. **Install Playwright browsers:**
-   ```bash
-   playwright install
-   ```
+> Override model: `$env:OLLAMA_MODEL = "qwen3.5:9b"`  
+> Override URL: `$env:OLLAMA_URL = "http://localhost:11434/api/generate"`
 
-3. **Start Ollama and pull Llama-3-70b:**
-   ```bash
-   ollama pull llama3
-   ```
+### 2 — Backend
 
-4. **Run the backend server:**
-   ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-   ```
+```powershell
+cd backend
+pip install -r ../requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-### Frontend Setup
+### 3 — Frontend
 
-1. **Install Node dependencies:**
-   ```bash
-   cd frontend
-   npm install
-   ```
+```powershell
+cd frontend
+npm install
+npm run dev
+```
 
-2. **Set environment variable (optional):**
-   ```bash
-   export NEXT_PUBLIC_API_URL=http://localhost:8000
-   ```
+Open [http://localhost:3000](http://localhost:3000).
 
-3. **Run the development server:**
-   ```bash
-   npm run dev
-   ```
+> **Note:** After the first `npm install`, you must restart the dev server once so PostCSS picks up `postcss.config.js` and compiles Tailwind.
 
-### Database Setup
+## API Reference
 
-The system uses SQLite with automatic schema initialization on startup. No additional setup required.
+### `POST /api/v1/analyze/stream`
 
-## API Documentation
+SSE pipeline. Events: `log`, `article`, `result`, `error`.
 
-### POST /api/v1/analyze
+```json
+{ "symbols": ["USO", "BITO", "QQQ", "SPY"], "max_posts": 50, "include_backtest": true, "lookback_days": 14 }
+```
 
-Trigger the complete analysis pipeline.
+### `GET /api/v1/prices`
 
-**Request Body:**
 ```json
 {
-  "symbols": ["USO", "BITO"],
-  "max_posts": 50,
-  "include_backtest": true,
-  "lookback_days": 14
+  "USO":  { "price": 128.25, "change": 7.80, "change_pct": 6.47, "day_low": 121.03, "day_high": 128.88 },
+  "BITO": { "price": 10.29,  "change": -0.12, "change_pct": -1.15, ... },
+  "QQQ":  { ... },
+  "SPY":  { ... }
 }
 ```
 
-**Response:**
-```json
-{
-  "request_id": "abc123",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "symbols_analyzed": ["USO", "BITO"],
-  "posts_scraped": 47,
-  "sentiment_scores": {
-    "USO": {
-      "market_bluster": -0.65,
-      "policy_change": 0.25,
-      "confidence": 0.82,
-      "reasoning": "Strong bearish sentiment from Truth Social posts"
-    }
-  },
-  "aggregated_sentiment": {
-    "market_bluster": -0.65,
-    "policy_change": 0.25,
-    "confidence": 0.82
-  },
-  "trading_signal": {
-    "signal_type": "SHORT",
-    "confidence_score": 0.78,
-    "entry_symbol": "USO",
-    "stop_loss_pct": 2.0,
-    "take_profit_pct": 3.0,
-    "urgency": "HIGH"
-  },
-  "backtest_results": {
-    "total_return": 15.5,
-    "sharpe_ratio": 1.8,
-    "max_drawdown": -8.2,
-    "win_rate": 62.5,
-    "lookback_days": 14,
-    "walk_forward_steps": 98
-  },
-  "processing_time_ms": 3240,
-  "status": "SUCCESS"
-}
-```
-
-## Trading Signal Logic
-
-The system generates trading signals based on sentiment analysis:
-
-| Bluster Score | Policy Score | Signal | Urgency |
-|---------------|--------------|--------|---------|
-| < -0.5        | < 0.3        | SHORT  | HIGH if abs(bluster) > 0.7 |
-| > 0.7         | Any          | LONG   | HIGH if policy > 0.8 |
-| Otherwise     | Any          | HOLD   | LOW     |
-
-## Risk Management
-
-- **Leverage**: 3x (configurable in backtesting)
-- **Stop Loss**: 2% per trade
-- **Take Profit**: 3% per trade
-- **Position Sizing**: Manual calculation based on account equity
-
-## Performance Metrics
-
-The rolling window backtest calculates:
-
-- **Total Return**: Cumulative return across all trades
-- **Annualized Return**: Yearly-compounded return rate
-- **Sharpe Ratio**: Risk-adjusted returns (risk-free rate = 2%)
-- **Max Drawdown**: Largest peak-to-trough decline
-- **Win Rate**: Percentage of profitable trades
+### `GET /health` · `GET /metrics`
 
 ## Disclaimer
 
-⚠️ **WARNING**: This system is for educational purposes only. Trading leveraged ETFs involves significant risk and may not be suitable for all investors. Past performance does not guarantee future results. Always conduct your own research and consult with a financial advisor before making trading decisions.
-
-## License
-
-MIT License - See LICENSE file for details.
+Educational use only. Trading leveraged ETFs carries significant risk. Not financial advice.

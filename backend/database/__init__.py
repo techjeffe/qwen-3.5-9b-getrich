@@ -1,10 +1,10 @@
 """Database package initialization"""
 
-from .engine import get_db_engine, SessionLocal
+from .engine import engine, SessionLocal
 from .models import Base, Post, AnalysisResult, TradingSignal
 
 __all__ = [
-    "get_db_engine",
+    "engine",
     "SessionLocal",
     "Base",
     "Post",

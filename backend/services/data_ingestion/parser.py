@@ -36,12 +36,15 @@ class RSSFeedParser:
     - Date-based filtering
     """
     
-    # Configured RSS feeds for geopolitical coverage
+    # Configured RSS feeds for geopolitical/market coverage (verified working)
     GEOPOLITICAL_FEEDS = {
-        "reuters_middle_east": "https://www.reuters.com/rss/world/middle_east",
-        "ap_news_world": "https://apnews.com/rss/10001185",
-        "aljazeera_all": "https://www.aljazeera.com/xml/rss/all.xml",
-        "bloomberg_energy": "https://feeds.bloomberg.com/news/markets/energy.rss",
+        "trump_truth":     "https://trumpstruth.org/feed",
+        "bbc_world":       "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "aljazeera_all":   "https://www.aljazeera.com/xml/rss/all.xml",
+        "nyt_world":       "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "marketwatch":     "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
+        "npr_world":       "https://feeds.npr.org/1017/rss.xml",
+        "guardian_world":  "https://www.theguardian.com/world/rss",
     }
     
     # Geopolitical keywords for filtering
@@ -194,7 +197,7 @@ class RSSFeedParser:
         # Clean up whitespace
         text = re.sub(r'\s+', ' ', text)
         
-        return text[:2000]  # Limit to 2000 chars
+        return text[:5000]
     
     def _extract_keywords(self, text: str) -> List[str]:
         """Extract matching geopolitical keywords from text."""

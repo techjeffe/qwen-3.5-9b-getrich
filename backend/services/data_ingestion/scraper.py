@@ -80,34 +80,14 @@ class TruthSocialScraper:
     ) -> List[TruthSocialPost]:
         """
         Scrape Truth Social posts matching the query.
-        
-        Args:
-            query: Search query for geopolitical/market content
-            limit: Maximum number of posts to scrape
-            max_retries: Maximum retry attempts per request
-            
-        Returns:
-            List of scraped posts with metadata
+        Requires a live Playwright browser session and authenticated account.
+        Returns empty list until real scraping is implemented.
         """
-        posts = []
-        retries = 0
-        
-        while len(posts) < limit and retries < max_retries:
-            try:
-                await self._scrape_with_delay()
-                scraped = await self._extract_posts(query, limit - len(posts))
-                posts.extend(scraped)
-                
-                if len(scraped) == 0:
-                    break
-                    
-            except Exception as e:
-                retries += 1
-                print(f"Scrape attempt {retries} failed: {e}")
-                if retries >= max_retries:
-                    break
-        
-        return posts
+        # Real scraping requires: logged-in Truth Social session, Playwright
+        # browser launched via __aenter__, and actual DOM parsing.
+        # TODO: implement _extract_posts with real Playwright navigation.
+        print("Truth Social scraper: not yet implemented — returning no posts")
+        return []
     
     async def _scrape_with_delay(self) -> None:
         """Execute scrape with rate limiting and jitter."""

@@ -5,7 +5,7 @@ export async function POST(request: NextRequest) {
         const body = await request.json();
 
         // Forward to backend API
-        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze`, {
+        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analyze`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",

@@ -9,12 +9,11 @@ from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Float, JSON, Boolean, ForeignKey,
     Index, event
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 from .engine import engine
 
-# Base class for all models
-Base = type("Base", (object,), {"metadata": None})
+Base = declarative_base()
 
 
 class Post(Base):
@@ -29,7 +28,7 @@ class Post(Base):
     source = Column(String(50), nullable=False)  # e.g., "truth_social", "reuters_rss"
     author = Column(String(200), nullable=True)
     timestamp = Column(DateTime(timezone=True), default=func.now())
-    sentiment_analysis: Optional[Dict[str, Any]] = Column(JSON, nullable=True)
+    sentiment_analysis = Column(JSON, nullable=True)
     is_analyzed = Column(Boolean, default=False)
 
     __table_args__ = (
@@ -56,10 +55,10 @@ class AnalysisResult(Base):
     signal = Column(JSON, nullable=False)
     
     # Backtest results if run
-    backtest_results: Optional[Dict[str, Any]] = Column(JSON, nullable=True)
-    
-    # Metadata about the analysis run
-    metadata = Column(JSON, nullable=True)
+    backtest_results = Column(JSON, nullable=True)
+
+    # Metadata about the analysis run (named run_metadata to avoid shadowing SQLAlchemy's Base.metadata)
+    run_metadata = Column(JSON, nullable=True)
 
     __table_args__ = (
         Index("ix_analysis_timestamp", "timestamp"),

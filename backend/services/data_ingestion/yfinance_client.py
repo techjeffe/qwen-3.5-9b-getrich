@@ -35,7 +35,7 @@ class PriceClient:
     """
     
     # Supported symbols for the trading system
-    SUPPORTED_SYMBOLS = {"SPY", "USO", "BITO", "SQQQ", "UNG"}
+    SUPPORTED_SYMBOLS = {"SPY", "USO", "BITO", "QQQ", "SQQQ", "UNG"}
     
     def __init__(self, cache_duration: int = 300):
         """
@@ -85,32 +85,18 @@ class PriceClient:
         return results
     
     def get_realtime_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Fetch real-time quote for a single symbol.
-        
-        Args:
-            symbol: Ticker symbol
-            
-        Returns:
-            Dictionary with current quote data or None if unavailable
-        """
+        """Fetch real-time quote using fast_info (low-latency, no full info call)."""
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
+            fi = yf.Ticker(symbol).fast_info
             return {
                 "symbol": symbol,
-                "current_price": info.get("regularMarketPrice"),
-                "previous_close": info.get("previousClose"),
-                "day_low": info.get("dayLow", {}).get("low"),
-                "day_high": info.get("dayHigh", {}).get("high"),
-                "regular_market_volume": info.get("regularMarketVolume"),
-                "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
-                "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
-                "market_cap": info.get("marketCap"),
+                "current_price": fi.last_price,
+                "previous_close": fi.previous_close,
+                "day_low": fi.day_low,
+                "day_high": fi.day_high,
+                "regular_market_volume": fi.shares,
                 "timestamp": datetime.utcnow()
             }
-            
         except Exception as e:
             print(f"Error fetching quote for {symbol}: {e}")
             return None

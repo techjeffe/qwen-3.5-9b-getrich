@@ -93,6 +93,12 @@ class TradingSignal(BaseModel):
         description="Trade urgency level"
     )
 
+    # Specific actionable recommendations
+    recommendations: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description='List of {action, symbol, leverage} e.g. {"action":"BUY","symbol":"QQQ","leverage":"3x"}'
+    )
+
     model_config = {
         "json_schema_extra": {
             "example": {
@@ -210,7 +216,7 @@ class AnalysisRequest(BaseModel):
     @classmethod
     def validate_symbols(cls, v: List[str]) -> List[str]:
         """Validate that symbols are valid ETF tickers."""
-        valid_symbols = {"SPY", "USO", "BITO", "SQQQ", "UNG"}
+        valid_symbols = {"SPY", "USO", "BITO", "QQQ", "SQQQ", "UNG"}
         for symbol in v:
             if symbol not in valid_symbols:
                 raise ValueError(f"Invalid symbol: {symbol}. Valid options: {valid_symbols}")
@@ -274,12 +280,12 @@ class AnalysisResponse(BaseModel):
                 "symbols_analyzed": ["USO", "BITO"],
                 "posts_scraped": 47,
                 "sentiment_scores": {
-                    "USO": {"market_bluster": -0.65, "policy_change": 0.82, ...},
-                    "BITO": {"market_bluster": -0.58, "policy_change": 0.79, ...}
+                    "USO": {"market_bluster": -0.65, "policy_change": 0.82},
+                    "BITO": {"market_bluster": -0.58, "policy_change": 0.79}
                 },
                 "aggregated_sentiment": {...},
-                "trading_signal": {"signal_type": "LONG", ...},
-                "backtest_results": {"total_return": 12.5, ...},
+                "trading_signal": {"signal_type": "LONG"},
+                "backtest_results": {"total_return": 12.5},
                 "processing_time_ms": 3420.5,
                 "status": "SUCCESS"
             }
