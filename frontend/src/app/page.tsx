@@ -713,11 +713,17 @@ function TradeExecutionModal({
 }
 
 function ActualTradeComparisonCard({ pnlSummary, currentRequestId }: { pnlSummary: PnLSummary | null; currentRequestId?: string }) {
-    const currentTrades = (pnlSummary?.trades ?? [])
-        .filter((trade) => trade.request_id === currentRequestId && trade.actual_execution)
-        .sort((a, b) => a.symbol.localeCompare(b.symbol));
+    const executedTrades = (pnlSummary?.trades ?? [])
+        .filter((trade) => trade.actual_execution)
+        .sort((a, b) => {
+            const aTime = new Date(a.actual_execution?.executed_at || 0).getTime();
+            const bTime = new Date(b.actual_execution?.executed_at || 0).getTime();
+            return bTime - aTime;
+        });
+    const currentTrades = executedTrades.filter((trade) => trade.request_id === currentRequestId);
+    const visibleTrades = (currentTrades.length > 0 ? currentTrades : executedTrades).slice(0, 6);
 
-    if (!pnlSummary || currentTrades.length === 0) return null;
+    if (!pnlSummary || visibleTrades.length === 0) return null;
 
     return (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="bg-gray-800 rounded-xl p-5 border border-gray-700">
@@ -726,9 +732,15 @@ function ActualTradeComparisonCard({ pnlSummary, currentRequestId }: { pnlSummar
                     Your Trades vs Recommendations
                 </h3>
                 <span className="text-xs text-gray-500">
-                    {pnlSummary.execution_summary.executed_trades} logged trades · {pnlSummary.execution_summary.match_rate.toFixed(0)}% matched
+                    {currentTrades.length > 0
+                        ? `${currentTrades.length} from this run`
+                        : `Showing latest ${visibleTrades.length} logged trades`}
                 </span>
             </div>
+
+            <p className="text-sm text-gray-400 mb-4">
+                Logged trades now stay visible across auto re-runs even after a new request id is created.
+            </p>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
                 <div className="rounded-lg bg-gray-700/50 p-4">
@@ -748,7 +760,7 @@ function ActualTradeComparisonCard({ pnlSummary, currentRequestId }: { pnlSummar
             </div>
 
             <div className="space-y-3">
-                {currentTrades.map((trade) => (
+                {visibleTrades.map((trade) => (
                     <div key={trade.id} className="rounded-lg border border-gray-700 bg-gray-900/50 p-4">
                         <div className="flex items-center justify-between gap-3">
                             <p className="text-sm font-black text-white">

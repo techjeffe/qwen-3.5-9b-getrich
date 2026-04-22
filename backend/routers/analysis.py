@@ -29,6 +29,7 @@ from services.data_ingestion.scraper import TruthSocialScraper
 from services.data_ingestion.parser import RSSFeedParser
 from services.data_ingestion.yfinance_client import PriceClient
 from services.data_ingestion.market_validation import MarketValidationClient
+from services.ollama import get_ollama_status
 from services.sentiment.engine import SentimentEngine
 from services.sentiment.prompts import get_symbol_specialist_focus, format_symbol_specialist_context_prompt
 from services.backtesting.optimization import RollingWindowOptimizer
@@ -125,6 +126,25 @@ async def get_market_prices():
     return result
 
 
+@router.get("/ollama/status", tags=["System"])
+async def get_ollama_runtime_status():
+    """Return reachability and active model details from Ollama."""
+    try:
+        return get_ollama_status()
+    except Exception as exc:
+        import os as _os
+
+        return {
+            "reachable": False,
+            "ollama_root": _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", ""),
+            "configured_model": _os.getenv("OLLAMA_MODEL", "").strip(),
+            "active_model": "",
+            "available_models": [],
+            "resolution": "unreachable",
+            "error": str(exc),
+        }
+
+
 def _sse(message: str) -> str:
     return f"data: {json.dumps({'type': 'log', 'message': message})}\n\n"
 
@@ -159,15 +179,16 @@ async def analyze_market_stream(request: AnalysisRequest):
             effective_request = _apply_request_defaults(request, config)
             prompt_overrides = config.symbol_prompt_overrides or {}
             # ── Preflight: verify Ollama is reachable ────────────────────────
-            import requests as _req
-            import os as _os
-            ollama_base = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-            ollama_root = ollama_base.replace("/api/generate", "")
             try:
-                _req.get(f"{ollama_root}/api/tags", timeout=3)
-                yield _sse("Ollama reachable — model ready")
+                ollama_status = get_ollama_status()
+                ollama_root = str(ollama_status.get("ollama_root") or "")
+                active_model = str(ollama_status.get("active_model") or "").strip() or "unknown model"
+                yield _sse(f"Ollama reachable — using {active_model}")
             except Exception:
-                model = _os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+                import os as _os
+
+                ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
+                model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
                 yield _sse_error(
                     f"Cannot reach Ollama at {ollama_root}. "
                     f"Start it with: ollama run {model}"
@@ -214,8 +235,8 @@ async def analyze_market_stream(request: AnalysisRequest):
             yield _sse(f"Validation data fetched: {', '.join(validation_ready) or 'no structured data'}")
 
             # Step 3: Sentiment Analysis
-            yield _sse("Running Qwen 3.5 9b sentiment analysis on collected text...")
-            sentiment_results = await _analyze_sentiment(posts, effective_request.symbols, price_context, prompt_overrides)
+            yield _sse(f"Running sentiment analysis with {active_model} on collected text...")
+            sentiment_results = await _analyze_sentiment(posts, effective_request.symbols, price_context, prompt_overrides, active_model)
             for sym, s in sentiment_results.items():
                 bluster = s.get('bluster_score', 0)
                 policy = s.get('policy_score', 0)

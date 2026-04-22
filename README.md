@@ -1,6 +1,8 @@
 # Sentiment Trading Alpha
 
-Geopolitical sentiment pipeline that ingests live RSS headlines, overlays structured FRED and EIA validation data, runs symbol-specific Qwen 3.5 9b specialist analysis, and generates BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY with configurable leverage. Auto-runs every 30 minutes.
+Geopolitical sentiment pipeline that ingests live RSS headlines, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY with configurable leverage. Auto-runs every 30 minutes.
+
+This app is untested in the real world, not financial advice, and for amusement purposes only. 
 
 Frontend baseline:
 

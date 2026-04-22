@@ -74,7 +74,7 @@ class SentimentEngine:
     """
     
     # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
-    MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+    MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.1
     MAX_TOKENS = 3072
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -83,7 +83,7 @@ class SentimentEngine:
     _cache: Dict[str, SentimentAnalysisResponse] = {}
     _cache_ttl: int = 300  # 5 minutes
     
-    def __init__(self, api_url: Optional[str] = None):
+    def __init__(self, api_url: Optional[str] = None, model_name: Optional[str] = None):
         """
         Initialize sentiment engine.
         
@@ -91,6 +91,7 @@ class SentimentEngine:
             api_url: Ollama API URL (default: localhost:11434)
         """
         self.api_url = api_url or self.API_URL
+        self.model_name = (model_name or self.MODEL_NAME or "").strip()
         self.session = requests.Session()
         self._cache = {}
     
@@ -224,7 +225,7 @@ class SentimentEngine:
 
     def _call_ollama_sync(self, prompt: str) -> Dict[str, Any]:
         payload = {
-            "model": self.MODEL_NAME,
+            "model": self.model_name,
             "prompt": prompt,
             "stream": False,
             "think": False,  # Disables Qwen3 thinking mode; response goes to "response" field
