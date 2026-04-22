@@ -1,7 +1,7 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "3x Sentiment Trading System",
+  title: "Sentiment Trading Alpha",
   description: "Sentiment-driven trading signals for 3x leveraged ETFs",
 };
 
