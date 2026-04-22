@@ -1043,6 +1043,9 @@ export default function Home() {
                                 {isAnalyzing ? "Analyzing…" : result ? "Signal Ready" : "Idle"}
                             </p>
                         </div>
+                        <Link href="/about" className="text-xs text-slate-300 hover:text-white border border-slate-700 rounded-lg px-3 py-2">
+                            About
+                        </Link>
                         <Link href="/admin" className="text-xs text-blue-300 hover:text-blue-200 border border-blue-500/20 rounded-lg px-3 py-2">
                             Admin
                         </Link>
