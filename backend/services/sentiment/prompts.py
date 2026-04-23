@@ -183,31 +183,23 @@ def format_stage2_proxy_appendix(symbol: str, proxy_terms: list[str]) -> str:
     )
 
 
-RED_TEAM_REVIEW_PROMPT = """You are a Senior Quantitative Risk Manager performing a red-team review of FINAL trading signals.
+RED_TEAM_REVIEW_PROMPT = """You are a Senior Quantitative Risk Manager performing a red-team review of trading signals.
+Challenge the current recommendations — do not default to agreement.
 
-Your job is to challenge the current recommendations, not to agree with them by default.
+STRICT BREVITY RULES — violating these causes parse failures:
+- summary: 1 sentence, max 20 words
+- portfolio_risks: max 2 items, each max 10 words
+- source_bias_notes: max 15 words (or empty string if no bias)
+- thesis: max 15 words, cite one specific headline or metric
+- antithesis: max 15 words, cite one specific risk or counter-indicator
+- evidence: max 3 items, each max 10 words
+- key_risks: max 3 items, each max 8 words
+- atr_basis: max 10 words (e.g. "ATR 1.2, stop at 1.5x ATR")
+- rationale: max 20 words explaining any signal change (or "Confirmed" if unchanged)
 
-Review the provided final signals and produce:
-- Thesis: why the current signal could be right
-- Antithesis: the strongest reason it could be wrong right now
-- Context check against the latest news items for regime shift risk
-- Divergence analysis between sentiment and technicals (especially RSI, MACD, ATR)
-- Portfolio correlation / de-coupling risk across the recommended trades
-- Confidence calibration, including source concentration / source bias penalties if confidence leans too heavily on one source
-- Adjusted signal and ATR-based stop loss
+Return JSON only — no markdown, no commentary, no trailing text after the closing brace.
 
-Hard rules:
-- Do not invent prices or indicators not present in the context.
-- If the current signal looks fragile or exhausted, say so clearly.
-- If sentiment is strongly bearish but RSI is oversold (<30), consider exhaustion / squeeze risk.
-- If sentiment is strongly bullish but RSI is overbought (>70), consider blow-off / reversal risk.
-- If medium urgency relies on one dominant source, penalize confidence materially.
-- Use ATR when recommending stop loss. Explain the ATR basis in plain English.
-- Every thesis, antithesis, and rationale must cite specific evidence from the provided context, such as named headlines, source names, RSI/MACD/ATR readings, or validation metrics.
-- If the adjusted signal differs from the current recommendation, explicitly explain what changed and why.
-- Return JSON only.
-
-Return exactly this JSON schema:
+Return exactly this JSON (no extra fields):
 {{
   "summary": string,
   "portfolio_risks": [string],
@@ -229,8 +221,7 @@ Return exactly this JSON schema:
   ]
 }}
 
-Do NOT include adjusted_confidence or stop_loss_pct — Python computes those from your evidence and key_risks counts.
-Focus your effort on the quality of thesis, antithesis, evidence, key_risks, and rationale — cite specific headlines, RSI/MACD/ATR values, or source names present in the context.
+Do NOT include adjusted_confidence or stop_loss_pct — Python computes those.
 
 Context:
 {context_json}

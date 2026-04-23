@@ -2578,7 +2578,7 @@ async def _run_red_team_review(
     )
     prompt = format_red_team_review_prompt(json.dumps(context, ensure_ascii=True, default=str, indent=2))
     engine = SentimentEngine(model_name=model_name)
-    raw = await engine._call_ollama(prompt, model_override=model_name, force_json=True, max_tokens=1800)
+    raw = await engine._call_ollama(prompt, model_override=model_name, force_json=True, max_tokens=700)
     raw_text = engine._strip_thinking(raw.get("response", ""))
     text = raw_text.strip()
     start = text.find("{")
