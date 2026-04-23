@@ -87,7 +87,7 @@ class SentimentEngine:
     
     # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
-    TEMPERATURE = 0.35
+    TEMPERATURE = 0.10
     MAX_TOKENS = 8192
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     
@@ -350,19 +350,52 @@ class SentimentEngine:
         if adjusted_signal.upper() == blue_signal.upper():
             base += 0.08
         else:
-            base -= 0.14
+            base -= 0.22
         # More evidence → more confident; more risks → less confident
-        base += min(0.14, len(evidence) * 0.028)
-        base -= min(0.12, len(key_risks) * 0.025)
+        base += min(0.12, len(evidence) * 0.024)
+        base -= min(0.14, len(key_risks) * 0.028)
         if source_bias_applied:
             base -= 0.10
-        return round(max(0.28, min(0.87, base)), 3)
+        return round(max(0.24, min(0.84, base)), 3)
 
     @staticmethod
     def compute_red_team_stop_loss(adjusted_urgency: str) -> float:
         """Rule-based stop loss from urgency — removes the LLM float guess."""
         return {"HIGH": 3.5, "MEDIUM": 2.5, "LOW": 1.8}.get(
             str(adjusted_urgency).upper(), 2.5
+        )
+
+    @staticmethod
+    def red_team_override_is_material(
+        adjusted_signal: str,
+        blue_signal: str,
+        evidence: list,
+        key_risks: list,
+        source_bias_applied: bool,
+    ) -> bool:
+        """Require stronger evidence before red team is allowed to overturn blue team."""
+        normalized_adjusted = str(adjusted_signal or "HOLD").upper().strip()
+        normalized_blue = str(blue_signal or "HOLD").upper().strip()
+        if normalized_adjusted == normalized_blue:
+            return True
+
+        confidence = SentimentEngine.compute_red_team_confidence(
+            adjusted_signal=normalized_adjusted,
+            blue_signal=normalized_blue,
+            evidence=evidence,
+            key_risks=key_risks,
+            source_bias_applied=source_bias_applied,
+        )
+
+        evidence_count = len(evidence or [])
+        risk_count = len(key_risks or [])
+        if normalized_adjusted == "HOLD":
+            return confidence >= 0.58 and (evidence_count >= 2 or risk_count >= 2)
+        return (
+            confidence >= 0.64
+            and evidence_count >= 3
+            and evidence_count >= risk_count + 1
+            and not source_bias_applied
         )
 
     @staticmethod

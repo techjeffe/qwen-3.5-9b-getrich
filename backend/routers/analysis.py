@@ -620,6 +620,8 @@ async def rerun_analysis_snapshot(
     mark_analysis_started(db, rerun_request_id)
 
     try:
+        previous_state = _latest_previous_analysis_state(db)
+        previous_response = previous_state.get("response") if previous_state else None
         sentiment_results, sentiment_trace = await _analyze_sentiment(
             posts,
             symbols,
@@ -636,7 +638,29 @@ async def rerun_analysis_snapshot(
         if not _snapshot_risk:
             _rerun_cfg = get_or_create_app_config(db)
             _snapshot_risk = str(getattr(_rerun_cfg, "risk_profile", "moderate") or "moderate")
-        blue_team_signal = _generate_trading_signal(sentiment_results, quotes_by_symbol, risk_profile=_snapshot_risk)
+        use_closed_market_hysteresis = (
+            _is_closed_market_session(quotes_by_symbol)
+            and previous_response is not None
+            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
+            and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
+        )
+        blue_team_signal = _generate_trading_signal(
+            sentiment_results,
+            quotes_by_symbol,
+            risk_profile=_snapshot_risk,
+            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
+            stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+        )
+        if previous_response and not _material_change_gate(
+            symbols=symbols,
+            posts_count=len(posts),
+            sentiment_results=sentiment_results,
+            price_context=price_context,
+            quotes_by_symbol=quotes_by_symbol,
+            previous_state=previous_state,
+            candidate_signal=blue_team_signal,
+        ):
+            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
         quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
         if blue_team_signal.entry_symbol in quotes_by_symbol:
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
@@ -953,7 +977,34 @@ async def analyze_market_stream(request: AnalysisRequest):
             # Step 4: Trading Signal
             yield emit("Generating trading signal...")
             _stream_risk = str(getattr(config, "risk_profile", "moderate") or "moderate")
-            blue_team_signal = _generate_trading_signal(sentiment_results, quotes_by_symbol, risk_profile=_stream_risk)
+            previous_state = _latest_previous_analysis_state(db)
+            previous_response = previous_state.get("response") if previous_state else None
+            use_closed_market_hysteresis = (
+                _is_closed_market_session(quotes_by_symbol)
+                and previous_response is not None
+                and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
+                and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
+            )
+            if use_closed_market_hysteresis:
+                yield emit("Closed-market hysteresis active: preserving prior signal unless the inputs moved materially.")
+            blue_team_signal = _generate_trading_signal(
+                sentiment_results,
+                quotes_by_symbol,
+                risk_profile=_stream_risk,
+                previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
+                stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+            )
+            if previous_response and not _material_change_gate(
+                symbols=effective_request.symbols,
+                posts_count=len(posts),
+                sentiment_results=sentiment_results,
+                price_context=price_context,
+                quotes_by_symbol=quotes_by_symbol,
+                previous_state=previous_state,
+                candidate_signal=blue_team_signal,
+            ):
+                yield emit("Material-change gate active: keeping prior thesis because the news/price move is not large enough to justify a flip.")
+                blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
             quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
             if blue_team_signal.entry_symbol in quotes_by_symbol:
                 blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
@@ -1158,7 +1209,31 @@ async def analyze_market(
             web_context_by_symbol=web_context_by_symbol,
         )
         _batch_risk = str(getattr(config, "risk_profile", "moderate") or "moderate")
-        blue_team_signal = _generate_trading_signal(sentiment_results, quotes_by_symbol, risk_profile=_batch_risk)
+        previous_state = _latest_previous_analysis_state(db)
+        previous_response = previous_state.get("response") if previous_state else None
+        use_closed_market_hysteresis = (
+            _is_closed_market_session(quotes_by_symbol)
+            and previous_response is not None
+            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
+            and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
+        )
+        blue_team_signal = _generate_trading_signal(
+            sentiment_results,
+            quotes_by_symbol,
+            risk_profile=_batch_risk,
+            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
+            stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+        )
+        if previous_response and not _material_change_gate(
+            symbols=effective_request.symbols,
+            posts_count=len(posts),
+            sentiment_results=sentiment_results,
+            price_context=price_context,
+            quotes_by_symbol=quotes_by_symbol,
+            previous_state=previous_state,
+            candidate_signal=blue_team_signal,
+        ):
+            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
         quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
         if blue_team_signal.entry_symbol in quotes_by_symbol:
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
@@ -2191,10 +2266,193 @@ def _resolve_leverage(confidence: float, risk_profile: str, action: str = "") ->
     return "3x" if confidence > 0.75 else "1x"
 
 
+def _is_closed_market_session(quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]]) -> bool:
+    """Return True when all fetched quotes indicate the market is fully closed."""
+    if not quotes_by_symbol:
+        return False
+    sessions = {
+        str((quote or {}).get("session") or "").lower().strip()
+        for quote in quotes_by_symbol.values()
+        if isinstance(quote, dict)
+    }
+    sessions.discard("")
+    return bool(sessions) and sessions.issubset({"closed"})
+
+
+def _latest_previous_analysis_response(
+    db: Optional[Session],
+    max_age_hours: int = 8,
+) -> Optional[AnalysisResponse]:
+    """Load the most recent saved analysis if it is still recent enough to use for hysteresis."""
+    if db is None:
+        return None
+    latest = (
+        db.query(AnalysisResult)
+        .order_by(AnalysisResult.timestamp.desc())
+        .first()
+    )
+    if not latest:
+        return None
+    response = _load_saved_analysis_response(latest)
+    latest_ts = latest.timestamp
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+    else:
+        latest_ts = latest_ts.astimezone(timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        return None
+    return response
+
+
+def _latest_previous_analysis_state(
+    db: Optional[Session],
+    max_age_hours: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """Return the most recent saved analysis plus its reconstructed response and snapshot metadata."""
+    if db is None:
+        return None
+    latest = (
+        db.query(AnalysisResult)
+        .order_by(AnalysisResult.timestamp.desc())
+        .first()
+    )
+    if not latest:
+        return None
+    latest_ts = latest.timestamp
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+    else:
+        latest_ts = latest_ts.astimezone(timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        return None
+    metadata = latest.run_metadata or {}
+    snapshot = metadata.get("dataset_snapshot") or {}
+    return {
+        "analysis": latest,
+        "response": _load_saved_analysis_response(latest),
+        "snapshot": snapshot,
+        "quotes_by_symbol": snapshot.get("quotes_by_symbol") or {},
+    }
+
+
+def _max_sentiment_input_delta(
+    current_sentiment_results: Dict[str, Dict[str, Any]],
+    previous_response: Optional[AnalysisResponse],
+) -> float:
+    """Compare current vs previous sentiment inputs to avoid freezing legitimate regime changes."""
+    if not previous_response or not previous_response.sentiment_scores:
+        return 999.0
+    deltas: List[float] = []
+    for symbol, current in current_sentiment_results.items():
+        previous = previous_response.sentiment_scores.get(symbol)
+        if not previous:
+            continue
+        deltas.append(abs(float(current.get("policy_score", 0.0)) - float(previous.policy_change)))
+        deltas.append(abs(float(current.get("bluster_score", 0.0)) - float(previous.market_bluster)))
+        deltas.append(abs(float(current.get("confidence", 0.0)) - float(previous.confidence)))
+    return max(deltas) if deltas else 999.0
+
+
+def _max_price_move_vs_previous_pct(
+    symbols: List[str],
+    current_quotes: Optional[Dict[str, Dict[str, Any]]],
+    previous_quotes: Optional[Dict[str, Dict[str, Any]]],
+) -> float:
+    """Compare current prices to the previous run's prices and return the largest absolute move."""
+    if not current_quotes or not previous_quotes:
+        return 999.0
+    moves: List[float] = []
+    for symbol in symbols:
+        current_quote = current_quotes.get(symbol) or {}
+        previous_quote = previous_quotes.get(symbol) or {}
+        current_price = float(current_quote.get("current_price") or 0.0)
+        previous_price = float(previous_quote.get("current_price") or 0.0)
+        if current_price > 0 and previous_price > 0:
+            moves.append(abs(current_price - previous_price) / previous_price * 100.0)
+    return max(moves) if moves else 999.0
+
+
+def _max_atr_pct(symbols: List[str], price_context: Optional[Dict[str, Any]]) -> float:
+    """Return the largest available ATR percent across active symbols for price-move gating."""
+    if not price_context:
+        return 0.0
+    atr_values: List[float] = []
+    for symbol in symbols:
+        indicators = price_context.get(f"technical_indicators_{str(symbol).lower()}") or {}
+        try:
+            atr_pct = float(indicators.get("atr_14_pct") or 0.0)
+        except (TypeError, ValueError):
+            atr_pct = 0.0
+        if atr_pct > 0:
+            atr_values.append(atr_pct)
+    return max(atr_values) if atr_values else 0.0
+
+
+def _signals_differ_materially(
+    previous_signal: Optional[TradingSignal],
+    current_signal: Optional[TradingSignal],
+) -> bool:
+    """Check whether two signals differ in thesis or recommendation composition."""
+    if previous_signal is None or current_signal is None:
+        return True
+    if str(previous_signal.signal_type or "HOLD").upper() != str(current_signal.signal_type or "HOLD").upper():
+        return True
+    prev_map = _recommendations_by_underlying(previous_signal)
+    cur_map = _recommendations_by_underlying(current_signal)
+    if set(prev_map.keys()) != set(cur_map.keys()):
+        return True
+    for symbol in prev_map:
+        prev = prev_map.get(symbol) or {}
+        cur = cur_map.get(symbol) or {}
+        if (
+            str(prev.get("action") or "").upper() != str(cur.get("action") or "").upper()
+            or str(prev.get("symbol") or "").upper() != str(cur.get("symbol") or "").upper()
+            or str(prev.get("leverage") or "") != str(cur.get("leverage") or "")
+        ):
+            return True
+    return False
+
+
+def _material_change_gate(
+    *,
+    symbols: List[str],
+    posts_count: int,
+    sentiment_results: Dict[str, Dict[str, Any]],
+    price_context: Dict[str, Any],
+    quotes_by_symbol: Dict[str, Dict[str, Any]],
+    previous_state: Optional[Dict[str, Any]],
+    candidate_signal: Optional[TradingSignal],
+) -> bool:
+    """Return True when a thesis flip is justified by meaningful news or price movement."""
+    if previous_state is None:
+        return True
+    previous_response = previous_state.get("response")
+    previous_quotes = previous_state.get("quotes_by_symbol") or {}
+    previous_signal = (previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None
+    if not _signals_differ_materially(previous_signal, candidate_signal):
+        return True
+
+    posts_delta = abs(int(getattr(previous_response, "posts_scraped", 0) or 0) - int(posts_count or 0)) if previous_response else 999
+    sentiment_delta = _max_sentiment_input_delta(sentiment_results, previous_response)
+    price_move_pct = _max_price_move_vs_previous_pct(symbols, quotes_by_symbol, previous_quotes)
+    atr_pct = _max_atr_pct(symbols, price_context)
+    material_price_threshold = max(0.75, min(3.0, atr_pct * 0.5 if atr_pct > 0 else 1.0))
+
+    return (
+        posts_delta >= 6
+        or sentiment_delta >= 0.24
+        or price_move_pct >= material_price_threshold
+    )
+
+
 def _generate_trading_signal(
     sentiment_results: Dict[str, Dict],
     quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
     risk_profile: str = "aggressive",
+    previous_signal: Optional[TradingSignal] = None,
+    stability_mode: str = "normal",
 ) -> TradingSignal:
     if not sentiment_results:
         return TradingSignal(
@@ -2216,18 +2474,23 @@ def _generate_trading_signal(
     long_recommendations = 0
     short_recommendations = 0
     hold_recommendations = 0
+    previous_recommendations = _recommendations_by_underlying(previous_signal)
+    is_closed_hysteresis = stability_mode == "closed_market_hysteresis"
+    entry_threshold = 0.42 if is_closed_hysteresis else 0.30
+    keep_threshold = 0.22 if is_closed_hysteresis else 0.30
 
     for sym, result in sentiment_results.items():
         directional = result.get('directional_score', 0.0)
         confidence = result['confidence']
         specialist_signal = str(result.get('signal_type', 'HOLD')).upper()
         specialist_urgency = str(result.get('urgency', 'LOW')).upper()
+        previous_action = str((previous_recommendations.get(sym) or {}).get("action", "")).upper().strip()
 
-        if directional <= -0.3:
+        if directional <= -entry_threshold or (previous_action == "SELL" and directional <= -keep_threshold):
             action = "SELL"
             urgency = specialist_urgency if specialist_signal == "SHORT" else ("HIGH" if abs(directional) > 0.7 else "MEDIUM")
             short_recommendations += 1
-        elif directional >= 0.3:
+        elif directional >= entry_threshold or (previous_action == "BUY" and directional >= keep_threshold):
             action = "BUY"
             urgency = specialist_urgency if specialist_signal == "LONG" else ("HIGH" if directional > 0.7 else "MEDIUM")
             long_recommendations += 1
@@ -2259,15 +2522,23 @@ def _generate_trading_signal(
 
     normalized_basket_score = (net_direction_score / total_weight) if total_weight > 0 else 0.0
 
+    basket_entry_threshold = 0.28 if is_closed_hysteresis else 0.18
+    basket_keep_threshold = 0.10 if is_closed_hysteresis else 0.18
+    previous_signal_type = str(getattr(previous_signal, "signal_type", "HOLD") or "HOLD").upper().strip()
+
     if long_recommendations == len(symbols) and len(symbols) > 0:
         signal_type = "LONG"
     elif short_recommendations == len(symbols) and len(symbols) > 0:
         signal_type = "SHORT"
     elif hold_recommendations == len(symbols) and len(symbols) > 0:
         signal_type = "HOLD"
-    elif normalized_basket_score >= 0.18:
+    elif previous_signal_type == "LONG" and normalized_basket_score >= basket_keep_threshold:
         signal_type = "LONG"
-    elif normalized_basket_score <= -0.18:
+    elif previous_signal_type == "SHORT" and normalized_basket_score <= -basket_keep_threshold:
+        signal_type = "SHORT"
+    elif normalized_basket_score >= basket_entry_threshold:
+        signal_type = "LONG"
+    elif normalized_basket_score <= -basket_entry_threshold:
         signal_type = "SHORT"
     else:
         signal_type = "HOLD"
@@ -2291,7 +2562,7 @@ def _generate_trading_signal(
             strongest_symbol = strongest_recommendation["underlying_symbol"]
             strongest_execution_symbol = strongest_recommendation["symbol"]
 
-    if abs(normalized_basket_score) < 0.18:
+    if abs(normalized_basket_score) < basket_entry_threshold:
         overall_urgency = "LOW"
 
     # ── Determine conviction level and trading type ──────────────────────────
@@ -2392,15 +2663,28 @@ def _build_consensus_trading_signal(
 
     blue_signal_type = str(blue_team_signal.signal_type or "HOLD").upper()
     source_bias = bool(red_team_review.source_bias_penalty_applied)
+    blue_rec_map = _recommendations_by_underlying(blue_team_signal)
 
     for review in red_team_review.symbol_reviews:
         symbol = str(review.symbol or "").upper().strip()
         adjusted_signal = str(review.adjusted_signal or "HOLD").upper().strip()
         adjusted_urgency = str(review.adjusted_urgency or "LOW").upper().strip()
+        blue_rec = blue_rec_map.get(symbol) or {}
+        blue_symbol_signal = str(blue_rec.get("action") or ("HOLD" if not blue_rec else blue_signal_type)).upper().strip()
+        if blue_symbol_signal in {"LONG", "SHORT"}:
+            blue_symbol_signal = "BUY" if blue_symbol_signal == "LONG" else "SELL"
+        if not SentimentEngine.red_team_override_is_material(
+            adjusted_signal=adjusted_signal,
+            blue_signal=blue_symbol_signal,
+            evidence=list(review.evidence or []),
+            key_risks=list(review.key_risks or []),
+            source_bias_applied=source_bias,
+        ):
+            adjusted_signal = blue_symbol_signal or "HOLD"
         # Python computes confidence and stop-loss — LLM no longer outputs raw floats
         adjusted_confidence = SentimentEngine.compute_red_team_confidence(
             adjusted_signal=adjusted_signal,
-            blue_signal=blue_signal_type,
+            blue_signal=blue_symbol_signal or blue_signal_type,
             evidence=list(review.evidence or []),
             key_risks=list(review.key_risks or []),
             source_bias_applied=source_bias,
@@ -2435,16 +2719,28 @@ def _build_consensus_trading_signal(
             strongest_execution_symbol = recommendation["symbol"]
 
     # Confidence is now Python-computed per review and collected in signed_scores magnitude
-    computed_confidences = [
-        SentimentEngine.compute_red_team_confidence(
-            adjusted_signal=str(rv.adjusted_signal or "HOLD").upper(),
-            blue_signal=blue_signal_type,
+    computed_confidences = []
+    for rv in red_team_review.symbol_reviews:
+        rv_symbol = str(rv.symbol or "").upper().strip()
+        rv_blue_signal = str((blue_rec_map.get(rv_symbol) or {}).get("action") or blue_signal_type).upper()
+        rv_adjusted_signal = str(rv.adjusted_signal or "HOLD").upper()
+        if not SentimentEngine.red_team_override_is_material(
+            adjusted_signal=rv_adjusted_signal,
+            blue_signal=rv_blue_signal,
             evidence=list(rv.evidence or []),
             key_risks=list(rv.key_risks or []),
             source_bias_applied=source_bias,
+        ):
+            rv_adjusted_signal = str((blue_rec_map.get(rv_symbol) or {}).get("action") or "HOLD").upper()
+        computed_confidences.append(
+            SentimentEngine.compute_red_team_confidence(
+                adjusted_signal=rv_adjusted_signal,
+                blue_signal=rv_blue_signal,
+                evidence=list(rv.evidence or []),
+                key_risks=list(rv.key_risks or []),
+                source_bias_applied=source_bias,
+            )
         )
-        for rv in red_team_review.symbol_reviews
-    ]
 
     if recommendations:
         avg_signed = sum(signed_scores) / max(1, len(signed_scores))
