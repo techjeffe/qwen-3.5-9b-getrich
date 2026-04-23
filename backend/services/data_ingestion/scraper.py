@@ -13,11 +13,13 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-# Geopolitical keywords for filtering
+# Market-relevant keywords for filtering
 GEOPOLITICAL_KEYWORDS = [
-    "iran", "middle east", "war", "conflict", "sanctions", 
-    "oil", "energy", "trump", "policy", "regulation",
-    "market", "stocks", "economy", "inflation"
+    "war", "conflict", "sanctions", "geopolitical",
+    "oil", "crude", "energy", "opec", "hormuz",
+    "crypto", "bitcoin", "fed", "inflation", "rates",
+    "policy", "regulation", "tariff", "trade",
+    "market", "stocks", "economy"
 ]
 
 
@@ -77,7 +79,7 @@ class TruthSocialScraper:
     
     async def scrape_posts(
         self,
-        query: str = "iran war market",
+        query: str = "market geopolitics policy oil crypto fed trade",
         limit: int = 50,
         max_retries: int = 3
     ) -> List[TruthSocialPost]:

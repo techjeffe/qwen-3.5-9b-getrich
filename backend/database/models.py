@@ -97,6 +97,11 @@ class Trade(Base):
     """
     Immutable recommendation-time trade entry used for forward P&L tracking.
     One row is created per actionable recommendation.
+    Tracks conviction level and expected holding period to reduce churn.
+    
+    CRITICAL: `symbol` is the EXECUTION symbol (e.g., SBIT, SPXS, UCO) that was actually bought/sold.
+    `underlying_symbol` is the base symbol (e.g., BITO, QQQ, USO) for reference.
+    P&L is calculated using the execution symbol's prices.
     """
     __tablename__ = "trades"
 
@@ -104,23 +109,33 @@ class Trade(Base):
     analysis_id = Column(Integer, ForeignKey("analysis_results.id"), nullable=False)
     request_id = Column(String(36), nullable=False)
 
-    symbol = Column(String(10), nullable=False)
+    symbol = Column(String(10), nullable=False)  # EXECUTION symbol (SBIT, SPXS, UCO, etc.)
+    underlying_symbol = Column(String(10), nullable=True)  # BASE symbol (BITO, QQQ, USO, etc.) for reference
     action = Column(String(10), nullable=False)  # BUY or SELL
     leverage = Column(String(10), nullable=False, default="1x")
     signal_type = Column(String(20), nullable=False)
     confidence_score = Column(Float, nullable=True)
 
     recommended_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
-    entry_price = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)  # Price for the EXECUTION symbol
     entry_price_timestamp = Column(DateTime(timezone=True), nullable=False)
 
     stop_loss_pct = Column(Float, nullable=True)
     take_profit_pct = Column(Float, nullable=True)
+    
+    # Conviction and holding period fields
+    conviction_level = Column(String(20), nullable=True, default="MEDIUM")  # LOW, MEDIUM, HIGH
+    holding_period_hours = Column(Integer, nullable=True, default=4)
+    trading_type = Column(String(20), nullable=True, default="SWING")  # SCALP, SWING, POSITION, VOLATILE_EVENT
+    holding_window_until = Column(DateTime(timezone=True), nullable=True)  # calculated: recommended_at + holding_period_hours
 
     __table_args__ = (
         Index("ix_trades_analysis_id", "analysis_id"),
         Index("ix_trades_symbol_recommended_at", "symbol", "recommended_at"),
+        Index("ix_trades_underlying_symbol", "underlying_symbol"),
         Index("ix_trades_request_id", "request_id"),
+        Index("ix_trades_holding_window_until", "holding_window_until"),
+        Index("ix_trades_conviction_level", "conviction_level"),
     )
 
 
@@ -175,6 +190,88 @@ class TradeExecution(Base):
     )
 
 
+class TradeClose(Base):
+    """
+    User-recorded closing trade for a recommendation.
+    When present, this price is used as the definitive realized P&L.
+    """
+    __tablename__ = "trade_closes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_id = Column(Integer, ForeignKey("trades.id"), nullable=False)
+
+    closed_price = Column(Float, nullable=False)
+    closed_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("trade_id", name="uq_trade_closes_trade_id"),
+        Index("ix_trade_closes_trade_id", "trade_id"),
+    )
+
+
+class PriceHistory(Base):
+    """
+    Daily OHLCV price history for tracked symbols.
+    Persisted independently of analysis data — never cleared by reset-data.
+    Used to compute technical indicators (RSI, MACD, SMA, etc.) without repeated yfinance calls.
+    """
+    __tablename__ = "price_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(10), nullable=False)
+    date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    close = Column(Float, nullable=True)
+    adj_close = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    source = Column(String(20), nullable=False, default="yfinance")
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "date", name="uq_price_history_symbol_date"),
+        Index("ix_price_history_symbol_date", "symbol", "date"),
+    )
+
+
+class PaperTrade(Base):
+    """
+    Auto-executed paper trade simulating $100 per signal during market hours.
+    One open position per underlying symbol at a time.
+    Closed and replaced when the recommendation changes ticker, leverage, or direction.
+    Closed without replacement on a HOLD signal.
+    """
+    __tablename__ = "paper_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    underlying = Column(String(10), nullable=False)          # USO, QQQ, BITO, SPY, NVDA …
+    execution_ticker = Column(String(10), nullable=False)    # UCO, TQQQ, SPXL, BITU …
+    signal_type = Column(String(10), nullable=False)         # LONG or SHORT
+    leverage = Column(String(10), nullable=False, default="1x")
+    market_session = Column(String(20), nullable=True)       # open, pre-market, after-hours
+
+    amount = Column(Float, nullable=False, default=100.0)    # dollars invested
+    shares = Column(Float, nullable=False)                   # amount / entry_price
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=True)                # None = still open
+
+    entered_at = Column(DateTime(timezone=True), nullable=False)
+    exited_at = Column(DateTime(timezone=True), nullable=True)   # None = still open
+
+    realized_pnl = Column(Float, nullable=True)              # None = still open
+    realized_pnl_pct = Column(Float, nullable=True)
+
+    analysis_request_id = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index("ix_paper_trades_underlying", "underlying"),
+        Index("ix_paper_trades_entered_at", "entered_at"),
+        Index("ix_paper_trades_exited_at", "exited_at"),
+    )
+
+
 class AppConfig(Base):
     """
     Singleton application configuration and run-timing metadata.
@@ -187,11 +284,24 @@ class AppConfig(Base):
     auto_run_enabled = Column(Boolean, nullable=False, default=True)
     auto_run_interval_minutes = Column(Integer, nullable=False, default=30)
     tracked_symbols = Column(JSON, nullable=False, default=["USO", "BITO", "QQQ", "SPY"])
+    custom_symbols = Column(JSON, nullable=False, default=[])
     max_posts = Column(Integer, nullable=False, default=50)
     include_backtest = Column(Boolean, nullable=False, default=True)
     lookback_days = Column(Integer, nullable=False, default=14)
     symbol_prompt_overrides = Column(JSON, nullable=False, default={})
+    symbol_company_aliases = Column(JSON, nullable=False, default={})
+    display_timezone = Column(String(64), nullable=False, default="")
+    enabled_rss_feeds = Column(JSON, nullable=False, default=[])
+    custom_rss_feeds = Column(JSON, nullable=False, default=[])
+    custom_rss_feed_labels = Column(JSON, nullable=False, default={})
+    rss_article_detail_mode = Column(String(20), nullable=False, default="normal")
+    rss_article_limits = Column(JSON, nullable=False, default={"light": 5, "normal": 15, "detailed": 25})
     data_ingestion_interval_seconds = Column(Integer, nullable=False, default=900)
+    snapshot_retention_limit = Column(Integer, nullable=False, default=12)
+    extraction_model = Column(String(128), nullable=False, default="")
+    reasoning_model = Column(String(128), nullable=False, default="")
+    risk_profile = Column(String(20), nullable=False, default="moderate")
+    web_research_enabled = Column(Boolean, nullable=False, default=False)
 
     last_analysis_started_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -209,6 +319,11 @@ class AppConfig(Base):
 def init_db():
     """Initialize database by creating all tables."""
     Base.metadata.create_all(bind=engine)
+    try:
+        from .migrate import migrate
+        migrate()
+    except Exception as exc:
+        print(f"Database migration warning: {exc}")
 
 
 # Drop all tables (for testing/reinitialization)

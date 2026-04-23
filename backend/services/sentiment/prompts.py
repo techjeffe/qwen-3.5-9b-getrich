@@ -1,7 +1,244 @@
 """
-Geopolitical Risk Analysis Prompts for Llama-3-70b
-Specialized prompts for detecting market bluster vs policy changes
+Geopolitical Risk Analysis Prompts.
+Specialized prompts for detecting market bluster vs policy changes,
+and for the two-stage entity-extraction → reasoning pipeline.
 """
+
+import re
+
+# ============================================================================
+# STAGE 1: THEMATIC & ENTITY MAPPING
+# Maps news articles to tracked tickers via proxy terms before reasoning.
+# ============================================================================
+
+# Default proxy terms per ticker.  Custom symbols get a fallback rule.
+TICKER_PROXY_MAP: dict[str, list[str]] = {
+    "USO": [
+        "oil", "crude", "petroleum", "OPEC", "barrel", "WTI", "Brent",
+        "refinery", "gasoline", "fuel", "energy supply", "pipeline",
+        "LNG", "natural gas", "shale", "fracking", "tanker", "shipping lane",
+        "supply disruption", "crude export", "crude imports", "oilfield",
+        # Oil-specific geopolitical terms — not bare country names, which pull in
+        # unrelated political news that has no direct commodity price impact
+        "strait of hormuz", "oil sanction", "energy sanction",
+        "hormuz", "hormuz shipping", "hormuz transit",
+        "oil supply", "oil production", "oil export", "oil shipment",
+        "russia oil", "iran oil", "iranian oil", "venezuela oil", "opec cut",
+        "output cut", "production cut",
+    ],
+    "BITO": [
+        "bitcoin", "BTC", "crypto", "cryptocurrency", "blockchain",
+        "satoshi", "halving", "digital asset", "ethereum", "ETH",
+        "stablecoin", "DeFi", "NFT", "altcoin", "mining",
+        "sec crypto", "crypto regulation", "crypto ETF", "dollar strength",
+    ],
+    "QQQ": [
+        "nasdaq", "tech sector", "technology stocks", "semiconductors",
+        "chips", "AI", "artificial intelligence", "megacap tech",
+        "cloud computing", "data center", "software", "big tech",
+        "antitrust", "data privacy", "interest rate", "rate cut", "rate hike",
+        "apple", "microsoft", "nvidia", "google", "meta", "amazon",
+    ],
+    "SPY": [
+        "S&P 500", "S&P500", "stock market", "equities", "wall street",
+        "dow jones", "economy", "recession", "GDP", "inflation",
+        "interest rates", "Federal Reserve", "Fed", "employment",
+        "earnings season", "credit spread", "tariff", "trade war", "fiscal",
+    ],
+}
+
+
+def normalize_text_for_matching(text: str) -> str:
+    """Normalize text so simple substring matching catches common punctuation variants."""
+    lowered = str(text or "").lower()
+    lowered = lowered.replace("&", " and ")
+    lowered = re.sub(r"[-_/]", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def expand_proxy_terms_for_matching(terms: list[str]) -> list[str]:
+    """Expand proxy terms with a few high-value variants for simple substring matching."""
+    expanded: set[str] = set()
+    suffix_pairs = [
+        (" sanction", " sanctions"),
+        (" export", " exports"),
+        (" imports", " import"),
+        (" supply", " supplies"),
+        (" cut", " cuts"),
+        (" quota", " quotas"),
+        (" barrel", " barrels"),
+        (" tanker", " tankers"),
+        (" pipeline", " pipelines"),
+        (" refinery", " refineries"),
+        (" shipment", " shipments"),
+        (" disruption", " disruptions"),
+        (" lane", " lanes"),
+    ]
+
+    for term in terms:
+        normalized = normalize_text_for_matching(term)
+        if not normalized:
+            continue
+        expanded.add(normalized)
+        for singular, plural in suffix_pairs:
+            if normalized.endswith(singular):
+                expanded.add(normalized[: -len(singular)] + plural)
+            if normalized.endswith(plural):
+                expanded.add(normalized[: -len(plural)] + singular)
+
+    return sorted(expanded)
+
+STAGE1_EXTRACTION_PROMPT = """TASK: Classify each numbered headline for relevance to tracked financial instruments.
+
+OUTPUT FORMAT: Return a single JSON object with one key "classifications" whose value is an array — one entry per headline index.
+
+Tracked instruments and proxy terms:
+{proxy_map_text}
+
+Rules:
+- Mark relevant=true if the headline touches the asset, its sector, a proxy term, or any macro factor (rates, inflation, war, regulation, trade policy) that could move these instruments.
+- When in doubt, mark relevant=true. It is better to include a borderline article than to miss market-moving news.
+- Only mark relevant=false for headlines that are clearly unrelated (sports, celebrity, local weather, entertainment).
+- For tickers marked INFER: use your knowledge of that company or asset's sector and news drivers as proxy terms.
+- Every headline index from 0 to N-1 MUST appear in the output array.
+
+Required output format:
+{{"classifications": [
+  {{"index": 0, "relevant": true, "tickers": ["USO"], "proxy_terms": ["crude oil", "OPEC"]}},
+  {{"index": 1, "relevant": false, "tickers": [], "proxy_terms": []}}
+]}}
+
+Headlines to classify:
+{headlines}"""
+
+STAGE2_PROXY_CONTEXT = """
+ENTITY MAPPING CONTEXT (from pre-processing):
+The following proxy terms were identified in the source articles as mapping to {symbol}:
+  {proxy_terms}
+
+CRITICAL INSTRUCTION: Even if "{symbol}" is not mentioned by name in the articles, attribute the sentiment to {symbol} if the underlying asset or any of the above proxy terms are discussed. Your reasoning MUST cite the specific proxy term used (e.g. "The article mentions 'crude oil prices falling' which maps to USO").
+"""
+
+
+def build_proxy_map_text(symbols: list[str]) -> str:
+    """Format the proxy map for the Stage 1 prompt, including any custom symbols."""
+    lines = []
+    for sym in symbols:
+        proxies = TICKER_PROXY_MAP.get(sym.upper())
+        if proxies:
+            lines.append(f"- {sym}: {', '.join(proxies)}")
+        else:
+            lines.append(
+                f"- {sym}: INFER — use your knowledge to identify what company or asset '{sym}' represents, "
+                f"its industry, key products or holdings, notable executives, and typical news proxy terms"
+            )
+    return "\n".join(lines)
+
+
+def format_stage1_extraction_prompt(
+    headlines: "list[str] | list[tuple[int, str]]",
+    symbols: list[str],
+) -> str:
+    """Build the Stage 1 entity-extraction prompt.
+
+    headlines may be a plain list of strings (auto-numbered 0…N)
+    or a list of (original_index, text) tuples for batched calls.
+    """
+    if headlines and isinstance(headlines[0], tuple):
+        numbered = "\n".join(f"{i}. {h}" for i, h in headlines)
+    else:
+        numbered = "\n".join(f"{i}. {h}" for i, h in enumerate(headlines))
+    return STAGE1_EXTRACTION_PROMPT.format(
+        proxy_map_text=build_proxy_map_text(symbols),
+        headlines=numbered,
+    )
+
+
+SYMBOL_KEYWORD_GENERATION_PROMPT = """List 15-20 keywords and proxy terms that appear in news articles likely to affect the stock or asset {symbol}.
+
+Include:
+- Company or fund name and common abbreviations
+- Key products, services, or major holdings
+- Sector and industry terms
+- Notable competitors or sector peers
+- Relevant macro factors (commodities, rates, regulation topics)
+- Common news triggers for this ticker
+
+Return JSON only, no other text:
+{{"terms": ["term1", "term2", ...]}}"""
+
+
+def format_keyword_generation_prompt(symbol: str) -> str:
+    return SYMBOL_KEYWORD_GENERATION_PROMPT.format(symbol=symbol)
+
+
+def format_stage2_proxy_appendix(symbol: str, proxy_terms: list[str]) -> str:
+    """Return the proxy-context block to inject into Stage 2 specialist prompts."""
+    if not proxy_terms:
+        return ""
+    return STAGE2_PROXY_CONTEXT.format(
+        symbol=symbol,
+        proxy_terms=", ".join(proxy_terms),
+    )
+
+
+RED_TEAM_REVIEW_PROMPT = """You are a Senior Quantitative Risk Manager performing a red-team review of FINAL trading signals.
+
+Your job is to challenge the current recommendations, not to agree with them by default.
+
+Review the provided final signals and produce:
+- Thesis: why the current signal could be right
+- Antithesis: the strongest reason it could be wrong right now
+- Context check against the latest news items for regime shift risk
+- Divergence analysis between sentiment and technicals (especially RSI, MACD, ATR)
+- Portfolio correlation / de-coupling risk across the recommended trades
+- Confidence calibration, including source concentration / source bias penalties if confidence leans too heavily on one source
+- Adjusted signal and ATR-based stop loss
+
+Hard rules:
+- Do not invent prices or indicators not present in the context.
+- If the current signal looks fragile or exhausted, say so clearly.
+- If sentiment is strongly bearish but RSI is oversold (<30), consider exhaustion / squeeze risk.
+- If sentiment is strongly bullish but RSI is overbought (>70), consider blow-off / reversal risk.
+- If medium urgency relies on one dominant source, penalize confidence materially.
+- Use ATR when recommending stop loss. Explain the ATR basis in plain English.
+- Every thesis, antithesis, and rationale must cite specific evidence from the provided context, such as named headlines, source names, RSI/MACD/ATR readings, or validation metrics.
+- If the adjusted signal differs from the current recommendation, explicitly explain what changed and why.
+- Return JSON only.
+
+Return exactly this JSON schema:
+{{
+  "summary": string,
+  "portfolio_risks": [string],
+  "source_bias_penalty_applied": boolean,
+  "source_bias_notes": string,
+  "symbol_reviews": [
+    {{
+      "symbol": string,
+      "current_recommendation": string,
+      "thesis": string,
+      "antithesis": string,
+      "evidence": [string],
+      "key_risks": [string],
+      "adjusted_signal": "BUY" | "SELL" | "HOLD",
+      "adjusted_urgency": "LOW" | "MEDIUM" | "HIGH",
+      "atr_basis": string,
+      "rationale": string
+    }}
+  ]
+}}
+
+Do NOT include adjusted_confidence or stop_loss_pct — Python computes those from your evidence and key_risks counts.
+Focus your effort on the quality of thesis, antithesis, evidence, key_risks, and rationale — cite specific headlines, RSI/MACD/ATR values, or source names present in the context.
+
+Context:
+{context_json}
+"""
+
+
+def format_red_team_review_prompt(context_json: str) -> str:
+    return RED_TEAM_REVIEW_PROMPT.format(context_json=context_json)
 
 # ============================================================================
 # MARKET BLUSTER DETECTION PROMPT
@@ -124,9 +361,13 @@ Return your analysis in this exact JSON format:
   }},
   "trading_signal": {{
     "signal_type": "LONG" | "SHORT" | "HOLD",
-    "confidence_score": float,  // 0.0 to +1.0
+    "confidence_score": float,  // 0.0 to +1.0 - confidence in analysis accuracy
+    "conviction_level": "LOW" | "MEDIUM" | "HIGH",  // conviction in thesis (LOW=reactive, MEDIUM=swing, HIGH=structural multi-day)
     "urgency": "LOW" | "MEDIUM" | "HIGH",
-    "reasoning": string
+    "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT",  // expected trade duration
+    "action_if_already_in_position": "HOLD" | "EXIT" | "ADD" | "TAKE_PROFIT",
+    "reasoning": string,
+    "holding_period_hours": int  // 1-720 hours based on trading_type (SCALP: 1-2, SWING: 4-24, POSITION: 24-168, VOLATILE_EVENT: 1-4)
   }},
   "overall_assessment": string,  // Brief summary of the situation
   "supporting_points": [string],  // 3-6 concrete observations from the text
@@ -189,6 +430,28 @@ For symbol_impacts:
 - CRITICAL: Do not copy the same reasoning into all four symbols - analyze the specific transmission mechanism for each
 - Consider directional impact: "crypto_regulation" typically hurts BITO near-term but QQQ may benefit if it reduces regulatory uncertainty
 - Military/geopolitical risk: typically helps USO (energy) and hurts QQQ/SPY (growth stocks), neutral to BITO unless tied to specific sanctions on crypto
+
+Conviction level guidance (to reduce trading churn):
+- LOW conviction (1-2 hour expected hold): Breaking news with immediate headline impact but no fundamental change. Reactive bluster. Positions likely to reverse quickly.
+  * Example: "Iran denies missile test" after earlier report -> SHORT signal may not last
+  * Set holding_period_hours = 2, trading_type = "VOLATILE_EVENT"
+- MEDIUM conviction (4-24 hour swing): Data-driven trading signal with clear catalyst but limited duration. Market volatility, earnings surprises, technical breaks.
+  * Example: "Federal Reserve hints at rate cuts next month" -> impact may persist through trading session
+  * Set holding_period_hours = 8-16, trading_type = "SWING"
+- HIGH conviction (24+ hour thesis): Structural multi-day theme. Sustained policy change, war developments, earnings trends, sector rotation.
+  * Example: "New crypto regulation passed Congress" or "Extended military conflict confirmed" -> impact persists for days
+  * Set holding_period_hours = 48-168, trading_type = "POSITION"
+
+Trading type selection:
+- SCALP (1-2 hours): Use ONLY for high-volatility news spikes expected to reverse quickly
+- SWING (4-24 hours): Default for news-driven trades, earnings, macro events
+- POSITION (24-168 hours): Multi-day structural themes, sustained policy changes
+- VOLATILE_EVENT (1-4 hours): Breaking news with uncertain duration or rapidly evolving situations
+
+action_if_already_in_position guidance:
+- If current signal matches existing trade direction: set to "HOLD" (let existing position run)
+- If current signal opposes existing trade: set to "TAKE_PROFIT" for MEDIUM/LOW conviction or "EXIT" if waiting for reversal confirmation
+- Only recommend "ADD" if conviction is HIGH and existing position has strong unrealized gains
 """
 
 
@@ -213,6 +476,9 @@ Recent Market Sentiment: {recent_sentiment}
 Structured Validation Context:
 {validation_context}
 
+Recent Web Research Context:
+{web_research_context}
+
 Text to analyze:
 {text}
 
@@ -233,7 +499,11 @@ Return your analysis in this exact JSON format:
   }},
   "trading_signal": {{
     "signal_type": "LONG" | "SHORT" | "HOLD",
-    "confidence_score": float,
+    "confidence_score": float,  // confidence in analysis accuracy
+    "conviction_level": "LOW" | "MEDIUM" | "HIGH",  // conviction in thesis
+    "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT",
+    "holding_period_hours": int,  // 1-720 hours
+    "action_if_already_in_position": "HOLD" | "EXIT" | "ADD" | "TAKE_PROFIT",
     "urgency": "LOW" | "MEDIUM" | "HIGH",
     "entry_symbol": "USO" | "BITO",
     "reasoning": string
@@ -293,6 +563,14 @@ For symbol_impacts:
 - CRITICAL: Do not copy the same reasoning into all four symbols - analyze the specific transmission mechanism for each
 - Consider directional impact: "crypto_regulation" typically hurts BITO near-term but QQQ may benefit if it reduces regulatory uncertainty
 - Military/geopolitical risk: typically helps USO (energy) and hurts QQQ/SPY (growth stocks), neutral to BITO unless tied to specific sanctions on crypto
+
+SCORING CALIBRATION — READ CAREFULLY:
+- Every symbol must receive DIFFERENT scores that reflect this specific news event's unique impact on that symbol's price drivers
+- Do NOT output the same bluster_score and policy_score across multiple symbols — this is a sign of lazy analysis
+- Avoid round numbers (0.5, 0.8, 0.3, 0.9) — use precise values like 0.43, 0.71, 0.28 that reflect actual reasoning
+- Confidence should reflect genuine uncertainty: most analyses should be 0.55-0.78, NOT 0.90
+- If news has weak signal-to-noise for a symbol, policy_score should be near 0.1-0.2 and confidence 0.45-0.60
+- Only use confidence > 0.85 if there is direct, confirmed, actionable news for that exact symbol
 """
 
 
@@ -397,40 +675,40 @@ SYMBOL_SPECIALIST_RESPONSE_PROMPT = """
 
 REMEMBER: This is a SINGLE-SYMBOL specialist analysis for {symbol} ONLY.
 
-Return your analysis in this exact JSON format - NOTHING ELSE:
+YOUR ONLY JOB IS FACT EXTRACTION. Python will compute all numerical scores from your output.
+Do NOT invent numbers — identify observable facts and phrases present in the text.
+
+Return ONLY this JSON — nothing else:
 {{
-  "is_bluster": boolean,
-  "bluster_score": float,
-  "is_policy_change": boolean,
-  "policy_score": float,
-  "directional_score": float,  // CRITICAL: Different symbols will have DIFFERENT directional_score values for the same news
-  "impact_severity": "low" | "medium" | "high",
-  "confidence": float,
-  "signal_type": "LONG" | "SHORT" | "HOLD",  // For {symbol} ONLY
+  "event_type": "geopolitical" | "regulatory" | "monetary_policy" | "fiscal" | "earnings" | "macro_data" | "sector_news" | "noise",
+  "confirmed": boolean,
+  "bluster_phrases": [string],
+  "substance_phrases": [string],
+  "symbol_relevance": {{
+    "{symbol}": {{
+      "relevant": boolean,
+      "direction": "bullish" | "bearish" | "neutral",
+      "mechanism": string
+    }}
+  }},
+  "source_count": integer,
   "urgency": "LOW" | "MEDIUM" | "HIGH",
-  "entry_symbol": "{symbol}",
-  "reasoning": string,  // Explain WHY this news affects {symbol} specifically
-  "analyst_writeup": string,  // 100-200 words explaining the {symbol} impact
+  "conviction": "LOW" | "MEDIUM" | "HIGH",
+  "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT",
+  "holding_period_hours": integer,
+  "analyst_writeup": string,
   "headline_citations": [string],
   "supporting_points": [string]
 }}
 
-ABSOLUTE RULES:
-1. Do NOT include symbol_impacts dictionary (this is single-symbol, not basket)
-2. Do NOT mention analyzing other symbols
-3. directional_score must be between -1.0 and +1.0 and represent {symbol}'s direction only
-4. Return ONLY valid JSON - no extra text or commentary
-5. Your reasoning MUST explain the {symbol}-specific transmission mechanism
-
-Example directional_score interpretation:
-- Military action: USO goes +0.8 (oil rally), QQQ goes -0.5 (growth fear), SPY -0.3, BITO neutral
-- Crypto regulation: BITO goes -0.7, QQQ -0.2 (regulatory clarity), USO/SPY neutral
-- Fed policy: SPY +0.6 (lower rates), QQQ +0.5 (multiple expansion), BITO +0.3, USO -0.2
-
-directional_score must be:
--1.0 = strongly bearish for {symbol}
-0.0 = neutral / mixed for {symbol}
-+1.0 = strongly bullish for {symbol}
+Definitions:
+- confirmed: true only if this is a completed, official action (signed, enacted, imposed, executed). Threats, warnings, negotiations, and speculation are false.
+- bluster_phrases: rhetorical/speculative phrases found in the text such as "threatens to", "could possibly", "warns that", "may consider". List actual phrases from the text, up to 6.
+- substance_phrases: concrete action/fact phrases found in the text such as "enacted sanctions", "signed executive order", "raised rates 25bps", "confirmed production cut". List actual phrases, up to 6.
+- source_count: how many distinct news outlets appear in the text; estimate 2 if unclear.
+- relevant: true only if this news has a plausible direct price mechanism for {symbol}. Unrelated-sector news with no transmission path should be false.
+- mechanism: one sentence on WHY this moves {symbol}'s price. If not relevant write "No direct price mechanism."
+- analyst_writeup: 100-200 words in plain English explaining what is happening and its specific impact on {symbol}.
 """
 
 
@@ -481,6 +759,7 @@ def format_context_aware_prompt(
     spy_price: float = 0.0,
     recent_sentiment: str = "",
     validation_context: str = "",
+    web_research_context: str = "",
 ) -> str:
     """Format the context-aware prompt with market data."""
     result = CONTEXT_AWARE_PROMPT
@@ -493,6 +772,7 @@ def format_context_aware_prompt(
     result = result.replace("{spy_price}", str(spy_price))
     result = result.replace("{recent_sentiment}", recent_sentiment)
     result = result.replace("{validation_context}", validation_context or "No structured validation data available.")
+    result = result.replace("{web_research_context}", web_research_context or "No recent web research context available.")
     result = result.replace("{text}", text)
     result = result.replace("{{", "{").replace("}}", "}")
     return result
@@ -511,6 +791,7 @@ def format_symbol_specialist_context_prompt(
     spy_price: float = 0.0,
     recent_sentiment: str = "",
     validation_context: str = "",
+    web_research_context: str = "",
 ) -> str:
     """Format the context-aware prompt with symbol-specialist guidance.
     
@@ -534,6 +815,7 @@ def format_symbol_specialist_context_prompt(
         spy_price=spy_price,
         recent_sentiment=recent_sentiment,
         validation_context=validation_context,
+        web_research_context=web_research_context,
     )
     appendix = SYMBOL_SPECIALIST_APPENDIX.format(
         symbol=symbol,

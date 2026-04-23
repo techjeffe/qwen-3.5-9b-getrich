@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
 import re
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -47,16 +48,21 @@ class RSSFeedParser:
         "guardian_world":  "https://www.theguardian.com/world/rss",
     }
     
-    # Geopolitical keywords for filtering
+    # Keywords used to tag articles with chips in the UI (not used for routing)
     KEYWORDS = [
-        "iran", "middle east", "war", "conflict", "sanctions",
-        "oil", "energy", "trump", "policy", "regulation",
-        "market", "stocks", "economy", "inflation", "trade"
+        "war", "conflict", "sanctions", "geopolitical",
+        "oil", "energy", "crude", "opec",
+        "crypto", "bitcoin", "blockchain",
+        "fed", "federal reserve", "inflation", "rates",
+        "trump", "tariff", "trade",
+        "policy", "regulation",
+        "market", "stocks", "economy", "recession",
     ]
     
-    def __init__(self, timeout: int = 10):
+    def __init__(self, timeout: int = 10, feeds: Optional[Dict[str, str]] = None):
         self.timeout = timeout
         self.session = requests.Session()
+        self.feeds = dict(feeds or self.GEOPOLITICAL_FEEDS)
         
     def parse_feeds(
         self,
@@ -76,11 +82,11 @@ class RSSFeedParser:
         articles = []
         
         # Select feeds to parse
-        feeds_to_parse = feed_names or list(self.GEOPOLITICAL_FEEDS.keys())
-        
+        feeds_to_parse = feed_names or list(self.feeds.keys())
+
         for feed_name in feeds_to_parse:
             try:
-                feed_url = self.GEOPOLITICAL_FEEDS[feed_name]
+                feed_url = self.feeds[feed_name]
                 articles.extend(self._parse_single_feed(feed_url, date_from))
             except Exception as e:
                 print(f"Error parsing {feed_name}: {e}")
@@ -164,10 +170,11 @@ class RSSFeedParser:
     
     def _get_source_name(self, feed_url: str) -> str:
         """Get human-readable source name from URL."""
-        for name, url in self.GEOPOLITICAL_FEEDS.items():
+        for name, url in self.feeds.items():
             if url == feed_url:
                 return name.replace("_", " ").title()
-        return "unknown"
+        host = (urlparse(feed_url).netloc or "unknown").replace("www.", "")
+        return host.split(":")[0].title()
     
     def _parse_date(self, parsed_date: Optional[tuple]) -> datetime:
         """Parse date tuple to datetime object."""

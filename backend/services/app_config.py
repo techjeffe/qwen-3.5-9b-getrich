@@ -5,59 +5,420 @@ Application configuration helpers.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+import sqlite3
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
+from database.engine import LEGACY_BACKEND_DB_PATH, ROOT_DB_PATH
 from database.models import AppConfig, AnalysisResult
 
 
 DEFAULT_TRACKED_SYMBOLS = ["USO", "BITO", "QQQ", "SPY"]
-SUPPORTED_SYMBOLS = {"SPY", "USO", "BITO", "QQQ", "SQQQ", "UNG"}
+DEFAULT_RSS_ARTICLE_DETAIL_MODE = "normal"
+DEFAULT_RSS_ARTICLE_LIMITS = {"light": 5, "normal": 15, "detailed": 25}
+DEFAULT_WEB_RESEARCH_ITEMS = {"light": 3, "normal": 4, "detailed": 6}
+DEFAULT_WEB_RESEARCH_RECENCY_DAYS = {"light": 14, "normal": 30, "detailed": 45}
+DEFAULT_RSS_FEEDS: List[Dict[str, str]] = [
+    {"key": "trump_truth", "label": "Trump Truth", "url": "https://trumpstruth.org/feed"},
+    {"key": "bbc_world", "label": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
+    {"key": "aljazeera_all", "label": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
+    {"key": "nyt_world", "label": "New York Times World", "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"},
+    {"key": "marketwatch", "label": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"},
+    {"key": "npr_world", "label": "NPR World", "url": "https://feeds.npr.org/1017/rss.xml"},
+    {"key": "guardian_world", "label": "The Guardian World", "url": "https://www.theguardian.com/world/rss"},
+]
+DEFAULT_EXTRACTION_MODEL = ""
+DEFAULT_REASONING_MODEL = ""
+DEFAULT_RISK_PROFILE = "moderate"
+VALID_RISK_PROFILES = {"conservative", "moderate", "aggressive", "crazy"}
+MAX_CUSTOM_SYMBOLS = 3
+MAX_CUSTOM_RSS_FEEDS = 3
+MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
 DEFAULT_ESTIMATED_ANALYSIS_SECONDS = 82
+DEFAULT_SNAPSHOT_RETENTION_LIMIT = 12
+DEFAULT_RSS_FEED_URLS = [feed["url"] for feed in DEFAULT_RSS_FEEDS]
 
 
-def _normalize_symbols(symbols: Any) -> List[str]:
-    if not isinstance(symbols, list):
-        return DEFAULT_TRACKED_SYMBOLS.copy()
+def is_valid_symbol(symbol: str) -> bool:
+    value = str(symbol or "").upper().strip()
+    if not value or len(value) > 10:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+    return value[0].isalpha() and all(char in allowed for char in value)
+
+
+def _normalize_symbol(value: Any) -> str:
+    return str(value or "").upper().strip()
+
+
+def _normalize_display_timezone(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_symbols(symbols: Any, *, fallback: List[str] | None = None, max_items: int = MAX_TRACKED_SYMBOLS) -> List[str]:
     normalized: List[str] = []
+    if not isinstance(symbols, list):
+        return list(fallback or [])
     for symbol in symbols:
-        value = str(symbol or "").upper().strip()
-        if value and value in SUPPORTED_SYMBOLS and value not in normalized:
+        value = _normalize_symbol(symbol)
+        if value and is_valid_symbol(value) and value not in normalized:
             normalized.append(value)
-    return normalized or DEFAULT_TRACKED_SYMBOLS.copy()
+        if len(normalized) >= max_items:
+            break
+    return normalized or list(fallback or [])
 
 
-def _normalize_prompt_overrides(data: Any) -> Dict[str, str]:
+def _normalize_custom_symbols(symbols: Any) -> List[str]:
+    custom = _normalize_symbols(symbols, fallback=[], max_items=MAX_CUSTOM_SYMBOLS)
+    return [symbol for symbol in custom if symbol not in DEFAULT_TRACKED_SYMBOLS][:MAX_CUSTOM_SYMBOLS]
+
+
+def _infer_custom_symbols(tracked_symbols: Any, custom_symbols: Any) -> List[str]:
+    explicit_custom = _normalize_custom_symbols(custom_symbols)
+    tracked = _normalize_symbols(tracked_symbols, fallback=[], max_items=MAX_TRACKED_SYMBOLS)
+    inferred = [
+        symbol for symbol in tracked
+        if symbol not in DEFAULT_TRACKED_SYMBOLS and symbol not in explicit_custom
+    ]
+    return (explicit_custom + inferred)[:MAX_CUSTOM_SYMBOLS]
+
+
+def _normalize_tracked_symbols(symbols: Any, custom_symbols: List[str]) -> List[str]:
+    allowed = set(DEFAULT_TRACKED_SYMBOLS) | set(custom_symbols)
+    normalized = _normalize_symbols(symbols, fallback=[], max_items=MAX_TRACKED_SYMBOLS)
+    return [symbol for symbol in normalized if symbol in allowed][:MAX_TRACKED_SYMBOLS]
+
+
+def _normalize_url(value: Any) -> str:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
+
+
+def _normalize_custom_rss_feeds(feeds: Any) -> List[str]:
+    normalized: List[str] = []
+    if not isinstance(feeds, list):
+        return []
+    for feed in feeds:
+        url = _normalize_url(feed)
+        if url and url not in DEFAULT_RSS_FEED_URLS and url not in normalized:
+            normalized.append(url)
+        if len(normalized) >= MAX_CUSTOM_RSS_FEEDS:
+            break
+    return normalized
+
+
+def _normalize_custom_rss_feed_labels(data: Any, custom_rss_feeds: List[str]) -> Dict[str, str]:
     if not isinstance(data, dict):
         return {}
+    allowed = set(custom_rss_feeds)
+    normalized: Dict[str, str] = {}
+    for url, label in data.items():
+        normalized_url = _normalize_url(url)
+        normalized_label = str(label or "").strip()
+        if normalized_url in allowed and normalized_label:
+            normalized[normalized_url] = normalized_label[:60]
+    return normalized
+
+
+def _normalize_enabled_rss_feeds(feeds: Any, custom_rss_feeds: List[str]) -> List[str]:
+    allowed = set(DEFAULT_RSS_FEED_URLS) | set(custom_rss_feeds)
+    normalized: List[str] = []
+    if not isinstance(feeds, list):
+        return DEFAULT_RSS_FEED_URLS.copy()
+    for feed in feeds:
+        url = _normalize_url(feed)
+        if url and url in allowed and url not in normalized:
+            normalized.append(url)
+    return normalized or DEFAULT_RSS_FEED_URLS.copy()
+
+
+def _normalize_prompt_overrides(data: Any, allowed_symbols: List[str]) -> Dict[str, str]:
+    if not isinstance(data, dict):
+        return {}
+    allowed = set(allowed_symbols)
     normalized: Dict[str, str] = {}
     for symbol, prompt in data.items():
-        sym = str(symbol or "").upper().strip()
-        if sym in SUPPORTED_SYMBOLS:
+        sym = _normalize_symbol(symbol)
+        if sym in allowed:
             normalized[sym] = str(prompt or "").strip()
     return normalized
+
+
+def _normalize_symbol_company_aliases(data: Any, allowed_symbols: List[str]) -> Dict[str, str]:
+    if not isinstance(data, dict):
+        return {}
+    allowed = set(allowed_symbols)
+    normalized: Dict[str, str] = {}
+    for symbol, alias in data.items():
+        sym = _normalize_symbol(symbol)
+        value = str(alias or "").strip()
+        if sym in allowed and value:
+            normalized[sym] = value[:120]
+    return normalized
+
+
+def _normalize_rss_article_limits(data: Any) -> Dict[str, int]:
+    limits = dict(DEFAULT_RSS_ARTICLE_LIMITS)
+    if isinstance(data, dict):
+        for key in ("light", "normal", "detailed"):
+            try:
+                value = int(data.get(key, limits[key]))
+            except (TypeError, ValueError):
+                value = limits[key]
+            limits[key] = max(1, min(50, value))
+    return limits
+
+
+def _normalize_risk_profile(value: Any) -> str:
+    profile = str(value or "").strip().lower()
+    return profile if profile in VALID_RISK_PROFILES else DEFAULT_RISK_PROFILE
+
+
+def _normalize_rss_article_detail_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"light", "normal", "detailed"} else DEFAULT_RSS_ARTICLE_DETAIL_MODE
+
+
+def resolve_rss_articles_per_feed(config: AppConfig) -> int:
+    limits = _normalize_rss_article_limits(getattr(config, "rss_article_limits", {}))
+    mode = _normalize_rss_article_detail_mode(getattr(config, "rss_article_detail_mode", DEFAULT_RSS_ARTICLE_DETAIL_MODE))
+    return limits[mode]
+
+
+def resolve_web_research_items_per_symbol(config: AppConfig) -> int:
+    mode = _normalize_rss_article_detail_mode(
+        getattr(config, "rss_article_detail_mode", DEFAULT_RSS_ARTICLE_DETAIL_MODE)
+    )
+    return DEFAULT_WEB_RESEARCH_ITEMS[mode]
+
+
+def resolve_web_research_recency_days(config: AppConfig) -> int:
+    mode = _normalize_rss_article_detail_mode(
+        getattr(config, "rss_article_detail_mode", DEFAULT_RSS_ARTICLE_DETAIL_MODE)
+    )
+    return DEFAULT_WEB_RESEARCH_RECENCY_DAYS[mode]
+
+
+def _label_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.netloc or url).replace("www.", "")
+    parts = [part for part in host.split(".") if part and part not in {"com", "org", "net", "io", "co", "uk"}]
+    if not parts:
+        parts = [host]
+    return " ".join(part.capitalize() for part in parts[:2]) or url
+
+
+def build_supported_symbols(custom_symbols: List[str]) -> List[str]:
+    return DEFAULT_TRACKED_SYMBOLS + [symbol for symbol in custom_symbols if symbol not in DEFAULT_TRACKED_SYMBOLS]
+
+
+def build_supported_rss_feeds(custom_rss_feeds: List[str], custom_rss_feed_labels: Dict[str, str] | None = None) -> List[Dict[str, str]]:
+    feeds = list(DEFAULT_RSS_FEEDS)
+    labels = _normalize_custom_rss_feed_labels(custom_rss_feed_labels or {}, custom_rss_feeds)
+    for index, url in enumerate(custom_rss_feeds, start=1):
+        feeds.append({
+            "key": f"custom_{index}",
+            "label": labels.get(url) or _label_from_url(url),
+            "url": url,
+        })
+    return feeds
+
+
+def build_enabled_rss_feed_map(config: AppConfig) -> Dict[str, str]:
+    custom_rss_feeds = _normalize_custom_rss_feeds(getattr(config, "custom_rss_feeds", []))
+    enabled_rss_feeds = _normalize_enabled_rss_feeds(getattr(config, "enabled_rss_feeds", []), custom_rss_feeds)
+    custom_rss_feed_labels = _normalize_custom_rss_feed_labels(
+        getattr(config, "custom_rss_feed_labels", {}),
+        custom_rss_feeds,
+    )
+    supported = build_supported_rss_feeds(custom_rss_feeds, custom_rss_feed_labels)
+    return {
+        feed["key"]: feed["url"]
+        for feed in supported
+        if feed["url"] in enabled_rss_feeds
+    }
+
+
+def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
+    if not LEGACY_BACKEND_DB_PATH.exists() or LEGACY_BACKEND_DB_PATH.resolve() == ROOT_DB_PATH.resolve():
+        return None
+
+    try:
+        conn = sqlite3.connect(str(LEGACY_BACKEND_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM app_config WHERE id = 1").fetchone()
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not row:
+        return None
+
+    def parse_json(value: Any, fallback: Any) -> Any:
+        if value in (None, ""):
+            return fallback
+        if isinstance(value, (list, dict)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+
+    config = AppConfig(
+        id=1,
+        auto_run_enabled=bool(row["auto_run_enabled"]),
+        auto_run_interval_minutes=int(row["auto_run_interval_minutes"] or 30),
+        tracked_symbols=_normalize_symbols(parse_json(row["tracked_symbols"], []), fallback=DEFAULT_TRACKED_SYMBOLS.copy()),
+        custom_symbols=_normalize_custom_symbols(parse_json(row["custom_symbols"], [])),
+        max_posts=int(row["max_posts"] or 50),
+        include_backtest=bool(row["include_backtest"]),
+        lookback_days=int(row["lookback_days"] or 14),
+        symbol_prompt_overrides=parse_json(row["symbol_prompt_overrides"], {}),
+        symbol_company_aliases=_normalize_symbol_company_aliases(
+            parse_json(row["symbol_company_aliases"] if "symbol_company_aliases" in row.keys() else {}, {}),
+            build_supported_symbols(_normalize_custom_symbols(parse_json(row["custom_symbols"], []))),
+        ),
+        display_timezone=_normalize_display_timezone(row["display_timezone"] if "display_timezone" in row.keys() else ""),
+        enabled_rss_feeds=_normalize_enabled_rss_feeds(parse_json(row["enabled_rss_feeds"], []), _normalize_custom_rss_feeds(parse_json(row["custom_rss_feeds"], []))),
+        custom_rss_feeds=_normalize_custom_rss_feeds(parse_json(row["custom_rss_feeds"], [])),
+        custom_rss_feed_labels=_normalize_custom_rss_feed_labels(
+            parse_json(row["custom_rss_feed_labels"] if "custom_rss_feed_labels" in row.keys() else {}, {}),
+            _normalize_custom_rss_feeds(parse_json(row["custom_rss_feeds"], [])),
+        ),
+        rss_article_detail_mode=_normalize_rss_article_detail_mode(row["rss_article_detail_mode"] if "rss_article_detail_mode" in row.keys() else DEFAULT_RSS_ARTICLE_DETAIL_MODE),
+        rss_article_limits=_normalize_rss_article_limits(parse_json(row["rss_article_limits"] if "rss_article_limits" in row.keys() else {}, {})),
+        data_ingestion_interval_seconds=int(row["data_ingestion_interval_seconds"] or 900),
+        snapshot_retention_limit=int(row["snapshot_retention_limit"] or DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+        web_research_enabled=bool(row["web_research_enabled"]) if "web_research_enabled" in row.keys() else False,
+        last_analysis_started_at=datetime.fromisoformat(row["last_analysis_started_at"]) if row["last_analysis_started_at"] else None,
+        last_analysis_completed_at=datetime.fromisoformat(row["last_analysis_completed_at"]) if row["last_analysis_completed_at"] else None,
+        last_analysis_request_id=row["last_analysis_request_id"],
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    return config
 
 
 def get_or_create_app_config(db: Session) -> AppConfig:
     config = db.query(AppConfig).filter(AppConfig.id == 1).first()
     if config:
-        if not config.tracked_symbols:
-            config.tracked_symbols = DEFAULT_TRACKED_SYMBOLS.copy()
+        changed = False
+        custom_symbols = _infer_custom_symbols(
+            getattr(config, "tracked_symbols", []),
+            getattr(config, "custom_symbols", []),
+        )
+        if getattr(config, "custom_symbols", None) != custom_symbols:
+            config.custom_symbols = custom_symbols
+            changed = True
+        tracked_symbols = _normalize_tracked_symbols(getattr(config, "tracked_symbols", []), custom_symbols)
+        if not tracked_symbols:
+            tracked_symbols = DEFAULT_TRACKED_SYMBOLS.copy()
+        if getattr(config, "tracked_symbols", None) != tracked_symbols:
+            config.tracked_symbols = tracked_symbols
+            changed = True
         if config.symbol_prompt_overrides is None:
             config.symbol_prompt_overrides = {}
+            changed = True
+        if getattr(config, "symbol_company_aliases", None) is None:
+            config.symbol_company_aliases = {}
+            changed = True
+        supported_symbols = build_supported_symbols(custom_symbols)
+        normalized_prompt_overrides = _normalize_prompt_overrides(
+            config.symbol_prompt_overrides,
+            supported_symbols,
+        )
+        if config.symbol_prompt_overrides != normalized_prompt_overrides:
+            config.symbol_prompt_overrides = normalized_prompt_overrides
+            changed = True
+        normalized_symbol_company_aliases = _normalize_symbol_company_aliases(
+            getattr(config, "symbol_company_aliases", {}),
+            supported_symbols,
+        )
+        if getattr(config, "symbol_company_aliases", None) != normalized_symbol_company_aliases:
+            config.symbol_company_aliases = normalized_symbol_company_aliases
+            changed = True
+        normalized_display_timezone = _normalize_display_timezone(getattr(config, "display_timezone", ""))
+        if getattr(config, "display_timezone", "") != normalized_display_timezone:
+            config.display_timezone = normalized_display_timezone
+            changed = True
+        custom_rss_feeds = _normalize_custom_rss_feeds(getattr(config, "custom_rss_feeds", []))
+        if getattr(config, "custom_rss_feeds", None) != custom_rss_feeds:
+            config.custom_rss_feeds = custom_rss_feeds
+            changed = True
+        if getattr(config, "custom_rss_feed_labels", None) is None:
+            config.custom_rss_feed_labels = {}
+            changed = True
+        normalized_custom_rss_feed_labels = _normalize_custom_rss_feed_labels(
+            getattr(config, "custom_rss_feed_labels", {}),
+            custom_rss_feeds,
+        )
+        if getattr(config, "custom_rss_feed_labels", None) != normalized_custom_rss_feed_labels:
+            config.custom_rss_feed_labels = normalized_custom_rss_feed_labels
+            changed = True
+        normalized_enabled_rss_feeds = _normalize_enabled_rss_feeds(
+            getattr(config, "enabled_rss_feeds", []),
+            custom_rss_feeds,
+        )
+        if getattr(config, "enabled_rss_feeds", None) != normalized_enabled_rss_feeds:
+            config.enabled_rss_feeds = normalized_enabled_rss_feeds
+            changed = True
+        normalized_rss_article_detail_mode = _normalize_rss_article_detail_mode(
+            getattr(config, "rss_article_detail_mode", DEFAULT_RSS_ARTICLE_DETAIL_MODE)
+        )
+        if getattr(config, "rss_article_detail_mode", None) != normalized_rss_article_detail_mode:
+            config.rss_article_detail_mode = normalized_rss_article_detail_mode
+            changed = True
+        normalized_rss_article_limits = _normalize_rss_article_limits(getattr(config, "rss_article_limits", {}))
+        if getattr(config, "rss_article_limits", None) != normalized_rss_article_limits:
+            config.rss_article_limits = normalized_rss_article_limits
+            changed = True
+        if getattr(config, "snapshot_retention_limit", None) is None:
+            config.snapshot_retention_limit = DEFAULT_SNAPSHOT_RETENTION_LIMIT
+            changed = True
+        if getattr(config, "web_research_enabled", None) is None:
+            config.web_research_enabled = False
+            changed = True
+        if changed:
+            db.add(config)
+            db.commit()
+            db.refresh(config)
         return config
+
+    imported = _maybe_import_legacy_app_config(db)
+    if imported:
+        return imported
 
     config = AppConfig(
         id=1,
         auto_run_enabled=True,
         auto_run_interval_minutes=30,
         tracked_symbols=DEFAULT_TRACKED_SYMBOLS.copy(),
+        custom_symbols=[],
         max_posts=50,
         include_backtest=True,
         lookback_days=14,
         symbol_prompt_overrides={},
+        symbol_company_aliases={},
+        display_timezone="",
+        enabled_rss_feeds=DEFAULT_RSS_FEED_URLS.copy(),
+        custom_rss_feeds=[],
+        custom_rss_feed_labels={},
+        rss_article_detail_mode=DEFAULT_RSS_ARTICLE_DETAIL_MODE,
+        rss_article_limits=dict(DEFAULT_RSS_ARTICLE_LIMITS),
         data_ingestion_interval_seconds=900,
+        snapshot_retention_limit=DEFAULT_SNAPSHOT_RETENTION_LIMIT,
+        web_research_enabled=False,
     )
     db.add(config)
     db.commit()
@@ -68,6 +429,29 @@ def get_or_create_app_config(db: Session) -> AppConfig:
 def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
     config = get_or_create_app_config(db)
 
+    custom_symbols = _infer_custom_symbols(
+        payload.get("tracked_symbols", config.tracked_symbols),
+        payload.get("custom_symbols", getattr(config, "custom_symbols", [])),
+    )
+    tracked_symbols = _normalize_tracked_symbols(
+        payload.get("tracked_symbols", config.tracked_symbols),
+        custom_symbols,
+    )
+    if not tracked_symbols:
+        tracked_symbols = config.tracked_symbols or DEFAULT_TRACKED_SYMBOLS.copy()
+
+    custom_rss_feeds = _normalize_custom_rss_feeds(
+        payload.get("custom_rss_feeds", getattr(config, "custom_rss_feeds", []))
+    )
+    custom_rss_feed_labels = _normalize_custom_rss_feed_labels(
+        payload.get("custom_rss_feed_labels", getattr(config, "custom_rss_feed_labels", {})),
+        custom_rss_feeds,
+    )
+    enabled_rss_feeds = _normalize_enabled_rss_feeds(
+        payload.get("enabled_rss_feeds", getattr(config, "enabled_rss_feeds", DEFAULT_RSS_FEED_URLS)),
+        custom_rss_feeds,
+    )
+
     if "auto_run_enabled" in payload:
         config.auto_run_enabled = bool(payload.get("auto_run_enabled"))
     if "auto_run_interval_minutes" in payload:
@@ -76,8 +460,10 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         except (TypeError, ValueError):
             value = config.auto_run_interval_minutes
         config.auto_run_interval_minutes = max(5, min(360, value))
-    if "tracked_symbols" in payload:
-        config.tracked_symbols = _normalize_symbols(payload.get("tracked_symbols"))
+
+    config.custom_symbols = custom_symbols
+    config.tracked_symbols = tracked_symbols
+
     if "max_posts" in payload:
         try:
             value = int(payload.get("max_posts"))
@@ -93,13 +479,45 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
             value = config.lookback_days
         config.lookback_days = max(7, min(30, value))
     if "symbol_prompt_overrides" in payload:
-        config.symbol_prompt_overrides = _normalize_prompt_overrides(payload.get("symbol_prompt_overrides"))
+        config.symbol_prompt_overrides = _normalize_prompt_overrides(
+            payload.get("symbol_prompt_overrides"),
+            build_supported_symbols(custom_symbols),
+        )
+    if "display_timezone" in payload:
+        config.display_timezone = _normalize_display_timezone(payload.get("display_timezone"))
+    if "symbol_company_aliases" in payload:
+        config.symbol_company_aliases = _normalize_symbol_company_aliases(
+            payload.get("symbol_company_aliases"),
+            build_supported_symbols(custom_symbols),
+        )
+    if "enabled_rss_feeds" in payload or "custom_rss_feeds" in payload or "custom_rss_feed_labels" in payload:
+        config.custom_rss_feeds = custom_rss_feeds
+        config.custom_rss_feed_labels = custom_rss_feed_labels
+        config.enabled_rss_feeds = enabled_rss_feeds
+    if "rss_article_detail_mode" in payload:
+        config.rss_article_detail_mode = _normalize_rss_article_detail_mode(payload.get("rss_article_detail_mode"))
+    if "rss_article_limits" in payload:
+        config.rss_article_limits = _normalize_rss_article_limits(payload.get("rss_article_limits"))
     if "data_ingestion_interval_seconds" in payload:
         try:
             value = int(payload.get("data_ingestion_interval_seconds"))
         except (TypeError, ValueError):
             value = config.data_ingestion_interval_seconds
         config.data_ingestion_interval_seconds = max(60, min(3600, value))
+    if "snapshot_retention_limit" in payload:
+        try:
+            value = int(payload.get("snapshot_retention_limit"))
+        except (TypeError, ValueError):
+            value = getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT)
+        config.snapshot_retention_limit = max(1, min(100, value))
+    if "extraction_model" in payload:
+        config.extraction_model = str(payload.get("extraction_model") or "").strip()
+    if "reasoning_model" in payload:
+        config.reasoning_model = str(payload.get("reasoning_model") or "").strip()
+    if "risk_profile" in payload:
+        config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
+    if "web_research_enabled" in payload:
+        config.web_research_enabled = bool(payload.get("web_research_enabled"))
 
     db.add(config)
     db.commit()
@@ -139,21 +557,57 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
     elif not config.auto_run_enabled:
         can_auto_run_now = False
 
+    custom_symbols = _normalize_custom_symbols(getattr(config, "custom_symbols", []))
+    tracked_symbols = _normalize_tracked_symbols(getattr(config, "tracked_symbols", []), custom_symbols)
+    custom_rss_feeds = _normalize_custom_rss_feeds(getattr(config, "custom_rss_feeds", []))
+    custom_rss_feed_labels = _normalize_custom_rss_feed_labels(
+        getattr(config, "custom_rss_feed_labels", {}),
+        custom_rss_feeds,
+    )
+    enabled_rss_feeds = _normalize_enabled_rss_feeds(getattr(config, "enabled_rss_feeds", []), custom_rss_feeds)
+
     return {
         "auto_run_enabled": config.auto_run_enabled,
         "auto_run_interval_minutes": config.auto_run_interval_minutes,
-        "tracked_symbols": _normalize_symbols(config.tracked_symbols),
+        "tracked_symbols": tracked_symbols or DEFAULT_TRACKED_SYMBOLS.copy(),
+        "custom_symbols": custom_symbols,
+        "default_symbols": DEFAULT_TRACKED_SYMBOLS.copy(),
+        "max_custom_symbols": MAX_CUSTOM_SYMBOLS,
         "max_posts": config.max_posts,
         "include_backtest": config.include_backtest,
         "lookback_days": config.lookback_days,
-        "symbol_prompt_overrides": _normalize_prompt_overrides(config.symbol_prompt_overrides),
+        "symbol_prompt_overrides": _normalize_prompt_overrides(
+            config.symbol_prompt_overrides,
+            build_supported_symbols(custom_symbols),
+        ),
+        "symbol_company_aliases": _normalize_symbol_company_aliases(
+            getattr(config, "symbol_company_aliases", {}),
+            build_supported_symbols(custom_symbols),
+        ),
+        "display_timezone": _normalize_display_timezone(getattr(config, "display_timezone", "")),
+        "default_rss_feeds": DEFAULT_RSS_FEEDS,
+        "custom_rss_feeds": custom_rss_feeds,
+        "custom_rss_feed_labels": custom_rss_feed_labels,
+        "enabled_rss_feeds": enabled_rss_feeds,
+        "supported_rss_feeds": build_supported_rss_feeds(custom_rss_feeds, custom_rss_feed_labels),
+        "max_custom_rss_feeds": MAX_CUSTOM_RSS_FEEDS,
+        "rss_article_detail_mode": _normalize_rss_article_detail_mode(
+            getattr(config, "rss_article_detail_mode", DEFAULT_RSS_ARTICLE_DETAIL_MODE)
+        ),
+        "rss_article_limits": _normalize_rss_article_limits(getattr(config, "rss_article_limits", {})),
+        "rss_articles_per_feed": resolve_rss_articles_per_feed(config),
         "data_ingestion_interval_seconds": config.data_ingestion_interval_seconds,
+        "snapshot_retention_limit": getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+        "extraction_model": str(getattr(config, "extraction_model", "") or ""),
+        "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
+        "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
+        "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
         "last_analysis_started_at": config.last_analysis_started_at.isoformat() if config.last_analysis_started_at else None,
         "last_analysis_completed_at": config.last_analysis_completed_at.isoformat() if config.last_analysis_completed_at else None,
         "last_analysis_request_id": config.last_analysis_request_id,
         "seconds_until_next_auto_run": seconds_until_next,
         "can_auto_run_now": can_auto_run_now,
-        "supported_symbols": sorted(SUPPORTED_SYMBOLS),
+        "supported_symbols": build_supported_symbols(custom_symbols),
         "estimated_analysis_seconds": DEFAULT_ESTIMATED_ANALYSIS_SECONDS,
     }
 

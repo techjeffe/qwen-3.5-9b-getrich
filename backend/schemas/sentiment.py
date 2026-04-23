@@ -30,7 +30,7 @@ class SentimentAnalysisResult(BaseModel):
         default=0.0,
         ge=-1.0,
         le=1.0,
-        description="Bluster intensity score (-1 to +1)"
+        description="Hype-vs-substance score: -1 = strong bluster/hype, +1 = substantive content"
     )
     bluster_indicators: List[str] = Field(
         default_factory=list,

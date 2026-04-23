@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
+from services.app_config import MAX_TRACKED_SYMBOLS, is_valid_symbol
+
 
 class SentimentScore(BaseModel):
     """
@@ -16,7 +18,7 @@ class SentimentScore(BaseModel):
         default=0.0,
         ge=-1.0,
         le=1.0,
-        description="Bluster score: -1 (strong bluster) to +1 (no bluster)"
+        description="Hype-vs-substance score: -1 = headline bluster/hype, +1 = substantive news"
     )
     policy_change: float = Field(
         default=0.0,
@@ -47,7 +49,7 @@ class SentimentScore(BaseModel):
 class TradingSignal(BaseModel):
     """
     Trading signal generated from sentiment analysis.
-    Includes entry/exit parameters for 3x leveraged ETFs.
+    Includes broker-friendly entry/exit parameters for the tradable instrument.
     """
     signal_type: Literal["LONG", "SHORT", "HOLD"] = Field(
         default="HOLD",
@@ -61,7 +63,7 @@ class TradingSignal(BaseModel):
     )
     
     # Entry parameters
-    entry_symbol: str = Field(default="USO", description="Primary ETF symbol")
+    entry_symbol: str = Field(default="USO", description="Primary tradable ticker to execute")
     entry_price: Optional[float] = Field(
         default=None,
         description="Suggested entry price"
@@ -81,7 +83,7 @@ class TradingSignal(BaseModel):
         description="Take profit percentage"
     )
     
-    # Position sizing (3x leverage)
+    # Position sizing / leverage metadata
     position_size_usd: Optional[float] = Field(
         default=None,
         description="Suggested position size in USD"
@@ -92,11 +94,34 @@ class TradingSignal(BaseModel):
         default="MEDIUM",
         description="Trade urgency level"
     )
+    
+    # Conviction and holding strategy
+    conviction_level: Literal["LOW", "MEDIUM", "HIGH"] = Field(
+        default="MEDIUM",
+        description="Conviction strength independent of analysis confidence (LOW=reactive/bluster, MEDIUM=data-driven swing, HIGH=structural multi-day thesis)"
+    )
+    
+    holding_period_hours: int = Field(
+        default=4,
+        ge=1,
+        le=720,
+        description="Expected holding period in hours, assuming no major news or stop/profit triggers"
+    )
+    
+    trading_type: Literal["SCALP", "SWING", "POSITION", "VOLATILE_EVENT"] = Field(
+        default="SWING",
+        description="Trade classification to guide re-analysis strategy (SCALP: 1-2h, SWING: 4-24h, POSITION: 24-168h, VOLATILE_EVENT: 1-4h)"
+    )
+    
+    action_if_already_in_position: Literal["HOLD", "EXIT", "ADD", "TAKE_PROFIT"] = Field(
+        default="HOLD",
+        description="Recommended action if already holding the same symbol with conflicting signal"
+    )
 
     # Specific actionable recommendations
     recommendations: List[Dict[str, str]] = Field(
         default_factory=list,
-        description='List of {action, symbol, leverage} e.g. {"action":"BUY","symbol":"QQQ","leverage":"3x"}'
+        description='List of broker-ready recommendations like {"action":"BUY","symbol":"TQQQ","leverage":"3x","underlying_symbol":"QQQ"}'
     )
 
     model_config = {
@@ -104,15 +129,61 @@ class TradingSignal(BaseModel):
             "example": {
                 "signal_type": "LONG",
                 "confidence_score": 0.87,
-                "entry_symbol": "USO",
+                "entry_symbol": "TQQQ",
                 "entry_price": 24.50,
                 "stop_loss_pct": 2.0,
                 "take_profit_pct": 3.0,
                 "position_size_usd": 1000.0,
-                "urgency": "HIGH"
+                "urgency": "HIGH",
+                "conviction_level": "HIGH",
+                "holding_period_hours": 24,
+                "trading_type": "SWING",
+                "action_if_already_in_position": "HOLD",
+                "recommendations": [{"action": "BUY", "symbol": "TQQQ", "leverage": "3x", "underlying_symbol": "QQQ"}],
             }
         }
     }
+
+
+class RedTeamSymbolReview(BaseModel):
+    symbol: str = Field(default="")
+    current_recommendation: str = Field(default="")
+    thesis: str = Field(default="")
+    antithesis: str = Field(default="")
+    evidence: List[str] = Field(default_factory=list)
+    key_risks: List[str] = Field(default_factory=list)
+    adjusted_signal: Literal["BUY", "SELL", "HOLD"] = Field(default="HOLD")
+    adjusted_confidence: float = Field(default=0.0, ge=0.0, le=1.0)  # populated by Python, not LLM
+    adjusted_urgency: Literal["LOW", "MEDIUM", "HIGH"] = Field(default="LOW")
+    stop_loss_pct: float = Field(default=2.0, ge=0.1, le=25.0)  # populated by Python, not LLM
+    atr_basis: str = Field(default="")
+    rationale: str = Field(default="")
+
+
+class RedTeamReview(BaseModel):
+    summary: str = Field(default="")
+    portfolio_risks: List[str] = Field(default_factory=list)
+    source_bias_penalty_applied: bool = Field(default=False)
+    source_bias_notes: str = Field(default="")
+    symbol_reviews: List[RedTeamSymbolReview] = Field(default_factory=list)
+
+
+class RedTeamSignalChange(BaseModel):
+    symbol: str = Field(default="")
+    blue_team_recommendation: str = Field(default="")
+    consensus_recommendation: str = Field(default="")
+    changed: bool = Field(default=False)
+    change_type: str = Field(default="unchanged")
+    rationale: str = Field(default="")
+    evidence: List[str] = Field(default_factory=list)
+
+
+class RedTeamDebug(BaseModel):
+    context: Dict[str, Any] = Field(default_factory=dict)
+    prompt: str = Field(default="")
+    raw_response: str = Field(default="")
+    parsed_payload: Dict[str, Any] = Field(default_factory=dict)
+    signal_changes: List[RedTeamSignalChange] = Field(default_factory=list)
 
 
 class BacktestResults(BaseModel):
@@ -190,10 +261,10 @@ class AnalysisRequest(BaseModel):
     Request schema for triggering a full analysis pipeline.
     """
     symbols: List[str] = Field(
-        default=["USO", "BITO"],
+        default=["USO", "BITO", "QQQ", "SPY"],
         min_length=1,
-        max_length=5,
-        description="ETF symbols to analyze (e.g., USO, BITO)"
+        max_length=MAX_TRACKED_SYMBOLS,
+        description="Ticker symbols to analyze (e.g., USO, BITO, QQQ, SPY)"
     )
     max_posts: int = Field(
         default=50,
@@ -215,12 +286,17 @@ class AnalysisRequest(BaseModel):
     @field_validator("symbols")
     @classmethod
     def validate_symbols(cls, v: List[str]) -> List[str]:
-        """Validate that symbols are valid ETF tickers."""
-        valid_symbols = {"SPY", "USO", "BITO", "QQQ", "SQQQ", "UNG"}
+        """Validate that symbols are syntactically valid and unique."""
+        normalized: List[str] = []
         for symbol in v:
-            if symbol not in valid_symbols:
-                raise ValueError(f"Invalid symbol: {symbol}. Valid options: {valid_symbols}")
-        return v
+            value = str(symbol or "").upper().strip()
+            if not is_valid_symbol(value):
+                raise ValueError(f"Invalid symbol: {symbol}")
+            if value not in normalized:
+                normalized.append(value)
+        if not normalized:
+            raise ValueError("At least one symbol is required")
+        return normalized[:MAX_TRACKED_SYMBOLS]
 
 
 class ModelInputArticle(BaseModel):
@@ -230,6 +306,20 @@ class ModelInputArticle(BaseModel):
     title: str = Field(default="")
     description: str = Field(default="")
     keywords: List[str] = Field(default_factory=list)
+
+
+class ModelInputWebItem(BaseModel):
+    """Recent web research item included in the compiled model input."""
+
+    source: str = Field(default="")
+    title: str = Field(default="")
+    url: str = Field(default="")
+    published_at: str = Field(default="")
+    summary: str = Field(default="")
+    query: str = Field(default="")
+    relevance_score: float = Field(default=0.0)
+    age_days: float = Field(default=0.0)
+    matched_keywords: List[str] = Field(default_factory=list)
 
 
 class ModelInputDebug(BaseModel):
@@ -254,6 +344,14 @@ class ModelInputDebug(BaseModel):
     per_symbol_prompts: Dict[str, str] = Field(
         default_factory=dict,
         description="Exact compiled prompt text sent to each symbol specialist"
+    )
+    web_context_by_symbol: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Lightweight recent web research summary injected per symbol"
+    )
+    web_items_by_symbol: Dict[str, List[ModelInputWebItem]] = Field(
+        default_factory=dict,
+        description="Structured recent web research items shown in Advanced Mode"
     )
 
 
@@ -293,6 +391,11 @@ class AnalysisResponse(BaseModel):
         description="Generated trading signal"
     )
 
+    blue_team_signal: Optional[TradingSignal] = Field(
+        default=None,
+        description="Original pre-red-team signal before adversarial adjustment"
+    )
+
     # Structured market validation inputs
     market_validation: Dict[str, Dict[str, Any]] = Field(
         default_factory=dict,
@@ -302,6 +405,16 @@ class AnalysisResponse(BaseModel):
     model_inputs: Optional[ModelInputDebug] = Field(
         default=None,
         description="Debug view of the compiled inputs supplied to the sentiment model"
+    )
+
+    red_team_review: Optional[RedTeamReview] = Field(
+        default=None,
+        description="Adversarial post-trade review that stress-tests the final recommendation set"
+    )
+
+    red_team_debug: Optional[RedTeamDebug] = Field(
+        default=None,
+        description="Detailed red-team prompt, raw response, parsed payload, and blue-vs-consensus diffs"
     )
     
     # Backtest results (optional)

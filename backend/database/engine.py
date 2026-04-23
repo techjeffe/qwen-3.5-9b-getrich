@@ -1,20 +1,24 @@
 """
-Database connection setup using SQLAlchemy with SQLite
+Database connection setup using SQLAlchemy with SQLite.
 """
 
 import os
+from pathlib import Path
 from typing import Generator
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Database URL from environment or default to SQLite
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///./trading_system.db"
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT_DB_PATH = REPO_ROOT / "trading_system.db"
+LEGACY_BACKEND_DB_PATH = REPO_ROOT / "backend" / "trading_system.db"
+DEFAULT_DATABASE_URL = f"sqlite:///{ROOT_DB_PATH.as_posix()}"
+
+# Database URL from environment or default to the repo-root SQLite file
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 # Create engine with SQLite-specific settings for file-based DB
 engine = create_engine(
