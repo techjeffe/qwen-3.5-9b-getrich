@@ -798,13 +798,12 @@ def _sse_article(source: str, title: str, description: str, keywords: list) -> s
     summary="Run full analysis pipeline with real-time progress",
     tags=["Analysis"]
 )
-async def analyze_market_stream(request: AnalysisRequest):
+async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(get_db)):
     """SSE endpoint streaming progress events then the final result."""
 
     async def generate() -> AsyncGenerator[str, None]:
         start_time = time.time()
         request_id = str(uuid.uuid4())[:8]
-        db = SessionLocal()
         pipeline_events: List[str] = []
         stage_times: Dict[str, float] = {}
 
@@ -1120,7 +1119,7 @@ async def analyze_market_stream(request: AnalysisRequest):
             )
 
             _save_analysis_and_trades(
-                request_id, response, quotes_by_symbol, posts, prompt_overrides, active_model,
+                db, request_id, response, quotes_by_symbol, posts, prompt_overrides, active_model,
                 extraction_model=extraction_model or "",
                 reasoning_model=reasoning_model or "",
                 risk_profile=_stream_risk,
@@ -1144,9 +1143,6 @@ async def analyze_market_stream(request: AnalysisRequest):
                 error=str(e),
             )
             yield _sse_error(str(e))
-        finally:
-            db.close()
-
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -1187,7 +1183,7 @@ async def analyze_market(
         prompt_overrides = config.symbol_prompt_overrides or {}
         mark_analysis_started(db, request_id)
 
-        posts, ingestion_trace = await _ingest_data(effective_request)
+        posts, ingestion_trace = await _ingest_data(effective_request, config)
         price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
         price_context = _inject_technical_context(price_context, effective_request.symbols, db)
         web_context_by_symbol, web_items_by_symbol = await _get_symbol_web_research(
@@ -1370,7 +1366,7 @@ async def analyze_market(
         )
 
 
-async def _ingest_data(request: AnalysisRequest) -> Tuple[List[Any], Dict[str, Any]]:
+async def _ingest_data(request: AnalysisRequest, config: Any) -> Tuple[List[Any], Dict[str, Any]]:
     """Ingest posts from Truth Social and RSS feeds. Returns posts plus a structured trace."""
     posts: List[Any] = []
     truth_status = {"status": "ok", "count": 0, "error": None}
@@ -1400,15 +1396,10 @@ async def _ingest_data(request: AnalysisRequest) -> Tuple[List[Any], Dict[str, A
         truth_status["error"] = str(e)
         trace["truth_social"] = {"status": "error", "count": 0, "items": [], "error": str(e)}
 
-    db = SessionLocal()
-    try:
-        config = get_or_create_app_config(db)
-        feed_map = build_enabled_rss_feed_map(config)
-        parser = RSSFeedParser(feeds=feed_map)
-        per_feed_cap = resolve_rss_articles_per_feed(config)
-        max_total_posts = max(request.max_posts, per_feed_cap * max(1, len(parser.feeds)))
-    finally:
-        db.close()
+    feed_map = build_enabled_rss_feed_map(config)
+    parser = RSSFeedParser(feeds=feed_map)
+    per_feed_cap = resolve_rss_articles_per_feed(config)
+    max_total_posts = max(request.max_posts, per_feed_cap * max(1, len(parser.feeds)))
     try:
         rss_articles: List[Any] = []
         feed_traces: List[Dict[str, Any]] = []
@@ -2521,10 +2512,7 @@ def _generate_trading_signal(
             overall_urgency = urgency
 
     normalized_basket_score = (net_direction_score / total_weight) if total_weight > 0 else 0.0
-
-    basket_entry_threshold = 0.28 if is_closed_hysteresis else 0.18
-    basket_keep_threshold = 0.10 if is_closed_hysteresis else 0.18
-    previous_signal_type = str(getattr(previous_signal, "signal_type", "HOLD") or "HOLD").upper().strip()
+    avg_confidence = sum(result['confidence'] for result in sentiment_results.values()) / len(sentiment_results)
 
     if long_recommendations == len(symbols) and len(symbols) > 0:
         signal_type = "LONG"
@@ -2532,38 +2520,34 @@ def _generate_trading_signal(
         signal_type = "SHORT"
     elif hold_recommendations == len(symbols) and len(symbols) > 0:
         signal_type = "HOLD"
-    elif previous_signal_type == "LONG" and normalized_basket_score >= basket_keep_threshold:
+    elif long_recommendations > 0 and short_recommendations == 0:
         signal_type = "LONG"
-    elif previous_signal_type == "SHORT" and normalized_basket_score <= -basket_keep_threshold:
+    elif short_recommendations > 0 and long_recommendations == 0:
         signal_type = "SHORT"
-    elif normalized_basket_score >= basket_entry_threshold:
-        signal_type = "LONG"
-    elif normalized_basket_score <= -basket_entry_threshold:
-        signal_type = "SHORT"
+    elif recommendations:
+        strongest_recommendation = max(
+            recommendations,
+            key=lambda rec: abs(float(sentiment_results[rec["underlying_symbol"]].get("directional_score", 0.0)))
+            * float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0)),
+        )
+        signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
+        strongest_symbol = strongest_recommendation["underlying_symbol"]
+        strongest_execution_symbol = strongest_recommendation["symbol"]
     else:
         signal_type = "HOLD"
 
-    avg_confidence = sum(result['confidence'] for result in sentiment_results.values()) / len(sentiment_results)
-    basket_confidence = min(1.0, max(abs(normalized_basket_score), 0.0) * 1.35)
-    confidence_score = avg_confidence if signal_type == "HOLD" else min(1.0, avg_confidence * 0.55 + basket_confidence * 0.45)
-
-    if signal_type != "HOLD":
-        matching_recommendations = [
-            rec
+    if signal_type == "HOLD":
+        confidence_score = avg_confidence
+        overall_urgency = "LOW"
+    elif recommendations:
+        actionable_confidences = [
+            float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0))
             for rec in recommendations
             if rec.get("thesis") == signal_type
         ]
-        if matching_recommendations:
-            strongest_recommendation = max(
-                matching_recommendations,
-                key=lambda rec: abs(float(sentiment_results[rec["underlying_symbol"]].get("directional_score", 0.0)))
-                * float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0)),
-            )
-            strongest_symbol = strongest_recommendation["underlying_symbol"]
-            strongest_execution_symbol = strongest_recommendation["symbol"]
-
-    if abs(normalized_basket_score) < basket_entry_threshold:
-        overall_urgency = "LOW"
+        confidence_score = max(actionable_confidences) if actionable_confidences else avg_confidence
+    else:
+        confidence_score = avg_confidence
 
     # ── Determine conviction level and trading type ──────────────────────────
     # Conviction levels: LOW (reactive), MEDIUM (data-driven), HIGH (structural)
@@ -2593,7 +2577,7 @@ def _generate_trading_signal(
     else:
         if signal_type == "HOLD":
             conviction_level = "LOW"
-        elif abs(normalized_basket_score) > 0.6 and confidence_score > 0.7:
+        elif strongest_score > 0.6 and confidence_score > 0.7:
             conviction_level = "HIGH"  # Strong structural signal
         elif overall_urgency == "HIGH" and confidence_score < 0.6:
             conviction_level = "LOW"  # Reactive bluster
@@ -2743,14 +2727,27 @@ def _build_consensus_trading_signal(
         )
 
     if recommendations:
-        avg_signed = sum(signed_scores) / max(1, len(signed_scores))
-        if avg_signed >= 0.18:
+        buy_recommendations = [rec for rec in recommendations if str(rec.get("action") or "").upper() == "BUY" and str(rec.get("thesis") or "").upper() == "LONG"]
+        sell_recommendations = [rec for rec in recommendations if str(rec.get("action") or "").upper() == "BUY" and str(rec.get("thesis") or "").upper() == "SHORT"]
+        if buy_recommendations and not sell_recommendations:
             signal_type = "LONG"
-        elif avg_signed <= -0.18:
+        elif sell_recommendations and not buy_recommendations:
             signal_type = "SHORT"
         else:
-            signal_type = "HOLD"
-        confidence_score = sum(computed_confidences) / len(computed_confidences)
+            strongest_recommendation = max(
+                recommendations,
+                key=lambda rec: abs(float(next(
+                    (
+                        computed_confidences[idx]
+                        for idx, rv in enumerate(red_team_review.symbol_reviews)
+                        if str(rv.symbol or "").upper().strip() == str(rec.get("underlying_symbol") or "").upper().strip()
+                    ),
+                    0.0,
+                ))),
+            )
+            signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
+            strongest_execution_symbol = strongest_recommendation["symbol"]
+        confidence_score = max(computed_confidences) if computed_confidences else 0.0
     else:
         signal_type = "HOLD"
         confidence_score = sum(computed_confidences) / max(1, len(computed_confidences))
@@ -2876,12 +2873,9 @@ async def _run_red_team_review(
     engine = SentimentEngine(model_name=model_name)
     raw = await engine._call_ollama(prompt, model_override=model_name, force_json=True, max_tokens=700)
     raw_text = engine._strip_thinking(raw.get("response", ""))
-    text = raw_text.strip()
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start < 0 or end <= start:
-        raise ValueError("Red-team review did not return valid JSON")
-    payload = engine._parse_json_with_repair(engine._sanitize_json(text[start:end]))
+    payload = engine._extract_json_value(raw_text)
+    if not isinstance(payload, dict):
+        raise ValueError("Red-team review returned non-object JSON")
     review = RedTeamReview.model_validate(payload)
     debug = RedTeamDebug(
         context=context,
@@ -3115,6 +3109,7 @@ def _save_analysis_result(
 
 
 def _save_analysis_and_trades(
+    db: Session,
     request_id: str,
     response: AnalysisResponse,
     quotes_by_symbol: Dict[str, Dict[str, Any]],
@@ -3127,24 +3122,20 @@ def _save_analysis_and_trades(
     secret_trace: Optional[Dict[str, Any]] = None,
     sentiment_results: Optional[Dict[str, Any]] = None,
 ) -> None:
-    db = SessionLocal()
-    try:
-        _save_analysis_result(
-            db,
-            request_id,
-            response,
-            quotes_by_symbol,
-            posts=posts,
-            model_name=model_name,
-            prompt_overrides=prompt_overrides,
-            extraction_model=extraction_model,
-            reasoning_model=reasoning_model,
-            risk_profile=risk_profile,
-            secret_trace=secret_trace,
-            sentiment_results=sentiment_results,
-        )
-    finally:
-        db.close()
+    _save_analysis_result(
+        db,
+        request_id,
+        response,
+        quotes_by_symbol,
+        posts=posts,
+        model_name=model_name,
+        prompt_overrides=prompt_overrides,
+        extraction_model=extraction_model,
+        reasoning_model=reasoning_model,
+        risk_profile=risk_profile,
+        secret_trace=secret_trace,
+        sentiment_results=sentiment_results,
+    )
 
 
 @router.get("/paper-trading/summary", tags=["Paper Trading"])

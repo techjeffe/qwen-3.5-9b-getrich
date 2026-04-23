@@ -484,6 +484,44 @@ class SentimentEngine:
                     raise
         return json.loads(s)
 
+    @staticmethod
+    def _extract_json_value(text: str) -> Any:
+        """
+        Robustly extract the first decodable JSON value from model output.
+
+        Tries, in order:
+        - full response as-is
+        - fenced ```json ... ``` blocks
+        - first decodable object/array found via raw_decode scanning
+
+        This is safer than slicing from the first '{' to the last '}' because it
+        tolerates trailing prose, stray brackets, and top-level arrays.
+        """
+        decoder = json.JSONDecoder()
+        raw = str(text or "").strip()
+        if not raw:
+            raise ValueError("Empty model response")
+
+        candidates: list[str] = [raw]
+        fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
+        candidates.extend(block.strip() for block in fenced_blocks if block.strip())
+
+        for candidate in candidates:
+            sanitized = SentimentEngine._sanitize_json(candidate)
+            try:
+                return SentimentEngine._parse_json_with_repair(sanitized)
+            except Exception:
+                pass
+
+            for match in re.finditer(r"[\{\[]", sanitized):
+                try:
+                    value, _ = decoder.raw_decode(sanitized[match.start():])
+                    return value
+                except json.JSONDecodeError:
+                    continue
+
+        raise ValueError("No decodable JSON payload found in model response")
+
     async def _call_ollama(
         self,
         prompt: str,
@@ -534,14 +572,9 @@ class SentimentEngine:
                 prompt, model_override=model, force_json=True, max_tokens=512
             )
             raw_text = self._strip_thinking(raw.get("response", ""))
-            text = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
-
-            obj_start = text.find("{")
-            end = text.rfind("}") + 1
-            if obj_start < 0 or end <= obj_start:
-                raise ValueError("No JSON object found")
-
-            data = self._parse_json_with_repair(self._sanitize_json(text[obj_start:end]))
+            data = self._extract_json_value(raw_text)
+            if not isinstance(data, dict):
+                raise ValueError("Keyword generation returned non-object JSON")
             raw_terms = (
                 data.get("terms") or data.get("keywords")
                 or data.get("proxy_terms") or []
