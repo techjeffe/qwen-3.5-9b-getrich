@@ -24,6 +24,23 @@ _REGULAR_OPEN   = time_cls(9, 30)
 _REGULAR_CLOSE  = time_cls(16, 0)
 
 
+def _directional_return_pct(signal_type: str, entry_price: float, current_price: float) -> float:
+    """Return percentage P&L with correct sign for long vs short paper trades."""
+    if entry_price <= 0 or current_price <= 0:
+        return 0.0
+
+    raw_return = (current_price - entry_price) / entry_price
+    if str(signal_type or "").upper() == "SHORT":
+        raw_return *= -1
+
+    return raw_return * 100.0
+
+
+def _directional_pnl(signal_type: str, entry_price: float, current_price: float, amount: float) -> float:
+    """Convert directional return into dollar P&L for the paper notional."""
+    return amount * (_directional_return_pct(signal_type, entry_price, current_price) / 100.0)
+
+
 def market_status() -> Dict[str, Any]:
     """Return current market session for display and gate-keeping."""
     now_et = datetime.now(_MARKET_TZ)
@@ -147,11 +164,11 @@ def process_signals(
 
 
 def _close_position(pos, exit_price: float, now: datetime, db) -> None:
-    raw_return = (exit_price / pos.entry_price) - 1
+    pnl_pct = _directional_return_pct(pos.signal_type, pos.entry_price, exit_price)
     pos.exit_price = exit_price
     pos.exited_at = now
-    pos.realized_pnl = round(raw_return * pos.amount, 4)
-    pos.realized_pnl_pct = round(raw_return * 100, 4)
+    pos.realized_pnl = round(_directional_pnl(pos.signal_type, pos.entry_price, exit_price, pos.amount), 4)
+    pos.realized_pnl_pct = round(pnl_pct, 4)
 
 
 def get_summary(db) -> Dict[str, Any]:
@@ -165,9 +182,19 @@ def get_summary(db) -> Dict[str, Any]:
     closed = [t for t in trades if t.exited_at is not None]
     open_positions_raw = [t for t in trades if t.exited_at is None]
 
-    realized_pnl = sum(t.realized_pnl or 0.0 for t in closed)
-    wins = [t for t in closed if (t.realized_pnl or 0) > 0]
-    losses = [t for t in closed if (t.realized_pnl or 0) <= 0]
+    closed_metrics = []
+    for t in closed:
+        pnl = _directional_pnl(t.signal_type, t.entry_price, float(t.exit_price or t.entry_price), t.amount)
+        pnl_pct = _directional_return_pct(t.signal_type, t.entry_price, float(t.exit_price or t.entry_price))
+        closed_metrics.append({
+            "trade": t,
+            "realized_pnl": round(pnl, 4),
+            "realized_pnl_pct": round(pnl_pct, 4),
+        })
+
+    realized_pnl = sum(item["realized_pnl"] for item in closed_metrics)
+    wins = [item for item in closed_metrics if item["realized_pnl"] > 0]
+    losses = [item for item in closed_metrics if item["realized_pnl"] <= 0]
 
     open_pnl = 0.0
     open_positions = []
@@ -177,8 +204,8 @@ def get_summary(db) -> Dict[str, Any]:
             current = float(q.get("current_price") or t.entry_price) if q else t.entry_price
         except Exception:
             current = t.entry_price
-        raw_return = (current / t.entry_price) - 1
-        unrealized = round(raw_return * t.amount, 4)
+        unrealized = round(_directional_pnl(t.signal_type, t.entry_price, current, t.amount), 4)
+        unrealized_pct = round(_directional_return_pct(t.signal_type, t.entry_price, current), 4)
         open_pnl += unrealized
         open_positions.append({
             "id": t.id,
@@ -193,7 +220,7 @@ def get_summary(db) -> Dict[str, Any]:
             "entered_at": _utc_iso(t.entered_at),
             "market_session": t.market_session,
             "unrealized_pnl": unrealized,
-            "unrealized_pnl_pct": round(raw_return * 100, 4),
+            "unrealized_pnl_pct": unrealized_pct,
         })
 
     total_deployed = PAPER_TRADE_AMOUNT * len(trades)
@@ -202,19 +229,21 @@ def get_summary(db) -> Dict[str, Any]:
     # Equity curve: cumulative realized P&L per closed trade
     equity_curve = []
     running = 0.0
-    for t in closed:
-        running += t.realized_pnl or 0.0
+    for item in closed_metrics:
+        t = item["trade"]
+        running += item["realized_pnl"]
         equity_curve.append({
             "at": _utc_iso(t.exited_at),
             "cumulative_pnl": round(running, 4),
-            "trade_pnl": t.realized_pnl,
-            "trade_pnl_pct": t.realized_pnl_pct,
+            "trade_pnl": item["realized_pnl"],
+            "trade_pnl_pct": item["realized_pnl_pct"],
             "ticker": t.execution_ticker,
             "underlying": t.underlying,
         })
 
     closed_trades = []
-    for t in reversed(closed):
+    for item in reversed(closed_metrics):
+        t = item["trade"]
         closed_trades.append({
             "id": t.id,
             "underlying": t.underlying,
@@ -227,8 +256,8 @@ def get_summary(db) -> Dict[str, Any]:
             "exit_price": t.exit_price,
             "entered_at": _utc_iso(t.entered_at),
             "exited_at": _utc_iso(t.exited_at),
-            "realized_pnl": t.realized_pnl,
-            "realized_pnl_pct": t.realized_pnl_pct,
+            "realized_pnl": item["realized_pnl"],
+            "realized_pnl_pct": item["realized_pnl_pct"],
             "market_session": t.market_session,
         })
 
@@ -246,8 +275,8 @@ def get_summary(db) -> Dict[str, Any]:
             "win_count": len(wins),
             "loss_count": len(losses),
             "win_rate": round(len(wins) / max(len(closed), 1) * 100, 1) if closed else 0,
-            "avg_win": round(sum(t.realized_pnl or 0 for t in wins) / max(len(wins), 1), 4) if wins else 0,
-            "avg_loss": round(sum(t.realized_pnl or 0 for t in losses) / max(len(losses), 1), 4) if losses else 0,
+            "avg_win": round(sum(item["realized_pnl"] for item in wins) / max(len(wins), 1), 4) if wins else 0,
+            "avg_loss": round(sum(item["realized_pnl"] for item in losses) / max(len(losses), 1), 4) if losses else 0,
         },
         "open_positions": open_positions,
         "closed_trades": closed_trades,
