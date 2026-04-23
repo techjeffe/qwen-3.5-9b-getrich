@@ -35,6 +35,31 @@ class Post(Base):
     )
 
 
+class ScrapedArticle(Base):
+    """
+    Queue-backed article store for the producer/consumer ingestion flow.
+    Articles are inserted by the ingestion worker and consumed by analysis runs.
+    """
+    __tablename__ = "scraped_articles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(100), nullable=False)
+    url = Column(Text, nullable=False, unique=True)
+    title = Column(Text, nullable=False, default="")
+    summary = Column(Text, nullable=False, default="")
+    full_content = Column(Text, nullable=False, default="")
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    discovered_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    processed = Column(Boolean, nullable=False, default=False)
+    fast_lane_triggered = Column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_scraped_articles_processed", "processed"),
+        Index("ix_scraped_articles_published_at", "published_at"),
+        Index("ix_scraped_articles_discovered_at", "discovered_at"),
+    )
+
+
 class AnalysisResult(Base):
     """
     Model storing complete analysis results from the sentiment engine.
@@ -265,6 +290,16 @@ class PaperTrade(Base):
 
     analysis_request_id = Column(String(64), nullable=True)
 
+    conviction_level = Column(String(10), nullable=True)       # HIGH, MEDIUM, LOW
+    trading_type = Column(String(20), nullable=True)           # POSITION, SWING, VOLATILE_EVENT, SCALP
+    holding_period_hours = Column(Integer, nullable=True)      # intended hold in hours
+    holding_window_until = Column(DateTime(timezone=True), nullable=True)  # expiry of conviction window
+
+    close_reason = Column(String(40), nullable=True)           # hold_signal, direction_flip, symbol_removed, window_expired, trailing_stop_hit
+
+    trailing_stop_price = Column(Float, nullable=True)         # set when HOLD fires; position closes when price crosses this level
+    best_price_seen = Column(Float, nullable=True)             # high-water mark (LONG) or low-water mark (SHORT) for trailing stop
+
     __table_args__ = (
         Index("ix_paper_trades_underlying", "underlying"),
         Index("ix_paper_trades_entered_at", "entered_at"),
@@ -303,15 +338,27 @@ class AppConfig(Base):
     risk_profile = Column(String(20), nullable=False, default="moderate")
     web_research_enabled = Column(Boolean, nullable=False, default=False)
 
+    # Trading logic overrides — null means "use logic_config.json default"
+    paper_trade_amount = Column(Float, nullable=True, default=None)
+    entry_threshold = Column(Float, nullable=True, default=None)
+    stop_loss_pct = Column(Float, nullable=True, default=None)
+    take_profit_pct = Column(Float, nullable=True, default=None)
+    materiality_min_posts_delta = Column(Integer, nullable=True, default=None)
+    materiality_min_sentiment_delta = Column(Float, nullable=True, default=None)
+
     last_analysis_started_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_completed_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_request_id = Column(String(36), nullable=True)
+    analysis_lock_request_id = Column(String(36), nullable=True)
+    analysis_lock_acquired_at = Column(DateTime(timezone=True), nullable=True)
+    analysis_lock_expires_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         Index("ix_app_config_last_analysis_started_at", "last_analysis_started_at"),
+        Index("ix_app_config_analysis_lock_expires_at", "analysis_lock_expires_at"),
     )
 
 

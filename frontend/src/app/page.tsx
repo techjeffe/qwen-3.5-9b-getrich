@@ -5,7 +5,6 @@ import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "rea
 import { Activity, WifiOff, ArrowRight, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp, Clock, Info } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import SentimentTicker from "@/components/Dashboard/SentimentTicker";
-import RollingWindowChart from "@/components/Dashboard/RollingWindowChart";
 import { formatTs, formatTime, useTimezone } from "@/lib/timezone";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -52,6 +51,7 @@ type ModelInputArticle = {
     source: string;
     title: string;
     description: string;
+    content?: string;
     keywords: string[];
 };
 type ModelInputWebItem = {
@@ -73,6 +73,31 @@ type ModelInputDebug = {
     per_symbol_prompts: Record<string, string>;
     web_context_by_symbol: Record<string, string>;
     web_items_by_symbol: Record<string, ModelInputWebItem[]>;
+};
+type IngestionTraceArticle = {
+    source: string;
+    title: string;
+    summary: string;
+    content?: string;
+    keywords: string[];
+};
+type IngestionTrace = {
+    source: string;
+    trigger_source: string;
+    request_max_posts?: number | null;
+    selected_article_ids: number[];
+    selected_fast_lane_article_ids: number[];
+    total_items: number;
+    queue?: {
+        status?: string;
+        pending_count?: number;
+        selected_count?: number;
+        selected_articles?: IngestionTraceArticle[];
+        selected_urls?: string[];
+        fast_lane_count?: number;
+    } | null;
+    truth_social?: Record<string, any> | null;
+    rss?: Record<string, any> | null;
 };
 
 type Recommendation = {
@@ -173,7 +198,15 @@ function RecommendationTooltip({ rec }: { rec: Recommendation }) {
 
 function formatSnapshotLabel(snapshot: AnalysisSnapshotItem, timeZone: string) {
     const timestamp = snapshot.timestamp ? formatTs(snapshot.timestamp, timeZone) : "Unknown time";
-    return `${timestamp} · ${snapshot.request_id} · ${snapshot.model_name || "unknown model"}`;
+    const ext = snapshot.extraction_model?.trim();
+    const rsn = snapshot.reasoning_model?.trim();
+    let modelLabel: string;
+    if (ext && rsn && ext !== rsn) {
+        modelLabel = `${ext} / ${rsn}`;
+    } else {
+        modelLabel = ext || rsn || snapshot.model_name || "unknown model";
+    }
+    return `${timestamp} · ${snapshot.request_id} · ${modelLabel}`;
 }
 
 function compactReasoning(reasoning?: string | null) {
@@ -388,7 +421,6 @@ type AppConfig = {
     default_symbols: string[];
     max_custom_symbols: number;
     max_posts: number;
-    include_backtest: boolean;
     lookback_days: number;
     symbol_prompt_overrides: Record<string, string>;
     display_timezone: string;
@@ -421,9 +453,9 @@ type AnalysisResult = {
     blue_team_signal?: any;
     market_validation: Record<string, MarketValidationPayload>;
     model_inputs?: ModelInputDebug | null;
+    ingestion_trace?: IngestionTrace | null;
     red_team_review?: RedTeamReview | null;
     red_team_debug?: RedTeamDebug | null;
-    backtest_results?: any;
     processing_time_ms: number;
 };
 type SnapshotRecommendation = {
@@ -459,7 +491,6 @@ const DEFAULT_APP_CONFIG: AppConfig = {
     default_symbols: ["USO", "BITO", "QQQ", "SPY"],
     max_custom_symbols: 3,
     max_posts: 50,
-    include_backtest: true,
     lookback_days: 14,
     symbol_prompt_overrides: {},
     display_timezone: "",
@@ -482,13 +513,14 @@ const DEFAULT_APP_CONFIG: AppConfig = {
     rss_article_detail_mode: "normal",
     risk_profile: "moderate",
 };
+
+const LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY = "lastViewedAnalysisRequestId";
 const ANALYSIS_STAGES: AnalysisStage[] = [
     { key: "preflight", label: "Checking model", weight: 0.08, matches: ["Ollama reachable"] },
     { key: "ingestion", label: "Collecting live feeds", weight: 0.24, matches: ["Fetching ", "articles", "Ingestion complete"] },
     { key: "prices", label: "Loading market prices", weight: 0.08, matches: ["Fetching real-time price data", "Price data fetched"] },
     { key: "sentiment", label: "Running symbol specialists", weight: 0.38, matches: ["Running Qwen", "bluster=", "confidence="] },
-    { key: "signal", label: "Building trade signals", weight: 0.08, matches: ["Generating trading signal", "Signal: "] },
-    { key: "backtest", label: "Running backtest", weight: 0.14, matches: ["Running rolling window backtest", "Backtest complete"] },
+    { key: "signal", label: "Building trade signals", weight: 0.22, matches: ["Generating trading signal", "Signal: "] },
 ];
 const SIGNAL_RULES = [
     { border: "border-l-red-500", bg: "bg-red-500/5", label: "SHORT", labelColor: "text-red-400", desc: "Bluster < −0.5 & Policy < 0.3" },
@@ -778,19 +810,6 @@ function SignalHero({
                         className={`h-full rounded-full ${isBuy ? "bg-emerald-500" : isShort ? "bg-red-500" : "bg-slate-500"}`}
                     />
                 </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2 mt-4">
-                {[
-                    { label: "Entry", val: signal.entry_symbol },
-                    { label: "Stop Loss", val: `-${signal.stop_loss_pct}%`, cls: "text-red-400" },
-                    { label: "Take Profit", val: `+${signal.take_profit_pct}%`, cls: "text-emerald-400" },
-                ].map(({ label, val, cls }) => (
-                    <div key={label} className="bg-slate-800/60 rounded-lg p-2 text-center">
-                        <p className="text-[10px] text-slate-500 mb-0.5">{label}</p>
-                        <p className={`text-sm font-bold ${cls ?? "text-white"}`}>{val}</p>
-                    </div>
-                ))}
             </div>
 
             {symbolWhyItems.length > 0 && (
@@ -1696,6 +1715,7 @@ function ModelComparePanel({
 function DebugPanel({ result }: { result: AnalysisResult }) {
     const { timeZone } = useTimezone();
     const modelInputs = result.model_inputs;
+    const ingestionTrace = result.ingestion_trace;
     const redTeamDebug = result.red_team_debug;
     const blueTeamSignal = result.blue_team_signal;
     const consensusSignal = result.trading_signal;
@@ -1703,6 +1723,8 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
     const visibleArticles = modelInputs?.articles ?? [];
     const webContextEntries = Object.entries(modelInputs?.web_context_by_symbol ?? {});
     const webItemEntries = Object.entries(modelInputs?.web_items_by_symbol ?? {});
+    const queueArticles = ingestionTrace?.queue?.selected_articles ?? [];
+    const queueUrls = ingestionTrace?.queue?.selected_urls ?? [];
     return (
         <GlassCard>
             <div className="flex items-center justify-between gap-4 mb-5">
@@ -1715,8 +1737,8 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
                     <p>{validationEntries.length} validation blocks</p>
                 </div>
             </div>
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-                <div className="space-y-4">
+            <div className="space-y-4">
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
                     <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
                         <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Structured Validation Summary</p>
                         <pre className="text-xs text-slate-300 whitespace-pre-wrap break-words font-mono leading-relaxed">
@@ -1738,22 +1760,116 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
                             <p className="text-xs text-slate-500">No price context captured.</p>
                         )}
                     </div>
-                    <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Compiled News Context</p>
-                        <pre className="max-h-80 overflow-auto text-xs text-slate-300 whitespace-pre-wrap break-words font-mono leading-relaxed">
-                            {modelInputs?.news_context || "No compiled news context returned."}
-                        </pre>
-                    </div>
                 </div>
-                <div className="space-y-4">
-                    <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">RSS Articles Fed To The Model</p>
-                        <div className="max-h-80 overflow-auto space-y-3">
-                            {visibleArticles.length > 0 ? visibleArticles.map((article, index) => (
-                                <div key={`${article.source}-${article.title}-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Compiled News Context</p>
+                    <pre className="max-h-80 overflow-auto text-xs text-slate-300 whitespace-pre-wrap break-words font-mono leading-relaxed">
+                        {modelInputs?.news_context || "No compiled news context returned."}
+                    </pre>
+                </div>
+                <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Queued Article Intake</p>
+                    {ingestionTrace ? (
+                        <div className="space-y-3">
+                            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Source</p>
+                                    <p className="mt-1 text-sm font-semibold text-white">{ingestionTrace.source || "unknown"}</p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Trigger</p>
+                                    <p className="mt-1 text-sm font-semibold text-white">{ingestionTrace.trigger_source || "api"}</p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Pending Queue</p>
+                                    <p className="mt-1 text-sm font-semibold text-white">{ingestionTrace.queue?.pending_count ?? 0}</p>
+                                </div>
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                    <p className="text-[10px] uppercase tracking-wider text-slate-500">Selected</p>
+                                    <p className="mt-1 text-sm font-semibold text-white">{ingestionTrace.queue?.selected_count ?? ingestionTrace.total_items ?? 0}</p>
+                                </div>
+                            </div>
+                            <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                    <span className="text-slate-500">Article IDs</span>
+                                    {(ingestionTrace.selected_article_ids ?? []).length > 0 ? (
+                                        ingestionTrace.selected_article_ids.map((articleId) => (
+                                            <span key={`selected-${articleId}`} className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-0.5 text-blue-200">
+                                                #{articleId}
+                                            </span>
+                                        ))
+                                    ) : (
+                                        <span className="text-slate-500">No queued article IDs captured.</span>
+                                    )}
+                                </div>
+                                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                                    <span className="text-slate-500">Fast Lane</span>
+                                    {(ingestionTrace.selected_fast_lane_article_ids ?? []).length > 0 ? (
+                                        ingestionTrace.selected_fast_lane_article_ids.map((articleId) => (
+                                            <span key={`fast-lane-${articleId}`} className="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                                                #{articleId}
+                                            </span>
+                                        ))
+                                    ) : (
+                                        <span className="text-slate-500">None in this run.</span>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="max-h-80 overflow-auto space-y-3">
+                                {queueArticles.length > 0 ? queueArticles.map((article, index) => (
+                                    <details key={`${article.source}-${article.title}-${index}`} className="group rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                        <summary className="flex cursor-pointer list-none items-start justify-between gap-3">
+                                            <div>
+                                                <p className="text-[10px] uppercase tracking-wider text-emerald-300">{article.source}</p>
+                                                <p className="text-sm text-white mt-1">{article.title}</p>
+                                                {article.summary && <p className="text-xs text-slate-500 mt-2 line-clamp-2 leading-relaxed">{article.summary}</p>}
+                                            </div>
+                                            <span className="text-[10px] uppercase tracking-wider text-slate-500">
+                                                {ingestionTrace.selected_article_ids?.[index] ? `#${ingestionTrace.selected_article_ids[index]}` : `item ${index + 1}`}
+                                            </span>
+                                        </summary>
+                                        <div className="mt-3 border-t border-slate-800 pt-3">
+                                            {article.summary && <p className="text-xs text-slate-400 leading-relaxed">{article.summary}</p>}
+                                            {article.keywords.length > 0 && (
+                                                <div className="flex flex-wrap gap-1.5 mt-2">
+                                                    {article.keywords.map((keyword, keywordIndex) => (
+                                                        <span key={`${article.title}-${keyword}-${keywordIndex}`} className="text-[10px] rounded border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-emerald-200">
+                                                            #{keyword}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {(article.content || "").trim() && (
+                                                <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-300 font-mono leading-relaxed">
+                                                    {article.content}
+                                                </pre>
+                                            )}
+                                            {queueUrls[index] && (
+                                                <p className="mt-2 break-all text-[10px] text-slate-500 font-mono">{queueUrls[index]}</p>
+                                            )}
+                                        </div>
+                                    </details>
+                                )) : (
+                                    <p className="text-xs text-slate-500">No queue trace was captured for this run.</p>
+                                )}
+                            </div>
+                        </div>
+                    ) : (
+                        <p className="text-xs text-slate-500">No ingestion trace returned for this run.</p>
+                    )}
+                </div>
+                <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">RSS Articles Fed To The Model</p>
+                    <div className="max-h-80 overflow-auto space-y-3">
+                        {visibleArticles.length > 0 ? visibleArticles.map((article, index) => (
+                            <details key={`${article.source}-${article.title}-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                <summary className="cursor-pointer list-none">
                                     <p className="text-[10px] uppercase tracking-wider text-blue-300">{article.source}</p>
                                     <p className="text-sm text-white mt-1">{article.title}</p>
-                                    {article.description && <p className="text-xs text-slate-400 mt-2 leading-relaxed">{article.description}</p>}
+                                    {article.description && <p className="text-xs text-slate-500 mt-2 line-clamp-2 leading-relaxed">{article.description}</p>}
+                                </summary>
+                                <div className="mt-3 border-t border-slate-800 pt-3">
+                                    {article.description && <p className="text-xs text-slate-400 leading-relaxed">{article.description}</p>}
                                     {article.keywords.length > 0 && (
                                         <div className="flex flex-wrap gap-1.5 mt-2">
                                             {article.keywords.map((keyword, keywordIndex) => (
@@ -1763,53 +1879,60 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
                                             ))}
                                         </div>
                                     )}
-                                </div>
-                            )) : <p className="text-xs text-slate-500">No RSS/debug articles captured.</p>}
-                        </div>
-                    </div>
-                    <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">FRED / EIA Validation Blocks</p>
-                        <div className="space-y-3">
-                            {validationEntries.map(([symbol, payload], index) => (
-                                <div key={symbol || `validation-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
-                                    <div className="flex items-center justify-between gap-3">
-                                        <p className="text-sm font-black text-white">{symbol}</p>
-                                        <span className="text-[10px] uppercase tracking-wider text-slate-400">{payload.status}</span>
-                                    </div>
-                                    <p className="text-xs text-slate-400 mt-2 leading-relaxed">{payload.summary || "No summary available."}</p>
-                                    <div className="mt-3 space-y-2">
-                                        {(payload.metrics ?? []).map((metric, metricIndex) => (
-                                            <div key={`${symbol}-${metric.name}-${metricIndex}`} className="rounded border border-slate-800/90 px-3 py-2 text-xs">
-                                                <div className="flex items-center justify-between gap-3">
-                                                    <span className="text-slate-300">{metric.label}</span>
-                                                    <span className="font-mono text-white">{metric.current ?? "n/a"}{metric.unit === "percent" ? "%" : ""}</span>
-                                                </div>
-                                                <div className="flex items-center justify-between gap-3 mt-1 text-[10px] text-slate-500">
-                                                    <span>{metric.source}</span>
-                                                    <span>{metric.as_of || metric.status}</span>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                    <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Recent Web Research</p>
-                        <div className="space-y-3">
-                            {webContextEntries.map(([symbol, summary]) => {
-                                const items = modelInputs?.web_items_by_symbol?.[symbol] ?? [];
-                                return (
-                                    <div key={symbol} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
-                                        <p className="text-sm font-black text-white">{symbol}</p>
-                                        <pre className="mt-2 whitespace-pre-wrap break-words text-xs text-slate-300 font-mono leading-relaxed">
-                                            {summary || "No recent web research summary captured."}
+                                    {(article.content || "").trim() && article.content !== article.description && (
+                                        <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-300 font-mono leading-relaxed">
+                                            {article.content}
                                         </pre>
-                                        {items.length > 0 && (
-                                            <div className="mt-3 space-y-2">
-                                                {items.map((item, index) => (
-                                                    <div key={`${symbol}-web-${index}`} className="rounded border border-slate-800/90 px-3 py-2 text-xs">
+                                    )}
+                                </div>
+                            </details>
+                        )) : <p className="text-xs text-slate-500">No RSS/debug articles captured.</p>}
+                    </div>
+                </div>
+                <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">FRED / EIA Validation Blocks</p>
+                    <div className="space-y-3">
+                        {validationEntries.map(([symbol, payload], index) => (
+                            <div key={symbol || `validation-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                <div className="flex items-center justify-between gap-3">
+                                    <p className="text-sm font-black text-white">{symbol}</p>
+                                    <span className="text-[10px] uppercase tracking-wider text-slate-400">{payload.status}</span>
+                                </div>
+                                <p className="text-xs text-slate-400 mt-2 leading-relaxed">{payload.summary || "No summary available."}</p>
+                                <div className="mt-3 space-y-2">
+                                    {(payload.metrics ?? []).map((metric, metricIndex) => (
+                                        <div key={`${symbol}-${metric.name}-${metricIndex}`} className="rounded border border-slate-800/90 px-3 py-2 text-xs">
+                                            <div className="flex items-center justify-between gap-3">
+                                                <span className="text-slate-300">{metric.label}</span>
+                                                <span className="font-mono text-white">{metric.current ?? "n/a"}{metric.unit === "percent" ? "%" : ""}</span>
+                                            </div>
+                                            <div className="flex items-center justify-between gap-3 mt-1 text-[10px] text-slate-500">
+                                                <span>{metric.source}</span>
+                                                <span>{metric.as_of || metric.status}</span>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+                <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Recent Web Research</p>
+                    <div className="space-y-3">
+                        {webContextEntries.map(([symbol, summary]) => {
+                            const items = modelInputs?.web_items_by_symbol?.[symbol] ?? [];
+                            return (
+                                <div key={symbol} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                                    <p className="text-sm font-black text-white">{symbol}</p>
+                                    <pre className="mt-2 whitespace-pre-wrap break-words text-xs text-slate-300 font-mono leading-relaxed">
+                                        {summary || "No recent web research summary captured."}
+                                    </pre>
+                                    {items.length > 0 && (
+                                        <div className="mt-3 space-y-2">
+                                            {items.map((item, index) => (
+                                                <details key={`${symbol}-web-${index}`} className="rounded border border-slate-800/90 px-3 py-2 text-xs">
+                                                    <summary className="cursor-pointer list-none">
                                                         <p className="text-slate-200">{item.title}</p>
                                                         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
                                                             <span>{item.source}</span>
@@ -1817,10 +1940,15 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
                                                             {Number.isFinite(item.relevance_score) && <span>score {item.relevance_score.toFixed(2)}</span>}
                                                             {Number.isFinite(item.age_days) && <span>{item.age_days.toFixed(1)}d old</span>}
                                                         </div>
+                                                    </summary>
+                                                    <div className="mt-3 border-t border-slate-800 pt-3">
                                                         {item.query && (
-                                                            <p className="mt-1 text-[10px] text-slate-500 break-words">
+                                                            <p className="text-[10px] text-slate-500 break-words">
                                                                 Query: <span className="font-mono">{item.query}</span>
                                                             </p>
+                                                        )}
+                                                        {item.summary && (
+                                                            <p className="mt-2 text-xs text-slate-300 leading-relaxed">{item.summary}</p>
                                                         )}
                                                         {item.matched_keywords?.length > 0 && (
                                                             <div className="mt-2 flex flex-wrap gap-1.5">
@@ -1839,23 +1967,25 @@ function DebugPanel({ result }: { result: AnalysisResult }) {
                                                                 href={item.url}
                                                                 target="_blank"
                                                                 rel="noreferrer"
-                                                                className="mt-1 inline-block break-all text-[10px] text-blue-300 hover:text-blue-200"
+                                                                className="mt-2 inline-block break-all text-[10px] text-blue-300 hover:text-blue-200"
                                                             >
                                                                 {item.url}
                                                             </a>
                                                         )}
                                                     </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })}
-                            {webContextEntries.length === 0 && webItemEntries.length === 0 && (
-                                <p className="text-xs text-slate-500">Light web research was not enabled or no trusted recent items were captured.</p>
-                            )}
-                        </div>
+                                                </details>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                        {webContextEntries.length === 0 && webItemEntries.length === 0 && (
+                            <p className="text-xs text-slate-500">Light web research was not enabled or no trusted recent items were captured.</p>
+                        )}
                     </div>
+                </div>
+                <div className="space-y-4">
                     <div className="rounded-xl border border-slate-700/50 bg-slate-900/50 p-4">
                         <p className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3">Red-Team Review Trace</p>
                         {redTeamDebug ? (
@@ -2256,49 +2386,6 @@ function TradeCard({ trade, prices, onCloseTrade }: {
     );
 }
 
-function PaperRecommendationPnlCard({ trades, prices, currentRequestId, onCloseTrade }: {
-    trades: PnLTrade[];
-    prices: Prices | null;
-    currentRequestId?: string;
-    onCloseTrade: (tradeId: number, closedPrice: number, notes: string) => Promise<void>;
-}) {
-    const currentTrades = trades.filter((trade) => trade.request_id === currentRequestId);
-    if (currentTrades.length === 0) return null;
-
-    const totalNotional = currentTrades.reduce((sum, trade) => sum + (trade.paper_notional_usd ?? 100), 0);
-    const livePaperPnl = currentTrades.reduce((sum, trade) => {
-        const priceSymbol = prices?.[trade.symbol] ? trade.symbol : (UNDERLYING_PRICE_MAP[trade.symbol] ?? trade.symbol);
-        const livePrice = prices?.[priceSymbol]?.price;
-        if (livePrice == null) return sum;
-        return sum + paperPnlUsd(livePnl(trade.action, trade.entry_price, livePrice), trade.paper_notional_usd ?? 100);
-    }, 0);
-    const liveReturnPct = totalNotional > 0 ? (livePaperPnl / totalNotional) * 100 : 0;
-
-    return (
-        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="bg-gray-800 rounded-xl p-5 border border-gray-700 space-y-4">
-            <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-4">
-                <p className="text-[10px] uppercase tracking-[0.22em] text-blue-300 mb-2">Paper follow-through</p>
-                <div className="flex flex-wrap items-baseline gap-x-4 gap-y-2">
-                    <span className={`text-2xl font-black tabular-nums ${livePaperPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                        {formatSignedUsd(livePaperPnl)}
-                    </span>
-                    <span className="text-xs text-slate-400">
-                        {liveReturnPct >= 0 ? "+" : ""}{liveReturnPct.toFixed(2)}% on ${totalNotional.toFixed(0)} tracked notional
-                    </span>
-                </div>
-                <p className="mt-2 text-xs text-slate-500">
-                    Every recommendation is tracked as a fixed $100 paper position using the execution ticker, with fractional shares allowed.
-                </p>
-            </div>
-            <div className="space-y-2">
-                {currentTrades.map((trade) => (
-                    <TradeCard key={`paper-${trade.id}`} trade={trade} prices={prices} onCloseTrade={onCloseTrade} />
-                ))}
-            </div>
-        </motion.div>
-    );
-}
-
 function ActualTradeComparisonCard({ pnlSummary, currentRequestId, prices, onCloseTrade }: {
     pnlSummary: PnLSummary | null;
     currentRequestId?: string;
@@ -2395,8 +2482,10 @@ export default function Home() {
     const [savedComparisonLoading, setSavedComparisonLoading] = useState(false);
     const [savedComparisonError, setSavedComparisonError] = useState<string | null>(null);
     const [showCompletedProgressUntil, setShowCompletedProgressUntil] = useState<number | null>(null);
+    const [restoringLastResult, setRestoringLastResult] = useState(true);
     const articleCounter = useRef(0);
     const autoRunStartedRef = useRef(false);
+    const historySectionRef = useRef<HTMLDivElement | null>(null);
     const trackedSymbols = config.tracked_symbols.length > 0 ? config.tracked_symbols : DEFAULT_APP_CONFIG.tracked_symbols;
     // Memoized so fetchPrices (which lists this as a dep) doesn't recreate on every render,
     // which would trigger the polling useEffect in a tight loop.
@@ -2467,7 +2556,6 @@ export default function Home() {
                 body: JSON.stringify({
                     symbols: trackedSymbols,
                     max_posts: config.max_posts,
-                    include_backtest: config.include_backtest,
                     lookback_days: config.lookback_days,
                 }),
             });
@@ -2531,7 +2619,7 @@ export default function Home() {
             setStreamStartedAt(null);
             void fetchConfig();
         }
-    }, [config.include_backtest, config.lookback_days, config.max_posts, config.auto_run_interval_minutes, trackedSymbols, fetchConfig, streamStartedAt]);
+    }, [config.lookback_days, config.max_posts, config.auto_run_interval_minutes, trackedSymbols, fetchConfig, streamStartedAt]);
 
     const fetchPnl = useCallback(async () => {
         try {
@@ -2568,6 +2656,37 @@ export default function Home() {
         }
         return payload as AnalysisResult;
     }, []);
+
+    const restoreLastViewedResult = useCallback(async () => {
+        try {
+            const response = await fetch("/api/analyze/snapshots?limit=12", { cache: "no-store" });
+            if (!response.ok) return;
+            const payload = await response.json();
+            const items = (payload.items || []) as AnalysisSnapshotItem[];
+            setAnalysisSnapshots(items);
+
+            const availableSnapshots = items.filter((item) => item.snapshot_available);
+            if (availableSnapshots.length === 0) return;
+
+            const storedRequestId = typeof window !== "undefined"
+                ? localStorage.getItem(LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY)
+                : null;
+            const preferredSnapshot = (
+                storedRequestId
+                    ? availableSnapshots.find((item) => item.request_id === storedRequestId)
+                    : null
+            ) || availableSnapshots[0];
+
+            if (!preferredSnapshot) return;
+
+            const restored = await fetchSnapshotDetail(preferredSnapshot.request_id);
+            if (isAnalyzingRef.current) return;
+            setResult(restored);
+        } catch { }
+        finally {
+            setRestoringLastResult(false);
+        }
+    }, [fetchSnapshotDetail]);
 
     const handleCloseTrade = useCallback(async (tradeId: number, closedPrice: number, notes: string) => {
         await fetch(`/api/trades/${tradeId}/close`, {
@@ -2682,12 +2801,12 @@ export default function Home() {
     }, [fetchConfig]);
 
     useEffect(() => {
-        if (!configLoaded || isAnalyzing || autoRunStartedRef.current) return;
+        if (!configLoaded || restoringLastResult || isAnalyzing || autoRunStartedRef.current) return;
         if (config.auto_run_enabled && config.can_auto_run_now && !result && feed.length === 0) {
             autoRunStartedRef.current = true;
             void handleAnalyze();
         }
-    }, [config, configLoaded, feed.length, handleAnalyze, isAnalyzing, result]);
+    }, [config, configLoaded, feed.length, handleAnalyze, isAnalyzing, restoringLastResult, result]);
 
     // Price polling
     const fetchPrices = useCallback(async () => {
@@ -2719,6 +2838,15 @@ export default function Home() {
     }, [fetchAnalysisSnapshots, result?.request_id]);
 
     useEffect(() => {
+        void restoreLastViewedResult();
+    }, [restoreLastViewedResult]);
+
+    useEffect(() => {
+        if (!result?.request_id || typeof window === "undefined") return;
+        localStorage.setItem(LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY, result.request_id);
+    }, [result?.request_id]);
+
+    useEffect(() => {
         if (comparisonResult || savedComparisonResult) setActiveTab("compare");
     }, [comparisonResult, savedComparisonResult]);
 
@@ -2732,6 +2860,14 @@ export default function Home() {
     useEffect(() => {
         if (!advancedMode && activeTab === "debug") setActiveTab("current");
     }, [advancedMode, activeTab]);
+
+    useEffect(() => {
+        if (activeTab !== "history") return;
+        const id = window.setTimeout(() => {
+            historySectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 0);
+        return () => window.clearTimeout(id);
+    }, [activeTab]);
 
     const toggleArticle = (idx: number) => {
         setExpandedIdxs((prev) => {
@@ -3055,13 +3191,6 @@ export default function Home() {
                                     {activeTab === "current" && (
                                         <div className="space-y-4">
                                             <SentimentTicker data={result.sentiment_scores} />
-                                            <RollingWindowChart backtestResults={result.backtest_results} lookbackDays={config.lookback_days} />
-                                            <PaperRecommendationPnlCard
-                                                trades={pnlSummary?.trades ?? []}
-                                                currentRequestId={result.request_id}
-                                                prices={prices}
-                                                onCloseTrade={handleCloseTrade}
-                                            />
                                             <ActualTradeComparisonCard pnlSummary={pnlSummary} currentRequestId={result.request_id} prices={prices} onCloseTrade={handleCloseTrade} />
                                         </div>
                                     )}
@@ -3072,7 +3201,7 @@ export default function Home() {
                             )}
 
                             {activeTab === "history" && (
-                                <motion.div key="tab-history" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+                                <motion.div ref={historySectionRef} key="tab-history" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
                                     <PullHistoryCard snapshots={analysisSnapshots} currentRequestId={result?.request_id} />
                                 </motion.div>
                             )}
@@ -3106,7 +3235,7 @@ export default function Home() {
                                     </h2>
                                     <p className="text-slate-500 text-sm max-w-md mx-auto">
                                         Fetches live headlines, runs local Ollama sentiment analysis with {activeModelLabel},
-                                        generates BUY/SELL signals for {trackedSymbols.join(", ")} and backtests on 6 months of data.
+                                        generates BUY/SELL signals for {trackedSymbols.join(", ")} and tracks live paper P&L over time.
                                     </p>
                                     <p className="text-slate-600 text-xs mt-4">
                                         {config.auto_run_enabled ? `Auto-runs in ${mm}:${ss.toString().padStart(2, "0")}` : "Auto-run disabled in admin settings"}

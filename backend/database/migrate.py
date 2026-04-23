@@ -41,10 +41,30 @@ def migrate():
                 ("reasoning_model", "VARCHAR(128)", "''"),
                 ("risk_profile", "VARCHAR(20)", "'moderate'"),
                 ("web_research_enabled", "BOOLEAN", "0"),
+                ("analysis_lock_request_id", "VARCHAR(36)", "NULL"),
+                ("analysis_lock_acquired_at", "DATETIME", "NULL"),
+                ("analysis_lock_expires_at", "DATETIME", "NULL"),
             ]:
                 if column_name not in existing_cols:
                     print(f"Adding {column_name} to app_config...")
-                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}")
+                    nullable = default_value == "NULL"
+                    null_sql = "" if nullable else " NOT NULL"
+                    default_sql = "" if nullable else f" DEFAULT {default_value}"
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}{null_sql}{default_sql}")
+                    conn.commit()
+
+            # ── app_config: nullable trading-logic override columns ─────────
+            for column_name, column_type in [
+                ("paper_trade_amount", "REAL"),
+                ("entry_threshold", "REAL"),
+                ("stop_loss_pct", "REAL"),
+                ("take_profit_pct", "REAL"),
+                ("materiality_min_posts_delta", "INTEGER"),
+                ("materiality_min_sentiment_delta", "REAL"),
+            ]:
+                if column_name not in existing_cols:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}")
                     conn.commit()
 
             # ── trades table: conviction and holding period columns ──────────
@@ -67,6 +87,7 @@ def migrate():
                 ("ix_trades_underlying_symbol", "trades", "underlying_symbol"),
                 ("ix_trades_holding_window_until", "trades", "holding_window_until"),
                 ("ix_trades_conviction_level", "trades", "conviction_level"),
+                ("ix_app_config_analysis_lock_expires_at", "app_config", "analysis_lock_expires_at"),
             ]:
                 if index_name not in existing_indexes:
                     print(f"Creating index {index_name}...")
@@ -97,6 +118,8 @@ def migrate():
                 conn.commit()
                 print("price_history table created.")
 
+
+
             # ── paper_trades table ─────────────────────────────────────────
             if "paper_trades" not in tables:
                 print("Creating paper_trades table...")
@@ -124,6 +147,22 @@ def migrate():
                 conn.execute(text("CREATE INDEX ix_paper_trades_exited_at ON paper_trades (exited_at)"))
                 conn.commit()
                 print("paper_trades table created.")
+            else:
+                # ── paper_trades: add conviction/window columns if missing ──
+                existing_pt_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(paper_trades)")).fetchall()]
+                for column_name, column_type in [
+                    ("conviction_level",    "VARCHAR(10)"),
+                    ("trading_type",        "VARCHAR(20)"),
+                    ("holding_period_hours","INTEGER"),
+                    ("holding_window_until","DATETIME"),
+                    ("close_reason",        "VARCHAR(40)"),
+                    ("trailing_stop_price", "REAL"),
+                    ("best_price_seen",     "REAL"),
+                ]:
+                    if column_name not in existing_pt_cols:
+                        print(f"Adding {column_name} to paper_trades...")
+                        conn.exec_driver_sql(f"ALTER TABLE paper_trades ADD COLUMN {column_name} {column_type}")
+                        conn.commit()
 
             # ── trade_closes table ──────────────────────────────────────────
             if "trade_closes" not in tables:
@@ -140,6 +179,28 @@ def migrate():
                 conn.execute(text("CREATE INDEX ix_trade_closes_trade_id ON trade_closes (trade_id)"))
                 conn.commit()
                 print("trade_closes table created.")
+
+            if "scraped_articles" not in tables:
+                print("Creating scraped_articles table...")
+                conn.execute(text("""
+                    CREATE TABLE scraped_articles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source VARCHAR(100) NOT NULL,
+                        url TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        full_content TEXT NOT NULL DEFAULT '',
+                        published_at DATETIME,
+                        discovered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        processed BOOLEAN NOT NULL DEFAULT 0,
+                        fast_lane_triggered BOOLEAN NOT NULL DEFAULT 0
+                    )
+                """))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_processed ON scraped_articles (processed)"))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_published_at ON scraped_articles (published_at)"))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_discovered_at ON scraped_articles (discovered_at)"))
+                conn.commit()
+                print("scraped_articles table created.")
         else:
             # ── app_config columns ──────────────────────────────────────────
             for column_name, column_type, default_value in [
@@ -157,6 +218,9 @@ def migrate():
                 ("reasoning_model", "VARCHAR(128)", "''"),
                 ("risk_profile", "VARCHAR(20)", "'moderate'"),
                 ("web_research_enabled", "BOOLEAN", "FALSE"),
+                ("analysis_lock_request_id", "VARCHAR(36)", "NULL"),
+                ("analysis_lock_acquired_at", "TIMESTAMPTZ", "NULL"),
+                ("analysis_lock_expires_at", "TIMESTAMPTZ", "NULL"),
             ]:
                 result = conn.execute(
                     text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
@@ -164,7 +228,28 @@ def migrate():
                 ).fetchone()
                 if not result:
                     print(f"Adding {column_name} to app_config...")
-                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}")
+                    nullable = default_value == "NULL"
+                    null_sql = "" if nullable else " NOT NULL"
+                    default_sql = "" if nullable else f" DEFAULT {default_value}"
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}{null_sql}{default_sql}")
+                    conn.commit()
+
+            # ── app_config: nullable trading-logic override columns ─────────
+            for column_name, column_type in [
+                ("paper_trade_amount", "FLOAT"),
+                ("entry_threshold", "FLOAT"),
+                ("stop_loss_pct", "FLOAT"),
+                ("take_profit_pct", "FLOAT"),
+                ("materiality_min_posts_delta", "INTEGER"),
+                ("materiality_min_sentiment_delta", "FLOAT"),
+            ]:
+                result = conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
+                    {"col": column_name},
+                ).fetchone()
+                if not result:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}"))
                     conn.commit()
 
             # ── trades table: conviction and holding period columns ──────────
@@ -189,6 +274,7 @@ def migrate():
                 ("ix_trades_underlying_symbol", "trades", "underlying_symbol"),
                 ("ix_trades_holding_window_until", "trades", "holding_window_until"),
                 ("ix_trades_conviction_level", "trades", "conviction_level"),
+                ("ix_app_config_analysis_lock_expires_at", "app_config", "analysis_lock_expires_at"),
             ]:
                 result = conn.execute(
                     text("SELECT indexname FROM pg_indexes WHERE indexname=:idx"),
@@ -224,6 +310,49 @@ def migrate():
                 conn.execute(text("CREATE INDEX ix_price_history_symbol_date ON price_history (symbol, date)"))
                 conn.commit()
                 print("price_history table created.")
+            result = conn.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_name='scraped_articles'")
+            ).fetchone()
+            if not result:
+                print("Creating scraped_articles table...")
+                conn.execute(text("""
+                    CREATE TABLE scraped_articles (
+                        id SERIAL PRIMARY KEY,
+                        source VARCHAR(100) NOT NULL,
+                        url TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        full_content TEXT NOT NULL DEFAULT '',
+                        published_at TIMESTAMPTZ,
+                        discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        processed BOOLEAN NOT NULL DEFAULT FALSE,
+                        fast_lane_triggered BOOLEAN NOT NULL DEFAULT FALSE
+                    )
+                """))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_processed ON scraped_articles (processed)"))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_published_at ON scraped_articles (published_at)"))
+                conn.execute(text("CREATE INDEX ix_scraped_articles_discovered_at ON scraped_articles (discovered_at)"))
+                conn.commit()
+                print("scraped_articles table created.")
+
+            # ── paper_trades: add conviction/window columns if missing ───────
+            for column_name, column_type in [
+                ("conviction_level",    "VARCHAR(10)"),
+                ("trading_type",        "VARCHAR(20)"),
+                ("holding_period_hours","INTEGER"),
+                ("holding_window_until","TIMESTAMPTZ"),
+                ("close_reason",        "VARCHAR(40)"),
+                ("trailing_stop_price", "FLOAT"),
+                ("best_price_seen",     "FLOAT"),
+            ]:
+                result = conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name='paper_trades' AND column_name=:col"),
+                    {"col": column_name},
+                ).fetchone()
+                if not result:
+                    print(f"Adding {column_name} to paper_trades...")
+                    conn.execute(text(f"ALTER TABLE paper_trades ADD COLUMN {column_name} {column_type}"))
+                    conn.commit()
 
             # ── trade_closes table ──────────────────────────────────────────
             result = conn.execute(

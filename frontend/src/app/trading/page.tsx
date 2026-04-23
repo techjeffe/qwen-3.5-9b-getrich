@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { useState, useEffect, useCallback } from "react";
@@ -10,7 +10,7 @@ import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type MarketStatus = {
     status: "open" | "pre-market" | "after-hours" | "closed";
@@ -48,6 +48,12 @@ type OpenPosition = {
     market_session: string;
     unrealized_pnl: number;
     unrealized_pnl_pct: number;
+    conviction_level: "HIGH" | "MEDIUM" | "LOW" | null;
+    trading_type: "POSITION" | "SWING" | "VOLATILE_EVENT" | "SCALP" | null;
+    holding_period_hours: number | null;
+    holding_window_until: string | null;
+    window_active: boolean;
+    window_remaining_minutes: number | null;
 };
 
 type ClosedTrade = {
@@ -65,6 +71,10 @@ type ClosedTrade = {
     realized_pnl: number;
     realized_pnl_pct: number;
     market_session: string;
+    conviction_level: "HIGH" | "MEDIUM" | "LOW" | null;
+    trading_type: "POSITION" | "SWING" | "VOLATILE_EVENT" | "SCALP" | null;
+    holding_period_hours: number | null;
+    close_reason: string | null;
 };
 
 type EquityPoint = {
@@ -84,7 +94,7 @@ type TradingData = {
     equity_curve: EquityPoint[];
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function pnlColor(val: number) {
     if (val > 0) return "text-emerald-400";
@@ -107,7 +117,7 @@ function fmtDollar(val: number) {
 }
 
 function fmtDate(iso: string | null) {
-    if (!iso) return "—";
+    if (!iso) return "â€”";
     return new Date(iso).toLocaleString(undefined, {
         month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
     });
@@ -143,6 +153,34 @@ function DirectionBadge({ signal }: { signal: string }) {
     );
 }
 
+function ConvictionBadge({ conviction, tradingType }: { conviction: string | null; tradingType: string | null }) {
+    const label = tradingType ?? conviction ?? "—";
+    const colors: Record<string, string> = {
+        POSITION:      "bg-purple-500/10 text-purple-300 border-purple-500/20",
+        SWING:         "bg-blue-500/10 text-blue-300 border-blue-500/20",
+        VOLATILE_EVENT:"bg-amber-500/10 text-amber-300 border-amber-500/20",
+        SCALP:         "bg-slate-500/10 text-slate-300 border-slate-500/20",
+    };
+    const cls = colors[tradingType ?? ""] ?? "bg-slate-500/10 text-slate-400 border-slate-500/20";
+    return (
+        <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${cls}`}>
+            {label}
+        </span>
+    );
+}
+
+function WindowBadge({ active, remaining }: { active: boolean; remaining: number | null }) {
+    if (!active || remaining == null) return <span className="text-slate-600 text-[10px]">—</span>;
+    const hrs = Math.floor(remaining / 60);
+    const mins = remaining % 60;
+    const label = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+    return (
+        <span className="inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+            🔒 {label}
+        </span>
+    );
+}
+
 function MarketBadge({ market }: { market: MarketStatus }) {
     const map: Record<string, string> = {
         open: "bg-emerald-500/10 text-emerald-300 border-emerald-500/20",
@@ -160,7 +198,7 @@ function MarketBadge({ market }: { market: MarketStatus }) {
     );
 }
 
-// ─── Stat Card ───────────────────────────────────────────────────────────────
+// â”€â”€â”€ Stat Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function StatCard({ label, value, sub, color = "" }: { label: string; value: string; sub?: string; color?: string }) {
     return (
@@ -172,7 +210,7 @@ function StatCard({ label, value, sub, color = "" }: { label: string; value: str
     );
 }
 
-// ─── Equity Curve ────────────────────────────────────────────────────────────
+// â”€â”€â”€ Equity Curve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function EquityCurve({ data }: { data: EquityPoint[] }) {
     if (data.length === 0) {
@@ -223,11 +261,11 @@ function EquityCurve({ data }: { data: EquityPoint[] }) {
     );
 }
 
-// ─── Main Page ───────────────────────────────────────────────────────────────
+// â”€â”€â”€ Main Page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export default function TradingPage() {
     const [data, setData] = useState<TradingData | null>(null);
-    const [loading, setLoading] = useState(true);
+    const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [resetting, setResetting] = useState(false);
 
@@ -235,9 +273,9 @@ export default function TradingPage() {
         try {
             setLoading(true);
             setError(null);
-            const r = await fetch("/api/paper-trading", { cache: "no-store" });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            setData(await r.json());
+            const paperTradingResponse = await fetch("/api/paper-trading", { cache: "no-store" });
+            if (!paperTradingResponse.ok) throw new Error(`HTTP ${paperTradingResponse.status}`);
+            setData(await paperTradingResponse.json());
         } catch (e) {
             setError(e instanceof Error ? e.message : "Failed to load");
         } finally {
@@ -272,7 +310,7 @@ export default function TradingPage() {
                         <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-400">
                             Paper Trading
                         </h1>
-                        <p className="text-slate-500 text-xs mt-0.5">$100 per signal · auto-executed during extended hours</p>
+                        <p className="text-slate-500 text-xs mt-0.5">$100 per signal &middot; auto-executed whenever the market is tradable</p>
                     </div>
                     <div className="flex items-center gap-2">
                         {data?.market && <MarketBadge market={data.market} />}
@@ -310,7 +348,7 @@ export default function TradingPage() {
 
                 {loading && !data && (
                     <div className="flex items-center justify-center py-20 text-slate-500 text-sm">
-                        <RefreshCw size={16} className="animate-spin mr-2" /> Loading…
+                        <RefreshCw size={16} className="animate-spin mr-2" /> Loading...
                     </div>
                 )}
 
@@ -376,6 +414,8 @@ export default function TradingPage() {
                                                 <th className="px-4 py-2.5 text-left">Ticker</th>
                                                 <th className="px-4 py-2.5 text-left">Direction</th>
                                                 <th className="px-4 py-2.5 text-left">Leverage</th>
+                                                <th className="px-4 py-2.5 text-left">Type</th>
+                                                <th className="px-4 py-2.5 text-left">Window</th>
                                                 <th className="px-4 py-2.5 text-right">Entry</th>
                                                 <th className="px-4 py-2.5 text-right">Current</th>
                                                 <th className="px-4 py-2.5 text-right">P&L</th>
@@ -392,6 +432,8 @@ export default function TradingPage() {
                                                     </td>
                                                     <td className="px-4 py-3"><DirectionBadge signal={pos.signal_type} /></td>
                                                     <td className="px-4 py-3 text-slate-300">{pos.leverage}</td>
+                                                    <td className="px-4 py-3"><ConvictionBadge conviction={pos.conviction_level} tradingType={pos.trading_type} /></td>
+                                                    <td className="px-4 py-3"><WindowBadge active={pos.window_active} remaining={pos.window_remaining_minutes} /></td>
                                                     <td className="px-4 py-3 text-right font-mono text-slate-300">${pos.entry_price.toFixed(2)}</td>
                                                     <td className="px-4 py-3 text-right font-mono text-slate-200">${pos.current_price.toFixed(2)}</td>
                                                     <td className="px-4 py-3 text-right">
@@ -465,7 +507,7 @@ export default function TradingPage() {
 
                         {data.closed_trades.length === 0 && (
                             <div className="rounded-xl border border-white/8 px-5 py-6 flex items-center gap-3 text-slate-500 text-sm" style={{ background: "rgba(30,41,59,0.7)" }}>
-                                <Minus size={16} /> No closed trades yet — trades close when the signal changes or flips direction
+                                <Minus size={16} /> No closed trades yet &mdash; trades close when the signal changes or flips direction
                             </div>
                         )}
                     </>
@@ -474,3 +516,5 @@ export default function TradingPage() {
         </div>
     );
 }
+
+

@@ -21,9 +21,11 @@ DEFAULT_DATABASE_URL = f"sqlite:///{ROOT_DB_PATH.as_posix()}"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 # Create engine with SQLite-specific settings for file-based DB
+_sqlite_connect_args = {"check_same_thread": False, "timeout": 30} if "sqlite" in DATABASE_URL else {}
+
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    connect_args=_sqlite_connect_args,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
@@ -57,4 +59,5 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA cache_size=10000")
+    cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()

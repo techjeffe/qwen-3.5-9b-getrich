@@ -1,8 +1,56 @@
+# Release Notes — April 23, 2026
+
+## Paper Trading Logic Overhaul
+
+Several correctness issues and three structural improvements to the paper trading simulation.
+
+**Bug fixes:**
+
+- Fixed a silent `NameError` that prevented any paper trade from ever opening after a data reset — `config` was referenced inside a `try` block before it was defined, so the exception was swallowed and no trades were created
+- Conviction window expiry now closes positions regardless of market hours — the `close_expired_positions` call was previously gated behind the market-closed check, so overnight expirations were silently skipped until the next open-market run
+
+**New trading logic:**
+
+- **ATR-scaled leverage caps** — leverage is now capped by the 14-day ATR % before the position is opened. When ATR % exceeds `high_vol_atr_pct` (3.0 %) leverage is capped at 1x; above `medium_vol_atr_pct` (1.5 %) it is capped at 2x. Thresholds are configurable in `logic_config.json`.
+- **Dynamic per-symbol materiality gate** — the gate that blocks thesis flips on trivial re-runs now uses a rolling article baseline (mean ± 1 stddev over the last 20 runs per symbol) instead of a fixed post-count threshold. The dynamic threshold activates once 5 runs of history exist and falls back to the fixed threshold until then.
+- **Trailing stop on HOLD** — instead of force-closing a position when a HOLD signal fires, the system now sets a trailing stop at `best_price_seen × (1 ± stop_loss_pct × tighten_factor)`. The stop tightens every run while the position is in HOLD mode and closes the position only if price crosses the stop level. Thesis re-confirmation clears the trailing stop.
+- **Conviction window reset on re-confirmation** — when a re-run confirms the same direction, the holding window resets to a full window (or max window if a cap applies). Same or upgraded trade type resets fully; downgraded type shrinks proportionally. SCALP / SWING / POSITION / VOLATILE_EVENT are all handled by a `trading_type` rank rather than conviction level.
+
+**Price history:**
+
+- Price history is now automatically pulled in the background when a new custom symbol is added via Admin. History is retained even if the symbol is later removed, so re-adding it skips a fresh pull.
+
+**History display:**
+
+- Analysis history labels now show both `extraction_model` and `reasoning_model` when they differ (e.g. `qwen3:8b / qwen3:14b`). Previously only a single model name was shown even in two-stage pipeline runs.
+
+---
+
+## Producer/Consumer Ingestion Refactor
+
+Today's backend update moved article ingestion out of the hot `/analyze` request path and into a DB-backed producer/consumer flow so analysis runs no longer block on live RSS fetches or full-page scraping.
+
+- Added a new `scraped_articles` queue table to persist discovered RSS items, cleaned full article text, timestamps, and `processed` / `fast_lane_triggered` state
+- Added a background ingestion worker that polls RSS feeds, runs a lightweight Stage 0 relevance pass, extracts cleaned article text, and saves unique URLs for later analysis
+- Refactored the batch `/analyze` path to consume pending `processed = false` articles from the database instead of scraping the web inline
+- Added a Fast Lane path for urgent macro headlines so high-impact summaries can trigger an off-cycle analysis run instead of waiting for the normal 15-minute batch
+- Added analysis lease fields in `app_config` so scheduled runs and urgent runs do not process the same queued articles in parallel
+
+## Startup and SQLite Stability
+
+This release also hardened first boot and overlapping background work, which had started to show up as SQLite lock errors during startup.
+
+- Added a startup grace window before the ingestion scheduler begins heavy work
+- The ingestion worker now defers while an analysis lease is active, reducing writer contention during app boot and urgent reruns
+- SQLite write windows were shortened and the engine was configured with a busy timeout to make lock recovery more forgiving under local single-user load
+
+---
+
 # Release Notes — April 22, 2026
 
 ## Paper Trading Simulation
 
-Every analysis run now automatically simulates a $100 paper trade per signal during extended market hours (4:00am–8:00pm ET, Monday–Friday). The simulation mirrors what a real trader following every signal would actually do:
+Every analysis run now automatically simulates a $100 paper trade per signal during extended market hours (4:00am-8:00pm ET, Monday-Friday). The simulation mirrors what a real trader following every signal would actually do:
 
 - **HOLD signal** — leave any open position running, don't open if flat. No action taken.
 - **Same direction, same leverage, same execution ticker** — position is unchanged. No action taken.
@@ -18,7 +66,7 @@ Extended hours are used because that is when pre-market and after-hours paper or
 - 8 summary stat cards: Net P&L, Realized P&L, Open P&L, Win Rate, Avg Win, Avg Loss, Total Deployed, Total Trades
 - Equity curve — cumulative realized P&L across all closed trades, color-coded green above zero / red below
 - Open positions table with live unrealized P&L fetched from yfinance at page load
-- Closed trades history with entry→exit prices, realized P&L, and market session each trade was opened in
+- Closed trades history with entry->exit prices, realized P&L, and market session each trade was opened in
 - Reset button (admin) to clear all paper trading history
 
 **New `paper_trades` database table** — completely independent of all analysis tables; never touched by reset-data operations. Stores one row per opened position with entry/exit prices, timestamps, session, shares, and P&L.
@@ -71,7 +119,7 @@ Even llama3.2 (3B) handles keyword generation reliably since "what words appear 
 
 `test_stage1.py` now tests both built-in and custom symbol paths:
 
-```
+```text
 python test_stage1.py llama3.2:latest
 ```
 
@@ -79,6 +127,48 @@ Output now shows:
 - Which keyword source was used per symbol: `(static)` or `(LLM-generated)`
 - The generated keywords for NVDA and NOW
 - Separate PASS/FAIL for built-in symbol catch rate vs custom symbol coverage vs noise filtering
+
+## Risk Profile and Leverage Control
+
+A new Risk Profile selector in Admin controls the maximum leverage the simulation will take. Four profiles:
+
+- **Conservative** — inverse ETF at 1x for bearish signals, 1x for bullish (no leveraged long)
+- **Moderate** — 2x when confidence > 75%, otherwise 1x
+- **Aggressive** — 3x when confidence > 75%, otherwise 1x
+- **Crazy** — always 3x
+
+The conservative profile routes bearish signals to true inverse ETFs (SQQQ, SPXS, SCO, SBIT) with BUY action instead of synthetic SELL positions. Stored in the database alongside other admin config.
+
+## Broker-Ready Execution Tickers
+
+Recommendations now name the actual tradable instrument rather than an abstract lever on the underlying. The execution mapping:
+
+| Signal | Action |
+|---|---|
+| QQQ bullish 3x | BUY TQQQ |
+| QQQ bearish | BUY SQQQ |
+| SPY bullish 3x | BUY SPXL |
+| SPY bearish | BUY SPXS |
+| USO bullish 2x | BUY UCO |
+| USO bearish 2x | BUY SCO |
+| BITO bullish 2x | BUY BITU |
+| BITO bearish 2x | BUY SBIT |
+
+Bitcoin and oil are capped at 2x. The Market Prices panel shows execution tickers alongside their underlyings when a position is active.
+
+## Health Page
+
+A dedicated `/health` page was added showing: active Ollama model and reachability, average analysis runtime, latest data-pull status (success or error), uptime, and recent system events. Available without running a fresh analysis.
+
+## Multi-Model Orchestration and Depth Mode
+
+The analysis pipeline now supports independently configuring Stage 1 (extraction) and Stage 2 (reasoning) models. Three depth modes control pipeline behavior:
+
+- **Light** — single model for both stages; lowest article count per feed
+- **Normal** — two-stage when both models are set, otherwise single-stage
+- **Detailed** — always two-stage; required models highlighted in Admin with an amber badge until set
+
+Model selectors in Admin adapt their layout to the selected depth. Snapshots store the model configuration used so reruns reproduce the original pipeline exactly. The runtime config card shows a `Stage 1 → Stage 2` label when multi-model is active.
 
 ## Highlights
 
@@ -106,6 +196,8 @@ Output now shows:
   - side-by-side reasoning summaries for why each model made its choice
 - Ollama runtime status now prefers the actually running model from `/api/ps`
 - Snapshot timestamps now render correctly in the configured local timezone
+- All timestamps across the app respect the configured display timezone (stored in the database and synced to the browser)
+- History and Compare tabs are always visible — no longer require a completed current run to display
 
 ## Persistence Improvements
 
@@ -162,3 +254,39 @@ Replay-based model comparison is now more usable for actual evaluation work.
 
 - Frontend production build: `npm run build`
 - Backend modified files compiled successfully
+
+---
+
+# Release Notes — April 21, 2026
+
+## Initial Release
+
+First working end-to-end build of the sentiment trading pipeline.
+
+## Local-Only Security Model
+
+- Backend binds to `127.0.0.1` by default — not publicly exposed
+- Optional `ADMIN_API_TOKEN` environment variable gates sensitive admin routes with a shared-secret header
+- Generated build artifacts, caches, and local databases excluded from git tracking
+
+## Core Analysis Pipeline
+
+- FastAPI backend with SSE streaming for live progress and article events
+- RSS ingestion across 7 sources with per-feed fair distribution so no single feed dominates the article pool
+- Keyword relevance filtering before LLM analysis — generic noise less likely to dominate the run
+- Symbol-specific specialist prompts: each tracked symbol gets its own narrowed news context and validation block rather than a shared aggregated blob
+- FRED validation for BITO (M2SL / M2REAL), QQQ (DFII10), and SPY (HY and IG credit spreads); EIA validation for USO (crude stocks, refinery utilization)
+- QQQ and SPY added to default coverage alongside USO and BITO
+
+## Frontend Baseline
+
+- Next.js 16.2.4 / React 19 dashboard
+- Live market price polling panel
+- Auto-run countdown and manual trigger
+- Expandable article cards in the live feed with source, title, and content preview
+- Signal presentation with action, symbol, leverage, and confidence
+
+## Advanced Mode
+
+- Toggle reveals debug panels for: RSS articles fed to the model, compiled news context, FRED/EIA validation blocks, technical indicator context per symbol, and exact final per-symbol prompts
+- Frozen snapshot comparison lab available in Advanced Mode — replay a saved dataset against a different Ollama-served model without re-downloading articles or validation data

@@ -15,6 +15,7 @@ import requests
 import asyncio
 
 from .prompts import expand_proxy_terms_for_matching, normalize_text_for_matching
+from config.logic_loader import LOGIC as _L
 
 
 @dataclass
@@ -258,44 +259,38 @@ class SentimentEngine:
         relevant = bool(sym_rel.get("relevant", False))
         direction = str(sym_rel.get("direction") or "neutral").lower()
 
+        _ss = _L["sentiment_scoring"]
+
         # ── Bluster score: −1 (pure rhetoric) → +1 (pure substance) ──────────
         n_sub = len(substance_phrases)
         n_blu = len(bluster_phrases)
         total = n_sub + n_blu
         raw_bluster = (n_sub - n_blu) / total if total else 0.0
         if not confirmed:
-            raw_bluster = max(-1.0, raw_bluster - 0.35)
+            raw_bluster = max(-1.0, raw_bluster - _ss["unconfirmed_bluster_penalty"])
         bluster_score = round(max(-1.0, min(1.0, raw_bluster)), 3)
 
         # ── Policy score: 0 (irrelevant noise) → 1 (major confirmed policy) ──
-        event_base: Dict[str, float] = {
-            "monetary_policy": 0.82,
-            "regulatory":      0.74,
-            "fiscal":          0.68,
-            "geopolitical":    0.58,
-            "macro_data":      0.52,
-            "earnings":        0.44,
-            "sector_news":     0.36,
-            "noise":           0.08,
-        }
-        base_policy = event_base.get(event_type, 0.30)
-        policy_score = base_policy * (1.0 if confirmed else 0.48)
+        event_base: Dict[str, float] = dict(_ss["event_base_scores"])
+        base_policy = event_base.get(event_type, event_base["default"])
+        policy_score = base_policy * (1.0 if confirmed else _ss["unconfirmed_policy_multiplier"])
         if not relevant:
-            policy_score *= 0.18
+            policy_score *= _ss["irrelevance_policy_multiplier"]
         policy_score = round(max(0.0, min(1.0, policy_score)), 3)
 
         # ── Confidence: grows with source diversity and drops if irrelevant ───
-        base_conf = 0.40 + (source_count / 10.0) * 0.38
+        base_conf = _ss["confidence_base"] + (source_count / 10.0) * _ss["confidence_source_weight"]
         if not relevant:
-            base_conf -= 0.18
+            base_conf -= _ss["confidence_irrelevance_penalty"]
         if not confirmed:
-            base_conf -= 0.08
-        confidence = round(max(0.28, min(0.91, base_conf)), 3)
+            base_conf -= _ss["confidence_unconfirmed_penalty"]
+        confidence = round(max(_ss["confidence_min"], min(_ss["confidence_max"], base_conf)), 3)
 
         # ── Signal type: rule-based from scores and direction ─────────────────
-        if bluster_score < -0.35 and policy_score < 0.30:
+        _min_mag = _ss["directional_score_min_magnitude"]
+        if bluster_score < _ss["bluster_short_threshold"] and policy_score < _ss["policy_signal_threshold"]:
             signal_type = "SHORT"
-        elif policy_score >= 0.40 and relevant:
+        elif policy_score >= _ss["policy_signal_threshold"] and relevant:
             if direction == "bullish":
                 signal_type = "LONG"
             elif direction == "bearish":
@@ -307,16 +302,16 @@ class SentimentEngine:
 
         # ── Directional score: signed magnitude for downstream signal gen ─────
         if signal_type == "LONG":
-            directional_score = round(min(1.0, max(0.15, policy_score)), 3)
+            directional_score = round(min(1.0, max(_min_mag, policy_score)), 3)
         elif signal_type == "SHORT":
-            directional_score = round(max(-1.0, min(-0.15, -(max(abs(bluster_score), policy_score)))), 3)
+            directional_score = round(max(-1.0, min(-_min_mag, -(max(abs(bluster_score), policy_score)))), 3)
         else:
             directional_score = 0.0
 
         # ── Impact severity ───────────────────────────────────────────────────
-        if policy_score >= 0.60:
+        if policy_score >= _ss["impact_severity_high"]:
             impact_severity = "high"
-        elif policy_score >= 0.35:
+        elif policy_score >= _ss["impact_severity_medium"]:
             impact_severity = "medium"
         else:
             impact_severity = "low"
@@ -328,8 +323,8 @@ class SentimentEngine:
             "signal_type":      signal_type,
             "directional_score": directional_score,
             "impact_severity":  impact_severity,
-            "is_bluster":       bluster_score < -0.2,
-            "is_policy_change": policy_score >= 0.40 and relevant,
+            "is_bluster":       bluster_score < _ss["bluster_detection_threshold"],
+            "is_policy_change": policy_score >= _ss["policy_change_threshold"] and relevant,
         }
 
     @staticmethod
@@ -345,23 +340,24 @@ class SentimentEngine:
         LLM provides the categorical signal and lists of evidence/risks.
         Python converts those counts into a calibrated confidence float.
         """
-        base = 0.58
+        _rt = _L["red_team"]
+        base = _rt["confidence_base"]
         # Agreement with blue team adds confidence; disagreement reduces it
         if adjusted_signal.upper() == blue_signal.upper():
-            base += 0.08
+            base += _rt["agreement_bonus"]
         else:
-            base -= 0.22
+            base -= _rt["disagreement_penalty"]
         # More evidence → more confident; more risks → less confident
-        base += min(0.12, len(evidence) * 0.024)
-        base -= min(0.14, len(key_risks) * 0.028)
+        base += min(_rt["evidence_bonus_max"], len(evidence) * _rt["evidence_bonus_per_item"])
+        base -= min(_rt["risk_penalty_max"], len(key_risks) * _rt["risk_penalty_per_item"])
         if source_bias_applied:
-            base -= 0.10
-        return round(max(0.24, min(0.84, base)), 3)
+            base -= _rt["source_bias_penalty"]
+        return round(max(_rt["confidence_min"], min(_rt["confidence_max"], base)), 3)
 
     @staticmethod
     def compute_red_team_stop_loss(adjusted_urgency: str) -> float:
         """Rule-based stop loss from urgency — removes the LLM float guess."""
-        return {"HIGH": 3.5, "MEDIUM": 2.5, "LOW": 1.8}.get(
+        return _L["red_team"]["stop_loss_by_urgency"].get(
             str(adjusted_urgency).upper(), 2.5
         )
 
@@ -389,11 +385,16 @@ class SentimentEngine:
 
         evidence_count = len(evidence or [])
         risk_count = len(key_risks or [])
+        _rt = _L["red_team"]
         if normalized_adjusted == "HOLD":
-            return confidence >= 0.58 and (evidence_count >= 2 or risk_count >= 2)
+            return (
+                confidence >= _rt["hold_override_min_confidence"]
+                and (evidence_count >= _rt["hold_override_min_evidence_or_risks"]
+                     or risk_count >= _rt["hold_override_min_evidence_or_risks"])
+            )
         return (
-            confidence >= 0.64
-            and evidence_count >= 3
+            confidence >= _rt["flip_override_min_confidence"]
+            and evidence_count >= _rt["flip_override_min_evidence"]
             and evidence_count >= risk_count + 1
             and not source_bias_applied
         )

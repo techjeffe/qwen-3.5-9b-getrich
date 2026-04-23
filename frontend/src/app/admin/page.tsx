@@ -18,7 +18,6 @@ type AppConfig = {
     default_symbols: string[];
     max_custom_symbols: number;
     max_posts: number;
-    include_backtest: boolean;
     lookback_days: number;
     symbol_prompt_overrides: Record<string, string>;
     symbol_company_aliases: Record<string, string>;
@@ -29,6 +28,20 @@ type AppConfig = {
     reasoning_model: string;
     risk_profile: string;
     web_research_enabled: boolean;
+    paper_trade_amount: number | null;
+    entry_threshold: number | null;
+    stop_loss_pct: number | null;
+    take_profit_pct: number | null;
+    materiality_min_posts_delta: number | null;
+    materiality_min_sentiment_delta: number | null;
+    logic_defaults: {
+        paper_trade_amount: number;
+        entry_threshold: number;
+        stop_loss_pct: number;
+        take_profit_pct: number;
+        materiality_min_posts_delta: number;
+        materiality_min_sentiment_delta: number;
+    };
     available_models: string[];
     last_analysis_started_at: string | null;
     last_analysis_completed_at: string | null;
@@ -49,6 +62,7 @@ type AppConfig = {
         detailed: number;
     };
     rss_articles_per_feed: number;
+    notices?: string[];
 };
 
 const EMPTY_CONFIG: AppConfig = {
@@ -59,7 +73,6 @@ const EMPTY_CONFIG: AppConfig = {
     default_symbols: ["USO", "BITO", "QQQ", "SPY"],
     max_custom_symbols: 3,
     max_posts: 50,
-    include_backtest: true,
     lookback_days: 14,
     symbol_prompt_overrides: {},
     symbol_company_aliases: {},
@@ -70,6 +83,20 @@ const EMPTY_CONFIG: AppConfig = {
     reasoning_model: "",
     risk_profile: "moderate",
     web_research_enabled: false,
+    paper_trade_amount: null,
+    entry_threshold: null,
+    stop_loss_pct: null,
+    take_profit_pct: null,
+    materiality_min_posts_delta: null,
+    materiality_min_sentiment_delta: null,
+    logic_defaults: {
+        paper_trade_amount: 100,
+        entry_threshold: 0.30,
+        stop_loss_pct: 2.0,
+        take_profit_pct: 3.0,
+        materiality_min_posts_delta: 6,
+        materiality_min_sentiment_delta: 0.24,
+    },
     available_models: [],
     last_analysis_started_at: null,
     last_analysis_completed_at: null,
@@ -486,7 +513,8 @@ export default function AdminPage() {
             if (!Array.isArray(committed.available_models)) committed.available_models = [];
             setConfig(committed);
             setSavedConfig(committed);
-            setStatus("Saved");
+            const notices = Array.isArray(committed.notices) ? committed.notices.filter(Boolean) : [];
+            setStatus(notices.length > 0 ? `Saved. ${notices.join(" ")}` : "Saved");
         } catch {
             setStatus("Save failed");
         } finally {
@@ -1098,14 +1126,6 @@ export default function AdminPage() {
                                 className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2"
                             />
                         </label>
-                        <label className="flex items-center gap-3 pt-7 text-sm">
-                            <input
-                                type="checkbox"
-                                checked={config.include_backtest}
-                                onChange={(e) => setConfig((current) => ({ ...current, include_backtest: e.target.checked }))}
-                            />
-                            Include backtest
-                        </label>
                     </div>
                 </section>
 
@@ -1247,6 +1267,96 @@ export default function AdminPage() {
                             <p className="text-xs text-slate-500 uppercase tracking-[0.2em]">Last Completed</p>
                             <p className="mt-2">{config.last_analysis_completed_at ? formatTs(config.last_analysis_completed_at, timeZone) : "Never"}</p>
                         </div>
+                    </div>
+                </section>
+
+                {/* Trading Logic */}
+                <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-5">
+                    <div>
+                        <h2 className="text-sm font-semibold text-slate-200">Trading Logic</h2>
+                        <p className="text-xs text-slate-500 mt-1">
+                            Override the default trading thresholds. Leave blank to use the system defaults from <code className="text-slate-400">logic_config.json</code>.
+                        </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Paper Trade Amount ($)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Dollar size of each simulated trade. Default: ${config.logic_defaults.paper_trade_amount}</p>
+                            <input
+                                type="number"
+                                min={1} max={100000} step={1}
+                                value={config.paper_trade_amount ?? ""}
+                                placeholder={String(config.logic_defaults.paper_trade_amount)}
+                                onChange={(e) => setConfig((c) => ({ ...c, paper_trade_amount: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Entry Threshold (directional score)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum directional score needed to open a trade (0.05–1.0). Default: {config.logic_defaults.entry_threshold}</p>
+                            <input
+                                type="number"
+                                min={0.05} max={1.0} step={0.01}
+                                value={config.entry_threshold ?? ""}
+                                placeholder={String(config.logic_defaults.entry_threshold)}
+                                onChange={(e) => setConfig((c) => ({ ...c, entry_threshold: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Stop Loss (%)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Max loss before closing a position. Default: {config.logic_defaults.stop_loss_pct}%</p>
+                            <input
+                                type="number"
+                                min={0.1} max={50} step={0.1}
+                                value={config.stop_loss_pct ?? ""}
+                                placeholder={String(config.logic_defaults.stop_loss_pct)}
+                                onChange={(e) => setConfig((c) => ({ ...c, stop_loss_pct: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Take Profit (%)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Target gain before closing a position. Default: {config.logic_defaults.take_profit_pct}%</p>
+                            <input
+                                type="number"
+                                min={0.1} max={100} step={0.1}
+                                value={config.take_profit_pct ?? ""}
+                                placeholder={String(config.logic_defaults.take_profit_pct)}
+                                onChange={(e) => setConfig((c) => ({ ...c, take_profit_pct: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Materiality Gate — Min New Articles</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">How many new articles are needed to justify a thesis flip. Default: {config.logic_defaults.materiality_min_posts_delta}</p>
+                            <input
+                                type="number"
+                                min={1} max={100} step={1}
+                                value={config.materiality_min_posts_delta ?? ""}
+                                placeholder={String(config.logic_defaults.materiality_min_posts_delta)}
+                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_posts_delta: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Materiality Gate — Min Sentiment Delta</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum change in sentiment score to justify a thesis flip (0.01–1.0). Default: {config.logic_defaults.materiality_min_sentiment_delta}</p>
+                            <input
+                                type="number"
+                                min={0.01} max={1.0} step={0.01}
+                                value={config.materiality_min_sentiment_delta ?? ""}
+                                placeholder={String(config.logic_defaults.materiality_min_sentiment_delta)}
+                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_sentiment_delta: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
                     </div>
                 </section>
 

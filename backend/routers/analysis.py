@@ -9,7 +9,7 @@ import time
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
+from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple, Callable, Awaitable
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -25,12 +25,21 @@ from schemas.analysis import (
     BacktestResults,
     ModelInputDebug,
     ModelInputArticle,
+    IngestionTraceDebug,
 )
-from database.engine import get_db, SessionLocal
-from database.models import Post, AnalysisResult, Trade, TradeSnapshot, TradeExecution, TradeClose, TradingSignal as TradingSignalModel
+from database.engine import get_db
+from database.models import (
+    ScrapedArticle,
+    AnalysisResult,
+    Trade,
+    TradeSnapshot,
+    TradeExecution,
+    TradeClose,
+    TradingSignal as TradingSignalModel,
+)
 from security import require_admin_token
-from services.data_ingestion.scraper import TruthSocialScraper
 from services.data_ingestion.parser import RSSFeedParser
+from services.data_ingestion.worker import build_analysis_posts
 from services.data_ingestion.yfinance_client import PriceClient
 from services.data_ingestion.market_validation import MarketValidationClient
 from services.ollama import get_ollama_status
@@ -48,11 +57,15 @@ from services.app_config import (
     get_or_create_app_config,
     mark_analysis_started,
     mark_analysis_completed,
+    refresh_analysis_lock,
+    release_analysis_lock,
     resolve_rss_articles_per_feed,
     resolve_web_research_items_per_symbol,
     resolve_web_research_recency_days,
+    try_acquire_analysis_lock,
     DEFAULT_SNAPSHOT_RETENTION_LIMIT,
 )
+from config.logic_loader import LOGIC as _L
 from services.pnl_tracker import PnLTracker, persist_recommendation_trades
 from services.runtime_health import record_analysis_result, record_data_pull
 from services.trading_instruments import build_execution_recommendation
@@ -60,6 +73,13 @@ from services.web_research import fetch_recent_symbol_web_context
 
 
 router = APIRouter()
+
+ProgressCallback = Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]
+
+
+class AnalysisLockError(RuntimeError):
+    """Raised when another analysis run already owns the queue lease."""
+
 
 # Module-level price cache to avoid hitting yfinance on every request.
 # TTL of 5 minutes matches yfinance's own guidance and keeps well under rate limits.
@@ -638,11 +658,12 @@ async def rerun_analysis_snapshot(
         if not _snapshot_risk:
             _rerun_cfg = get_or_create_app_config(db)
             _snapshot_risk = str(getattr(_rerun_cfg, "risk_profile", "moderate") or "moderate")
+        _hyst = _L["entry_thresholds"]
         use_closed_market_hysteresis = (
             _is_closed_market_session(quotes_by_symbol)
             and previous_response is not None
-            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
-            and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
+            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= _hyst["hysteresis_max_post_delta"]
+            and _max_sentiment_input_delta(sentiment_results, previous_response) <= _hyst["hysteresis_max_sentiment_delta"]
         )
         blue_team_signal = _generate_trading_signal(
             sentiment_results,
@@ -650,7 +671,9 @@ async def rerun_analysis_snapshot(
             risk_profile=_snapshot_risk,
             previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
             stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+            price_context=price_context,
         )
+        _sym_counts = _count_symbol_articles(posts, symbols)
         if previous_response and not _material_change_gate(
             symbols=symbols,
             posts_count=len(posts),
@@ -659,6 +682,8 @@ async def rerun_analysis_snapshot(
             quotes_by_symbol=quotes_by_symbol,
             previous_state=previous_state,
             candidate_signal=blue_team_signal,
+            per_symbol_counts=_sym_counts,
+            db=db,
         ):
             blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
         quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
@@ -687,8 +712,6 @@ async def rerun_analysis_snapshot(
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
 
         backtest_results = None
-        if include_backtest:
-            backtest_results = await _run_backtest(symbols, sentiment_results, lookback_days)
 
         processing_time_ms = (time.time() - started) * 1000
         restored_model_inputs = snapshot.get("model_inputs") or _build_model_input_debug(
@@ -791,6 +814,306 @@ def _sse_error(message: str) -> str:
 
 def _sse_article(source: str, title: str, description: str, keywords: list) -> str:
     return f"data: {json.dumps({'type': 'article', 'source': source, 'title': title, 'description': description, 'keywords': keywords})}\n\n"
+
+
+async def _emit_progress(callback: ProgressCallback, event_type: str, payload: Dict[str, Any]) -> None:
+    if callback is not None:
+        await callback(event_type, payload)
+
+
+def _resolve_active_model_name() -> str:
+    try:
+        ollama_status = get_ollama_status()
+        return str(ollama_status.get("active_model") or "").strip() or "unknown model"
+    except Exception:
+        import os as _os
+
+        ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
+        model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
+        raise RuntimeError(f"Ollama is not running at {ollama_root}. Start it with: ollama run {model}")
+
+
+def _mark_scraped_articles_processed(db: Session, article_ids: List[int]) -> None:
+    if not article_ids:
+        return
+    (
+        db.query(ScrapedArticle)
+        .filter(ScrapedArticle.id.in_(article_ids))
+        .update({ScrapedArticle.processed: True}, synchronize_session=False)
+    )
+    db.commit()
+
+
+async def _run_analysis_pipeline(
+    *,
+    db: Session,
+    request: AnalysisRequest,
+    article_ids: Optional[List[int]] = None,
+    trigger_source: str = "api",
+    progress_callback: ProgressCallback = None,
+) -> AnalysisResponse:
+    start_time = time.time()
+    request_id = str(uuid.uuid4())[:8]
+    pipeline_events: List[str] = []
+    active_model = _resolve_active_model_name()
+    config = get_or_create_app_config(db)
+    effective_request = _apply_request_defaults(request, config)
+    prompt_overrides = config.symbol_prompt_overrides or {}
+
+    if not try_acquire_analysis_lock(db, request_id):
+        raise AnalysisLockError("Another analysis run is already in progress")
+
+    try:
+        mark_analysis_started(db, request_id)
+        await _emit_progress(progress_callback, "log", {"message": f"Ollama reachable - using {active_model}"})
+
+        posts, ingestion_trace = await _ingest_data(
+            effective_request,
+            config,
+            db,
+            article_ids=article_ids,
+            trigger_source=trigger_source,
+        )
+        pipeline_events.append(f"Loaded {len(posts)} queued articles from the database")
+        await _emit_progress(progress_callback, "log", {"message": f"Loaded {len(posts)} queued articles from the database"})
+        for post in posts:
+            description = str(getattr(post, "content", "") or "")
+            if description == str(getattr(post, "title", "") or ""):
+                description = ""
+            await _emit_progress(
+                progress_callback,
+                "article",
+                {
+                    "source": str(getattr(post, "source", "") or "Queued Article"),
+                    "title": str(getattr(post, "title", "") or ""),
+                    "description": description[:1200],
+                    "keywords": list(getattr(post, "keywords", None) or [])[:6],
+                },
+            )
+
+        refresh_analysis_lock(db, request_id)
+        await _emit_progress(progress_callback, "log", {"message": f"Fetching real-time price data for {', '.join(effective_request.symbols)}..."})
+        price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
+        price_context = _inject_technical_context(price_context, effective_request.symbols, db)
+        web_context_by_symbol, web_items_by_symbol = await _get_symbol_web_research(
+            effective_request.symbols,
+            bool(getattr(config, "web_research_enabled", False)),
+            resolve_web_research_items_per_symbol(config),
+            resolve_web_research_recency_days(config),
+            getattr(config, "symbol_company_aliases", {}) or {},
+        )
+
+        refresh_analysis_lock(db, request_id)
+        extraction_model, reasoning_model = _resolve_pipeline_models(config, active_model)
+        await _emit_progress(progress_callback, "log", {"message": "Running sentiment analysis on queued articles..."})
+        sentiment_results, sentiment_trace = await _analyze_sentiment(
+            posts,
+            effective_request.symbols,
+            price_context,
+            prompt_overrides,
+            active_model,
+            extraction_model=extraction_model,
+            reasoning_model=reasoning_model,
+            web_context_by_symbol=web_context_by_symbol,
+        )
+
+        for symbol, sentiment in sentiment_results.items():
+            await _emit_progress(
+                progress_callback,
+                "log",
+                {
+                    "message": (
+                        f"{symbol}: bluster={float(sentiment.get('bluster_score', 0.0)):+.2f}  "
+                        f"policy={float(sentiment.get('policy_score', 0.0)):.2f}  "
+                        f"confidence={float(sentiment.get('confidence', 0.0)):.0%}"
+                    )
+                },
+            )
+
+        _risk_profile = str(getattr(config, "risk_profile", "moderate") or "moderate")
+        previous_state = _latest_previous_analysis_state(db)
+        previous_response = previous_state.get("response") if previous_state else None
+        _hyst = _L["entry_thresholds"]
+        use_closed_market_hysteresis = (
+            _is_closed_market_session(quotes_by_symbol)
+            and previous_response is not None
+            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= _hyst["hysteresis_max_post_delta"]
+            and _max_sentiment_input_delta(sentiment_results, previous_response) <= _hyst["hysteresis_max_sentiment_delta"]
+        )
+
+        blue_team_signal = _generate_trading_signal(
+            sentiment_results,
+            quotes_by_symbol,
+            risk_profile=_risk_profile,
+            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
+            stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+            entry_threshold_override=float(getattr(config, "entry_threshold", None) or 0) or None,
+            price_context=price_context,
+        )
+        _sym_counts = _count_symbol_articles(posts, effective_request.symbols)
+        if previous_response and not _material_change_gate(
+            symbols=effective_request.symbols,
+            posts_count=len(posts),
+            sentiment_results=sentiment_results,
+            price_context=price_context,
+            quotes_by_symbol=quotes_by_symbol,
+            previous_state=previous_state,
+            candidate_signal=blue_team_signal,
+            min_posts_delta=getattr(config, "materiality_min_posts_delta", None) or None,
+            min_sentiment_delta=getattr(config, "materiality_min_sentiment_delta", None) or None,
+            per_symbol_counts=_sym_counts,
+            db=db,
+        ):
+            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
+
+        quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
+        if blue_team_signal.entry_symbol in quotes_by_symbol:
+            blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
+
+        refresh_analysis_lock(db, request_id)
+        red_team_review, red_team_debug = await _run_red_team_review(
+            model_name=reasoning_model or active_model,
+            symbols=effective_request.symbols,
+            posts=posts,
+            sentiment_results=sentiment_results,
+            trading_signal=blue_team_signal,
+            price_context=price_context,
+            quotes_by_symbol=quotes_by_symbol,
+            market_validation=market_validation,
+        )
+        trading_signal = _build_consensus_trading_signal(
+            blue_team_signal,
+            red_team_review,
+            quotes_by_symbol=quotes_by_symbol,
+            risk_profile=_risk_profile,
+        )
+        if red_team_debug:
+            red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+        quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
+        if trading_signal.entry_symbol in quotes_by_symbol:
+            trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
+
+        backtest_results = None
+        processing_time_ms = (time.time() - start_time) * 1000
+
+        response = AnalysisResponse(
+            request_id=request_id,
+            timestamp=datetime.utcnow(),
+            symbols_analyzed=effective_request.symbols,
+            posts_scraped=len(posts),
+            sentiment_scores={
+                symbol: SentimentScore(
+                    market_bluster=sentiment.get('bluster_score', 0.0),
+                    policy_change=sentiment.get('policy_score', 0.0),
+                    confidence=sentiment.get('confidence', 0.5),
+                    reasoning=sentiment.get('reasoning', ''),
+                )
+                for symbol, sentiment in sentiment_results.items()
+            },
+            aggregated_sentiment=_aggregate_sentiment(sentiment_results),
+            trading_signal=trading_signal,
+            blue_team_signal=blue_team_signal,
+            market_validation=market_validation,
+            red_team_review=red_team_review,
+            red_team_debug=red_team_debug,
+            model_inputs=_build_model_input_debug(
+                posts,
+                price_context,
+                market_validation,
+                effective_request.symbols,
+                prompt_overrides,
+                web_context_by_symbol=web_context_by_symbol,
+                web_items_by_symbol=web_items_by_symbol,
+            ),
+            ingestion_trace=IngestionTraceDebug.model_validate(ingestion_trace),
+            backtest_results=backtest_results,
+            processing_time_ms=processing_time_ms,
+            status="SUCCESS",
+        )
+
+        secret_trace = _build_secret_trace(
+            request_id=request_id,
+            active_model=active_model,
+            extraction_model=extraction_model or "",
+            reasoning_model=reasoning_model or "",
+            risk_profile=_risk_profile,
+            request_payload=effective_request,
+            ingestion_trace=ingestion_trace,
+            price_context=price_context,
+            quotes_by_symbol=quotes_by_symbol,
+            market_validation=market_validation,
+            web_context_by_symbol=web_context_by_symbol,
+            web_items_by_symbol=web_items_by_symbol,
+            sentiment_results=sentiment_results,
+            sentiment_trace=sentiment_trace,
+            blue_team_signal=blue_team_signal,
+            trading_signal=trading_signal,
+            red_team_review=red_team_review.model_dump(mode="json") if red_team_review else None,
+            red_team_debug=red_team_debug.model_dump(mode="json") if red_team_debug else None,
+            backtest_results=backtest_results,
+            pipeline_events=pipeline_events,
+        )
+
+        _save_analysis_result(
+            db,
+            request_id,
+            response,
+            quotes_by_symbol,
+            posts=posts,
+            model_name=active_model,
+            prompt_overrides=prompt_overrides,
+            extraction_model=extraction_model or "",
+            reasoning_model=reasoning_model or "",
+            risk_profile=_risk_profile,
+            secret_trace=secret_trace,
+            sentiment_results=sentiment_results,
+            per_symbol_counts=_sym_counts,
+        )
+        _mark_scraped_articles_processed(db, ingestion_trace.get("selected_article_ids") or [])
+        mark_analysis_completed(db, request_id)
+        record_analysis_result(
+            status="success",
+            request_id=request_id,
+            duration_ms=processing_time_ms,
+            active_model=active_model,
+        )
+        await _emit_progress(progress_callback, "log", {"message": f"Analysis complete in {processing_time_ms / 1000:.2f}s"})
+        return response
+    except Exception as exc:
+        record_analysis_result(
+            status="failed",
+            request_id=request_id,
+            active_model=active_model,
+            error=str(exc),
+        )
+        raise
+    finally:
+        release_analysis_lock(db, request_id)
+
+
+async def run_analysis_for_pending_articles(
+    *,
+    db: Session,
+    symbols: List[str],
+    article_ids: Optional[List[int]] = None,
+    trigger_source: str = "worker",
+) -> Optional[AnalysisResponse]:
+    request = AnalysisRequest(
+        symbols=symbols,
+        max_posts=max(1, len(article_ids or []) or 50),
+        include_backtest=False,
+        lookback_days=14,
+    )
+    try:
+        return await _run_analysis_pipeline(
+            db=db,
+            request=request,
+            article_ids=article_ids,
+            trigger_source=trigger_source,
+        )
+    except AnalysisLockError as exc:
+        print(f"Skipping {trigger_source} analysis trigger because another run owns the lock: {exc}")
+        return None
 
 
 @router.post(
@@ -992,7 +1315,9 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 risk_profile=_stream_risk,
                 previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
                 stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
+                price_context=price_context,
             )
+            _sym_counts = _count_symbol_articles(posts, effective_request.symbols)
             if previous_response and not _material_change_gate(
                 symbols=effective_request.symbols,
                 posts_count=len(posts),
@@ -1001,6 +1326,8 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 quotes_by_symbol=quotes_by_symbol,
                 previous_state=previous_state,
                 candidate_signal=blue_team_signal,
+                per_symbol_counts=_sym_counts,
+                db=db,
             ):
                 yield emit("Material-change gate active: keeping prior thesis because the news/price move is not large enough to justify a flip.")
                 blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
@@ -1045,19 +1372,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             )
             mark_stage_complete("signal")
 
-            # Step 5: Backtest
             backtest_results = None
-            if effective_request.include_backtest:
-                yield emit(f"Running rolling window backtest ({effective_request.lookback_days}-day lookback)...")
-                backtest_results = await _run_backtest(
-                    effective_request.symbols, sentiment_results, effective_request.lookback_days
-                )
-                yield emit(
-                    f"Backtest complete — return: {backtest_results.total_return:.2f}%  "
-                    f"Sharpe: {backtest_results.sharpe_ratio:.2f}  "
-                    f"Max DD: {backtest_results.max_drawdown:.2f}%"
-                )
-            mark_stage_complete("backtest")
 
             processing_time_ms = (time.time() - start_time) * 1000
             yield emit(f"Analysis complete in {processing_time_ms / 1000:.2f}s")
@@ -1091,6 +1406,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                     web_context_by_symbol=web_context_by_symbol,
                     web_items_by_symbol=web_items_by_symbol,
                 ),
+                ingestion_trace=IngestionTraceDebug.model_validate(ingestion_trace),
                 backtest_results=backtest_results,
                 processing_time_ms=processing_time_ms,
                 status="SUCCESS"
@@ -1125,6 +1441,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 risk_profile=_stream_risk,
                 secret_trace=secret_trace,
                 sentiment_results=sentiment_results,
+                per_symbol_counts=_sym_counts,
             )
             mark_analysis_completed(db, request_id)
             record_analysis_result(
@@ -1161,314 +1478,86 @@ async def analyze_market(
     db: Session = Depends(get_db)
 ):
     try:
-        ollama_status = get_ollama_status()
-        ollama_root = str(ollama_status.get("ollama_root") or "")
-        active_model = str(ollama_status.get("active_model") or "").strip() or "unknown model"
-    except Exception:
-        import os as _os
-
-        ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
-        model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Ollama is not running at {ollama_root}. Start it with: ollama run {model}"
-        )
-
-    start_time = time.time()
-    request_id = str(uuid.uuid4())[:8]
-
-    try:
-        config = get_or_create_app_config(db)
-        effective_request = _apply_request_defaults(request, config)
-        prompt_overrides = config.symbol_prompt_overrides or {}
-        mark_analysis_started(db, request_id)
-
-        posts, ingestion_trace = await _ingest_data(effective_request, config)
-        price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
-        price_context = _inject_technical_context(price_context, effective_request.symbols, db)
-        web_context_by_symbol, web_items_by_symbol = await _get_symbol_web_research(
-            effective_request.symbols,
-            bool(getattr(config, "web_research_enabled", False)),
-            resolve_web_research_items_per_symbol(config),
-            resolve_web_research_recency_days(config),
-            getattr(config, "symbol_company_aliases", {}) or {},
-        )
-        extraction_model, reasoning_model = _resolve_pipeline_models(config, active_model)
-        sentiment_results, sentiment_trace = await _analyze_sentiment(
-            posts,
-            effective_request.symbols,
-            price_context,
-            prompt_overrides,
-            active_model,
-            extraction_model=extraction_model,
-            reasoning_model=reasoning_model,
-            web_context_by_symbol=web_context_by_symbol,
-        )
-        _batch_risk = str(getattr(config, "risk_profile", "moderate") or "moderate")
-        previous_state = _latest_previous_analysis_state(db)
-        previous_response = previous_state.get("response") if previous_state else None
-        use_closed_market_hysteresis = (
-            _is_closed_market_session(quotes_by_symbol)
-            and previous_response is not None
-            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
-            and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
-        )
-        blue_team_signal = _generate_trading_signal(
-            sentiment_results,
-            quotes_by_symbol,
-            risk_profile=_batch_risk,
-            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
-            stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
-        )
-        if previous_response and not _material_change_gate(
-            symbols=effective_request.symbols,
-            posts_count=len(posts),
-            sentiment_results=sentiment_results,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            previous_state=previous_state,
-            candidate_signal=blue_team_signal,
-        ):
-            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
-        quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
-        if blue_team_signal.entry_symbol in quotes_by_symbol:
-            blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
-        red_team_review, red_team_debug = await _run_red_team_review(
-            model_name=reasoning_model or active_model,
-            symbols=effective_request.symbols,
-            posts=posts,
-            sentiment_results=sentiment_results,
-            trading_signal=blue_team_signal,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            market_validation=market_validation,
-        )
-        trading_signal = _build_consensus_trading_signal(
-            blue_team_signal,
-            red_team_review,
-            quotes_by_symbol=quotes_by_symbol,
-            risk_profile=_batch_risk,
-        )
-        if red_team_debug:
-            red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
-        quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
-        if trading_signal.entry_symbol in quotes_by_symbol:
-            trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
-
-        backtest_results = None
-        if effective_request.include_backtest:
-            backtest_results = await _run_backtest(
-                effective_request.symbols, sentiment_results, effective_request.lookback_days
-            )
-
-        processing_time_ms = (time.time() - start_time) * 1000
-
-        response = AnalysisResponse(
-            request_id=request_id,
-            timestamp=datetime.utcnow(),
-            symbols_analyzed=effective_request.symbols,
-            posts_scraped=len(posts),
-            sentiment_scores={
-                symbol: SentimentScore(
-                    market_bluster=sentiment.get('bluster_score', 0.0),
-                    policy_change=sentiment.get('policy_score', 0.0),
-                    confidence=sentiment.get('confidence', 0.5),
-                    reasoning=sentiment.get('reasoning', '')
-                )
-                for symbol, sentiment in sentiment_results.items()
-            },
-            aggregated_sentiment=_aggregate_sentiment(sentiment_results),
-            trading_signal=trading_signal,
-            blue_team_signal=blue_team_signal,
-            market_validation=market_validation,
-            red_team_review=red_team_review,
-            red_team_debug=red_team_debug,
-            model_inputs=_build_model_input_debug(
-                posts,
-                price_context,
-                market_validation,
-                effective_request.symbols,
-                prompt_overrides,
-                web_context_by_symbol=web_context_by_symbol,
-                web_items_by_symbol=web_items_by_symbol,
-            ),
-            backtest_results=backtest_results,
-            processing_time_ms=processing_time_ms,
-            status="SUCCESS"
-        )
-        secret_trace = _build_secret_trace(
-            request_id=request_id,
-            active_model=active_model,
-            extraction_model=extraction_model or "",
-            reasoning_model=reasoning_model or "",
-            risk_profile=_batch_risk,
-            request_payload=effective_request,
-            ingestion_trace=ingestion_trace,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            market_validation=market_validation,
-            web_context_by_symbol=web_context_by_symbol,
-            web_items_by_symbol=web_items_by_symbol,
-            sentiment_results=sentiment_results,
-            sentiment_trace=sentiment_trace,
-            blue_team_signal=blue_team_signal,
-            trading_signal=trading_signal,
-            red_team_review=red_team_review.model_dump(mode="json") if red_team_review else None,
-            red_team_debug=red_team_debug.model_dump(mode="json") if red_team_debug else None,
-            backtest_results=backtest_results,
-            pipeline_events=[
-                f"Loaded {len(posts)} items from ingestion",
-                f"Fetched {len(quotes_by_symbol)} quotes",
-                f"Completed sentiment analysis for {len(sentiment_results)} symbols",
-                f"Generated blue-team {blue_team_signal.signal_type} signal",
-                f"Generated consensus {trading_signal.signal_type} signal",
-            ],
-        )
-
-        if db:
-            _save_analysis_result(
-                db,
-                request_id,
-                response,
-                quotes_by_symbol,
-                posts=posts,
-                model_name=active_model,
-                prompt_overrides=prompt_overrides,
-                extraction_model=extraction_model or "",
-                reasoning_model=reasoning_model or "",
-                risk_profile=_batch_risk,
-                secret_trace=secret_trace,
-            )
-            mark_analysis_completed(db, request_id)
-
-        record_analysis_result(
-            status="success",
-            request_id=request_id,
-            duration_ms=processing_time_ms,
-            active_model=active_model,
+        response = await _run_analysis_pipeline(
+            db=db,
+            request=request,
+            trigger_source="api",
         )
         return response
-
-    except Exception as e:
-        record_analysis_result(
-            status="failed",
-            request_id=request_id if "request_id" in locals() else None,
-            active_model=locals().get("active_model"),
-            error=str(e),
-        )
+    except AnalysisLockError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": "Analysis failed",
-                "message": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "message": str(exc),
+                "timestamp": datetime.utcnow().isoformat(),
             }
         )
 
 
-async def _ingest_data(request: AnalysisRequest, config: Any) -> Tuple[List[Any], Dict[str, Any]]:
-    """Ingest posts from Truth Social and RSS feeds. Returns posts plus a structured trace."""
-    posts: List[Any] = []
-    truth_status = {"status": "ok", "count": 0, "error": None}
-    rss_status = {"status": "ok", "count": 0, "error": None}
-    trace: Dict[str, Any] = {
-        "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
-        "rss": {"status": "ok", "feeds": [], "total_count": 0, "error": None},
-    }
+async def _ingest_data(
+    request: AnalysisRequest,
+    config: Any,
+    db: Session,
+    article_ids: Optional[List[int]] = None,
+    trigger_source: str = "api",
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Load pending scraped articles from the DB-backed ingestion queue."""
+    query = db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False))
+    if article_ids:
+        normalized_ids = sorted({int(article_id) for article_id in article_ids})
+        query = query.filter(ScrapedArticle.id.in_(normalized_ids))
 
-    scraper = TruthSocialScraper()
-    try:
-        truth_posts = await scraper.scrape_posts(
-            query="market geopolitics policy oil crypto fed trade",
-            limit=request.max_posts
+    rows = (
+        query.order_by(
+            ScrapedArticle.discovered_at.asc(),
+            ScrapedArticle.id.asc(),
         )
-        posts.extend(truth_posts)
-        truth_status["count"] = len(truth_posts)
-        trace["truth_social"] = {
-            "status": "ok",
-            "count": len(truth_posts),
-            "items": [_post_trace_summary(post) for post in truth_posts],
-            "error": None,
-        }
-    except Exception as e:
-        print(f"Truth Social scrape error: {e}")
-        truth_status["status"] = "error"
-        truth_status["error"] = str(e)
-        trace["truth_social"] = {"status": "error", "count": 0, "items": [], "error": str(e)}
-
-    feed_map = build_enabled_rss_feed_map(config)
-    parser = RSSFeedParser(feeds=feed_map)
-    per_feed_cap = resolve_rss_articles_per_feed(config)
-    max_total_posts = max(request.max_posts, per_feed_cap * max(1, len(parser.feeds)))
-    try:
-        rss_articles: List[Any] = []
-        feed_traces: List[Dict[str, Any]] = []
-        for feed_name in parser.feeds:
-            feed_url = feed_map.get(feed_name, "")
-            try:
-                articles = await asyncio.to_thread(parser.parse_feeds, feed_names=[feed_name])
-                articles = parser.filter_by_keywords(articles, min_keywords=1)
-                articles = articles[:per_feed_cap]
-                rss_articles.extend(articles)
-                feed_traces.append(
-                    {
-                        "feed_key": feed_name,
-                        "feed_url": feed_url,
-                        "status": "ok",
-                        "count": len(articles),
-                        "articles": [_post_trace_summary(article) for article in articles],
-                    }
-                )
-            except Exception as e:
-                feed_traces.append(
-                    {
-                        "feed_key": feed_name,
-                        "feed_url": feed_url,
-                        "status": "error",
-                        "count": 0,
-                        "articles": [],
-                        "error": str(e),
-                    }
-                )
-        posts.extend(rss_articles)
-        rss_status["count"] = len(rss_articles)
-        trace["rss"] = {
-            "status": "ok",
-            "feeds": feed_traces,
-            "per_feed_cap": per_feed_cap,
-            "total_count": len(rss_articles),
-            "error": None,
-        }
-    except Exception as e:
-        print(f"RSS feed parse error: {e}")
-        rss_status["status"] = "error"
-        rss_status["error"] = str(e)
-        trace["rss"] = {"status": "error", "feeds": [], "total_count": 0, "error": str(e)}
-
-    pull_status = "ok"
-    if truth_status["status"] == "error" and rss_status["status"] == "error":
-        pull_status = "error"
-    elif truth_status["status"] == "error" or rss_status["status"] == "error":
-        pull_status = "partial"
-
-    record_data_pull(
-        status=pull_status,
-        source="analysis_ingestion",
-        summary=f"Fetched {len(posts)} items from Truth Social and RSS",
-        details={
-            "truth_social": truth_status,
-            "rss": rss_status,
-            "total_items": len(posts),
-        },
-        error="; ".join(
-            error for error in [truth_status["error"], rss_status["error"]] if error
-        ) or None,
+        .limit(int(request.max_posts or getattr(config, "max_posts", 50) or 50))
+        .all()
     )
 
-    trace["total_items"] = len(posts)
-    trace["request_max_posts"] = request.max_posts
-    trace["truth_status"] = truth_status
-    trace["rss_status"] = rss_status
+    posts = build_analysis_posts(rows)
+    selected_ids = [int(row.id) for row in rows]
+    fast_lane_ids = [int(row.id) for row in rows if bool(row.fast_lane_triggered)]
+    trace: Dict[str, Any] = {
+        "source": "db_queue",
+        "trigger_source": trigger_source,
+        "request_max_posts": request.max_posts,
+        "selected_article_ids": selected_ids,
+        "selected_fast_lane_article_ids": fast_lane_ids,
+        "total_items": len(posts),
+        "queue": {
+            "status": "ok",
+            "pending_count": int(
+                db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False)).count()
+            ),
+            "selected_count": len(rows),
+            "selected_articles": [_post_trace_summary(post) for post in posts],
+            "selected_urls": [str(row.url or "") for row in rows],
+            "fast_lane_count": len(fast_lane_ids),
+        },
+        "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
+        "rss": {"status": "replaced_by_db_queue", "feeds": [], "total_count": len(posts), "error": None},
+    }
+
+    record_data_pull(
+        status="ok",
+        source="analysis_ingestion_queue",
+        summary=f"Loaded {len(posts)} pending articles from the DB queue",
+        details={
+            "trigger_source": trigger_source,
+            "selected_article_ids": selected_ids,
+            "fast_lane_article_ids": fast_lane_ids,
+            "pending_count": trace["queue"]["pending_count"],
+        },
+        error=None,
+    )
+
     return posts, trace
 
 
@@ -1477,7 +1566,7 @@ def _apply_request_defaults(request: AnalysisRequest, config: Any) -> AnalysisRe
     return AnalysisRequest(
         symbols=symbols,
         max_posts=request.max_posts or config.max_posts,
-        include_backtest=request.include_backtest if request.include_backtest is not None else config.include_backtest,
+        include_backtest=False,
         lookback_days=request.lookback_days or config.lookback_days,
     )
 
@@ -1840,6 +1929,7 @@ def _post_trace_summary(post: Any) -> Dict[str, Any]:
         "source": getattr(post, "source", None) or getattr(post, "feed_name", None) or getattr(post, "author", None) or "Unknown",
         "title": getattr(post, "title", "") or "",
         "summary": getattr(post, "summary", "") or "",
+        "content": getattr(post, "content", "") or "",
         "keywords": list(getattr(post, "keywords", None) or []),
     }
 
@@ -2135,6 +2225,7 @@ def _build_model_input_debug(
                 source=str(source),
                 title=title,
                 description="" if description == title else description,
+                content=description,
                 keywords=keywords[:8],
             )
         )
@@ -2244,17 +2335,32 @@ def _derive_directional_score(
     return 0.0
 
 
-def _resolve_leverage(confidence: float, risk_profile: str, action: str = "") -> str:
+def _resolve_leverage(confidence: float, risk_profile: str, action: str = "", atr_pct: float = 0.0) -> str:
     profile = str(risk_profile or "moderate").lower().strip()
     if profile == "conservative":
-        # Inverse ETF for bearish (broker-friendly, no shorting), underlying for bullish — 1x position sizing throughout
         return "inverse" if str(action).upper() == "SELL" else "1x"
+
+    # Profile-based raw leverage
     if profile == "moderate":
-        return "2x" if confidence > 0.75 else "1x"
-    if profile == "crazy":
-        return "3x"
-    # aggressive: 3x if confidence > 0.75, else 1x
-    return "3x" if confidence > 0.75 else "1x"
+        raw = 2 if confidence > 0.75 else 1
+    elif profile == "crazy":
+        raw = 3
+    else:
+        # aggressive
+        raw = 3 if confidence > 0.75 else 1
+
+    # ATR-based volatility cap — applied after profile, before returning
+    _lev_cfg = _L.get("leverage", {})
+    high_vol = float(_lev_cfg.get("high_vol_atr_pct", 3.0))
+    med_vol  = float(_lev_cfg.get("medium_vol_atr_pct", 1.5))
+    if atr_pct >= high_vol:
+        cap = 1
+    elif atr_pct >= med_vol:
+        cap = 2
+    else:
+        cap = 3
+
+    return f"{min(raw, cap)}x"
 
 
 def _is_closed_market_session(quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]]) -> bool:
@@ -2406,6 +2512,58 @@ def _signals_differ_materially(
     return False
 
 
+def _count_symbol_articles(posts: List[Any], symbols: List[str]) -> Dict[str, int]:
+    """Count articles relevant to each symbol by keyword matching."""
+    counts: Dict[str, int] = {}
+    for symbol in symbols:
+        sym_upper = symbol.upper()
+        terms_raw = SYMBOL_RELEVANCE_TERMS.get(sym_upper)
+        if not terms_raw:
+            counts[sym_upper] = len(posts)
+            continue
+        terms = expand_proxy_terms_for_matching(terms_raw)
+        count = 0
+        for post in posts:
+            text = normalize_text_for_matching(" ".join([
+                str(getattr(post, "title", "") or (post.get("title", "") if isinstance(post, dict) else "")),
+                str(getattr(post, "content", "") or (post.get("content", "") if isinstance(post, dict) else "")),
+                str(getattr(post, "description", "") or (post.get("description", "") if isinstance(post, dict) else "")),
+            ]))
+            if any(term in text for term in terms):
+                count += 1
+        counts[sym_upper] = count
+    return counts
+
+
+def _rolling_article_baseline(db, symbols: List[str], n_runs: int = 20) -> Dict[str, Dict[str, float]]:
+    """Compute rolling mean and stddev of per-symbol article counts from recent analysis runs."""
+    import math
+    from database.models import AnalysisResult as _AR
+    recent = (
+        db.query(_AR)
+        .filter(_AR.run_metadata.isnot(None))
+        .order_by(_AR.timestamp.desc())
+        .limit(n_runs)
+        .all()
+    )
+    history: Dict[str, List[int]] = {s.upper(): [] for s in symbols}
+    for row in recent:
+        counts = (row.run_metadata or {}).get("per_symbol_article_counts") or {}
+        for sym in symbols:
+            val = counts.get(sym.upper())
+            if val is not None:
+                history[sym.upper()].append(int(val))
+    stats: Dict[str, Dict[str, float]] = {}
+    for sym, vals in history.items():
+        if not vals:
+            stats[sym] = {"mean": 0.0, "stddev": 0.0, "n": 0}
+        else:
+            mean = sum(vals) / len(vals)
+            stddev = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+            stats[sym] = {"mean": mean, "stddev": stddev, "n": len(vals)}
+    return stats
+
+
 def _material_change_gate(
     *,
     symbols: List[str],
@@ -2415,6 +2573,10 @@ def _material_change_gate(
     quotes_by_symbol: Dict[str, Dict[str, Any]],
     previous_state: Optional[Dict[str, Any]],
     candidate_signal: Optional[TradingSignal],
+    min_posts_delta: Optional[int] = None,
+    min_sentiment_delta: Optional[float] = None,
+    per_symbol_counts: Optional[Dict[str, int]] = None,
+    db: Optional[Any] = None,
 ) -> bool:
     """Return True when a thesis flip is justified by meaningful news or price movement."""
     if previous_state is None:
@@ -2425,15 +2587,45 @@ def _material_change_gate(
     if not _signals_differ_materially(previous_signal, candidate_signal):
         return True
 
-    posts_delta = abs(int(getattr(previous_response, "posts_scraped", 0) or 0) - int(posts_count or 0)) if previous_response else 999
+    _mg = _L["materiality_gate"]
+    _min_posts = min_posts_delta if min_posts_delta is not None else _mg["min_posts_delta"]
+    _min_sent = min_sentiment_delta if min_sentiment_delta is not None else _mg["min_sentiment_delta"]
+
+    # Dynamic per-symbol article baseline when history is available
+    article_material = False
+    if db is not None and per_symbol_counts:
+        _min_hist = int(_mg.get("rolling_baseline_min_runs", 5))
+        _n_runs   = int(_mg.get("rolling_baseline_runs", 20))
+        _mult     = float(_mg.get("rolling_baseline_stddev_multiplier", 1.0))
+        baseline  = _rolling_article_baseline(db, symbols, n_runs=_n_runs)
+        for sym, count in per_symbol_counts.items():
+            b = baseline.get(sym.upper(), {})
+            if b.get("n", 0) >= _min_hist:
+                threshold = b["mean"] + _mult * b["stddev"]
+                if count > threshold:
+                    article_material = True
+                    break
+            else:
+                # Cold start: fall back to total-posts delta
+                prev_total = int(getattr(previous_response, "posts_scraped", 0) or 0)
+                if abs(prev_total - int(posts_count or 0)) >= _min_posts:
+                    article_material = True
+                    break
+    else:
+        posts_delta = abs(int(getattr(previous_response, "posts_scraped", 0) or 0) - int(posts_count or 0)) if previous_response else 999
+        article_material = posts_delta >= _min_posts
+
     sentiment_delta = _max_sentiment_input_delta(sentiment_results, previous_response)
     price_move_pct = _max_price_move_vs_previous_pct(symbols, quotes_by_symbol, previous_quotes)
     atr_pct = _max_atr_pct(symbols, price_context)
-    material_price_threshold = max(0.75, min(3.0, atr_pct * 0.5 if atr_pct > 0 else 1.0))
+    material_price_threshold = max(
+        _mg["price_move_floor_pct"],
+        min(_mg["price_move_ceiling_pct"], atr_pct * _mg["atr_multiplier"] if atr_pct > 0 else 1.0),
+    )
 
     return (
-        posts_delta >= 6
-        or sentiment_delta >= 0.24
+        article_material
+        or sentiment_delta >= _min_sent
         or price_move_pct >= material_price_threshold
     )
 
@@ -2444,16 +2636,24 @@ def _generate_trading_signal(
     risk_profile: str = "aggressive",
     previous_signal: Optional[TradingSignal] = None,
     stability_mode: str = "normal",
+    entry_threshold_override: Optional[float] = None,
+    price_context: Optional[Dict[str, Any]] = None,
 ) -> TradingSignal:
     if not sentiment_results:
         return TradingSignal(
             signal_type="HOLD", confidence_score=0.0,
-            entry_symbol="USO", stop_loss_pct=2.0, take_profit_pct=3.0, urgency="LOW",
-            conviction_level="LOW", holding_period_hours=2, trading_type="VOLATILE_EVENT",
+            entry_symbol="USO",
+            stop_loss_pct=_L["stop_loss_pct"],
+            take_profit_pct=_L["take_profit_pct"],
+            urgency="LOW",
+            conviction_level="LOW",
+            holding_period_hours=_L["conviction"]["holding_minutes"]["VOLATILE_EVENT"] / 60,
+            trading_type="VOLATILE_EVENT",
             action_if_already_in_position="HOLD"
         )
 
     symbols = list(sentiment_results.keys())
+    _signal_atr_pct = _max_atr_pct(symbols, price_context)
     recommendations: List[Dict[str, str]] = []
     urgency_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
     overall_urgency = "LOW"
@@ -2466,9 +2666,10 @@ def _generate_trading_signal(
     short_recommendations = 0
     hold_recommendations = 0
     previous_recommendations = _recommendations_by_underlying(previous_signal)
+    _et = _L["entry_thresholds"]
     is_closed_hysteresis = stability_mode == "closed_market_hysteresis"
-    entry_threshold = 0.42 if is_closed_hysteresis else 0.30
-    keep_threshold = 0.22 if is_closed_hysteresis else 0.30
+    entry_threshold = _et["closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["normal"])
+    keep_threshold = _et["keep_closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["keep_normal"])
 
     for sym, result in sentiment_results.items():
         directional = result.get('directional_score', 0.0)
@@ -2490,7 +2691,7 @@ def _generate_trading_signal(
             urgency = specialist_urgency if specialist_signal == "HOLD" else "LOW"
             hold_recommendations += 1
 
-        leverage = _resolve_leverage(confidence, risk_profile, action=action)
+        leverage = _resolve_leverage(confidence, risk_profile, action=action, atr_pct=_signal_atr_pct)
         recommendation = None
         if action:
             recommendation = build_execution_recommendation(sym, action, leverage)
@@ -2572,14 +2773,15 @@ def _generate_trading_signal(
             break
     
     # Fallback to logic based on confidence and urgency if not provided
+    _cv = _L["conviction"]
     if conviction_level_from_engine:
         conviction_level = conviction_level_from_engine
     else:
         if signal_type == "HOLD":
             conviction_level = "LOW"
-        elif strongest_score > 0.6 and confidence_score > 0.7:
+        elif strongest_score > _cv["high_score_threshold"] and confidence_score > _cv["high_confidence_threshold"]:
             conviction_level = "HIGH"  # Strong structural signal
-        elif overall_urgency == "HIGH" and confidence_score < 0.6:
+        elif overall_urgency == "HIGH" and confidence_score < _cv["high_score_threshold"]:
             conviction_level = "LOW"  # Reactive bluster
         else:
             conviction_level = "MEDIUM"  # Data-driven swing
@@ -2597,15 +2799,7 @@ def _generate_trading_signal(
     if holding_period_from_engine:
         holding_period_hours = holding_period_from_engine
     else:
-        # Default holding periods by trading type
-        if trading_type == "SCALP":
-            holding_period_hours = 2
-        elif trading_type == "SWING":
-            holding_period_hours = 12
-        elif trading_type == "POSITION":
-            holding_period_hours = 72
-        else:  # VOLATILE_EVENT
-            holding_period_hours = 2
+        holding_period_hours = _cv["holding_minutes"].get(trading_type, 720) / 60
     
     # Determine action if already in position
     action_if_already_in_position = "HOLD"  # Default: let existing position run
@@ -2615,8 +2809,8 @@ def _generate_trading_signal(
         confidence_score=min(confidence_score, 1.0),
         entry_symbol=strongest_execution_symbol,
         entry_price=(quotes_by_symbol or {}).get(strongest_execution_symbol, {}).get("current_price") if symbols else None,
-        stop_loss_pct=2.0,
-        take_profit_pct=3.0,
+        stop_loss_pct=_L["stop_loss_pct"],
+        take_profit_pct=_L["take_profit_pct"],
         urgency=overall_urgency,
         conviction_level=conviction_level,
         holding_period_hours=holding_period_hours,
@@ -3005,6 +3199,7 @@ def _save_analysis_result(
     risk_profile: str = "moderate",
     secret_trace: Optional[Dict[str, Any]] = None,
     sentiment_results: Optional[Dict[str, Any]] = None,
+    per_symbol_counts: Optional[Dict[str, int]] = None,
 ) -> None:
     try:
         frozen_snapshot = dataset_snapshot or _build_dataset_snapshot(
@@ -3059,6 +3254,7 @@ def _save_analysis_result(
                 "red_team_debug": response.red_team_debug.model_dump(mode="json") if response.red_team_debug else None,
                 "dataset_snapshot": frozen_snapshot,
                 "secret_trace": secret_trace or frozen_snapshot.get("secret_trace") or {},
+                "per_symbol_article_counts": per_symbol_counts or {},
             }
         )
         db.add(analysis)
@@ -3070,6 +3266,7 @@ def _save_analysis_result(
             response=response,
             quotes_by_symbol=quotes_by_symbol,
         )
+        config = get_or_create_app_config(db)
         # Paper trading — auto-simulate $100 per signal during market hours
         try:
             from services.paper_trading import process_signals as _paper_process_signals
@@ -3084,11 +3281,29 @@ def _save_analysis_result(
                 sym_upper = sym.upper()
                 rec = recs_by_underlying.get(sym_upper, {})
                 signal_type = str(sym_result.get("signal_type") or "HOLD").upper()
+                # Derive per-symbol conviction from its own scores
+                _conf = float(sym_result.get("confidence") or 0.0)
+                _dir  = abs(float(sym_result.get("directional_score") or 0.0))
+                _urg  = str(sym_result.get("urgency") or "LOW").upper()
+                _cv   = _L["conviction"]
+                if signal_type == "HOLD":
+                    _conviction = "LOW"
+                elif _dir > _cv["high_score_threshold"] and _conf > _cv["high_confidence_threshold"]:
+                    _conviction = "HIGH"
+                elif _urg == "HIGH" and _conf < _cv["high_score_threshold"]:
+                    _conviction = "LOW"
+                else:
+                    _conviction = "MEDIUM"
+                _trade_type = {"HIGH": "POSITION", "MEDIUM": "SWING", "LOW": "VOLATILE_EVENT"}.get(_conviction, "SWING")
+                _hold_mins  = _cv["holding_minutes"].get(_trade_type, 720)
                 recs_for_paper.append({
                     "underlying": sym_upper,
                     "execution_ticker": rec.get("symbol", sym_upper) if rec else sym_upper,
                     "signal_type": signal_type,
                     "leverage": rec.get("leverage", "1x") if rec else "1x",
+                    "conviction_level": _conviction,
+                    "trading_type": _trade_type,
+                    "holding_minutes": _hold_mins,
                 })
             if recs_for_paper:
                 _paper_process_signals(
@@ -3096,10 +3311,10 @@ def _save_analysis_result(
                     recommendations=recs_for_paper,
                     quotes_by_symbol=quotes_by_symbol,
                     request_id=request_id,
+                    trade_amount=float(getattr(config, "paper_trade_amount", None) or 0) or None,
                 )
         except Exception as _pe:
             print(f"Paper trading hook error: {_pe}")
-        config = get_or_create_app_config(db)
         retention_limit = int(getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT))
         _prune_saved_analyses(db, retention_limit)
         db.commit()
@@ -3121,7 +3336,12 @@ def _save_analysis_and_trades(
     risk_profile: str = "moderate",
     secret_trace: Optional[Dict[str, Any]] = None,
     sentiment_results: Optional[Dict[str, Any]] = None,
+    per_symbol_counts: Optional[Dict[str, int]] = None,
 ) -> None:
+    _counts = per_symbol_counts or (
+        _count_symbol_articles(posts, list(response.symbols_analyzed or []))
+        if posts else {}
+    )
     _save_analysis_result(
         db,
         request_id,
@@ -3135,6 +3355,7 @@ def _save_analysis_and_trades(
         risk_profile=risk_profile,
         secret_trace=secret_trace,
         sentiment_results=sentiment_results,
+        per_symbol_counts=_counts,
     )
 
 
@@ -3142,6 +3363,14 @@ def _save_analysis_and_trades(
 async def get_paper_trading_summary(db: Session = Depends(get_db)):
     from services.paper_trading import get_summary
     return get_summary(db)
+
+
+@router.post("/paper-trading/expire-check", tags=["Paper Trading"])
+async def paper_trading_expire_check(db: Session = Depends(get_db)):
+    """Close any open positions whose conviction window has expired. Safe to call at any time."""
+    from services.paper_trading import close_expired_positions
+    closed = close_expired_positions(db)
+    return {"closed": len(closed), "positions": closed}
 
 
 @router.delete("/paper-trading/reset", tags=["Paper Trading"])

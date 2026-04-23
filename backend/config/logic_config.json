@@ -1,0 +1,126 @@
+{
+  "_readme": "Trading logic defaults. Fields marked admin:true are also editable via the admin UI and stored in the database — the DB value takes precedence over these defaults when set.",
+
+  "paper_trade_amount": 100.0,
+
+  "entry_thresholds": {
+    "normal": 0.30,
+    "closed_market": 0.42,
+    "keep_normal": 0.30,
+    "keep_closed_market": 0.22,
+    "hysteresis_max_post_delta": 5,
+    "hysteresis_max_sentiment_delta": 0.20
+  },
+
+  "stop_loss_pct": 2.0,
+  "take_profit_pct": 3.0,
+
+  "leverage": {
+    "_comment": "ATR-based volatility caps. When 14-day ATR % exceeds high_vol_atr_pct the position is capped at 1x regardless of profile. Exceeding medium_vol_atr_pct caps at 2x. Conservative profile (inverse ETF) is unaffected.",
+    "high_vol_atr_pct": 3.0,
+    "medium_vol_atr_pct": 1.5
+  },
+
+  "trailing_stop": {
+    "_comment": "When a HOLD signal fires on an open position, a trailing stop is set instead of forcing a market close. Stop = best_price_seen × (1 ± stop_loss_pct × tighten_factor). Updated every run while in trailing mode.",
+    "tighten_factor": 0.5
+  },
+
+  "materiality_gate": {
+    "min_posts_delta": 6,
+    "min_sentiment_delta": 0.24,
+    "atr_multiplier": 0.5,
+    "price_move_floor_pct": 0.75,
+    "price_move_ceiling_pct": 3.0,
+    "_comment_rolling": "Dynamic per-symbol article baseline. Requires rolling_baseline_min_runs of history before activating; falls back to min_posts_delta until then.",
+    "rolling_baseline_min_runs": 5,
+    "rolling_baseline_runs": 20,
+    "rolling_baseline_stddev_multiplier": 1.0
+  },
+
+  "sentiment_scoring": {
+    "unconfirmed_bluster_penalty": 0.35,
+    "irrelevance_policy_multiplier": 0.18,
+    "unconfirmed_policy_multiplier": 0.48,
+    "event_base_scores": {
+      "monetary_policy": 0.82,
+      "regulatory":      0.74,
+      "fiscal":          0.68,
+      "geopolitical":    0.58,
+      "macro_data":      0.52,
+      "earnings":        0.44,
+      "sector_news":     0.36,
+      "noise":           0.08,
+      "default":         0.30
+    },
+    "confidence_base": 0.40,
+    "confidence_source_weight": 0.38,
+    "confidence_irrelevance_penalty": 0.18,
+    "confidence_unconfirmed_penalty": 0.08,
+    "confidence_min": 0.28,
+    "confidence_max": 0.91,
+    "bluster_short_threshold": -0.35,
+    "policy_signal_threshold": 0.40,
+    "bluster_detection_threshold": -0.20,
+    "policy_change_threshold": 0.40,
+    "directional_score_min_magnitude": 0.15,
+    "impact_severity_high": 0.60,
+    "impact_severity_medium": 0.35
+  },
+
+  "red_team": {
+    "confidence_base": 0.58,
+    "agreement_bonus": 0.08,
+    "disagreement_penalty": 0.22,
+    "evidence_bonus_per_item": 0.024,
+    "evidence_bonus_max": 0.12,
+    "risk_penalty_per_item": 0.028,
+    "risk_penalty_max": 0.14,
+    "source_bias_penalty": 0.10,
+    "confidence_min": 0.24,
+    "confidence_max": 0.84,
+    "hold_override_min_confidence": 0.58,
+    "hold_override_min_evidence_or_risks": 2,
+    "flip_override_min_confidence": 0.64,
+    "flip_override_min_evidence": 3,
+    "stop_loss_by_urgency": {
+      "HIGH":   3.5,
+      "MEDIUM": 2.5,
+      "LOW":    1.8
+    }
+  },
+
+  "conviction": {
+    "high_score_threshold": 0.6,
+    "high_confidence_threshold": 0.7,
+    "high_consensus_confidence": 0.75,
+    "medium_consensus_confidence": 0.45,
+
+    "_comment_holding": "Holding window in minutes. The position stays open at least this long before a HOLD signal can close it.",
+    "holding_minutes": {
+      "SCALP":          120,
+      "SWING":          720,
+      "POSITION":       4320,
+      "VOLATILE_EVENT": 120
+    },
+
+    "_comment_reset": "When a re-run confirms the same direction, reset (or extend) the holding window. Same/upgraded conviction resets to a full window; downgraded conviction shrinks the window. max_holding_minutes caps total hold time from original entry regardless of resets.",
+    "reset_window_on_confirmation": true,
+    "max_holding_minutes": {
+      "SCALP":          360,
+      "SWING":          2160,
+      "POSITION":       12960,
+      "VOLATILE_EVENT": 360
+    },
+
+    "_comment_expiry": "What happens when the holding window expires.",
+    "close_on_window_expiry": true,
+    "close_expired_during_closed_hours": true,
+
+    "_comment_hold_signal": "Whether a HOLD signal is blocked from closing a position while the window is still active. true = window protects the position.",
+    "hold_signal_respects_window": true,
+
+    "_comment_flip": "Whether a direction flip (LONG->SHORT or vice versa) overrides the window and closes+reopens immediately.",
+    "flip_overrides_window": true
+  }
+}

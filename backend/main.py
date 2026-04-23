@@ -6,6 +6,7 @@ FastAPI application entry point.
 import asyncio
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -18,12 +19,18 @@ from database.engine import SessionLocal
 from database.models import AnalysisResult
 from database.models import init_db
 from routers import router as analysis_router
-from services.app_config import build_enabled_rss_feed_map, config_to_dict_with_stats, get_or_create_app_config
+from services.app_config import config_to_dict_with_stats, get_or_create_app_config
 from services.pnl_tracker import PnLTracker, SCHEDULER_INTERVAL_SECONDS
-from services.data_ingestion.parser import RSSFeedParser
+from services.data_ingestion.worker import run_ingestion_cycle
 from services.data_ingestion.yfinance_client import PriceClient
 from services.ollama import get_ollama_status
 from services.runtime_health import get_runtime_snapshot, record_data_pull, record_request
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 
 class _SuppressPricesAccessLog(logging.Filter):
@@ -35,31 +42,47 @@ logging.getLogger("uvicorn.access").addFilter(_SuppressPricesAccessLog())
 
 
 async def _data_ingestion_scheduler_loop():
-    """Periodically fetch fresh stock quotes and RSS feeds."""
+    """Periodically ingest RSS articles into the DB queue and refresh quotes."""
     from services.app_config import get_or_create_app_config
 
     client = PriceClient()
-
-    # Get ingestion interval from config (default 900 seconds)
-    db = SessionLocal()
     try:
-        config = get_or_create_app_config(db)
-        ingestion_interval = config.data_ingestion_interval_seconds or 900
-    finally:
-        db.close()
+        startup_grace_seconds = max(0, int(os.getenv("INGESTION_STARTUP_GRACE_SECONDS", "20")))
+    except ValueError:
+        startup_grace_seconds = 20
+
+    if startup_grace_seconds > 0:
+        print(f"Data ingestion scheduler startup grace: waiting {startup_grace_seconds}s before first cycle")
+        await asyncio.sleep(startup_grace_seconds)
     
     while True:
+        ingestion_interval = 900
         try:
             db = SessionLocal()
             try:
                 config = get_or_create_app_config(db)
+                ingestion_interval = int(config.data_ingestion_interval_seconds or 900)
+                now = datetime.utcnow()
+                lock_request_id = str(getattr(config, "analysis_lock_request_id", "") or "").strip()
+                lock_expires_at = getattr(config, "analysis_lock_expires_at", None)
+                if lock_request_id and lock_expires_at and lock_expires_at > now:
+                    wait_seconds = max(5, min(30, int((lock_expires_at - now).total_seconds())))
+                    print(
+                        "Data ingestion scheduler deferred: "
+                        f"analysis lock owned by {lock_request_id} until {lock_expires_at.isoformat()}"
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
             finally:
                 db.close()
 
-            # Fetch latest articles from RSS feeds
-            parser = RSSFeedParser(feeds=build_enabled_rss_feed_map(config))
-            articles = parser.parse_feeds()
-            print(f"Data ingestion scheduler: fetched {len(articles)} new RSS articles")
+            ingestion_stats = await run_ingestion_cycle()
+            print(
+                "Data ingestion scheduler: "
+                f"stage0={ingestion_stats.get('stage0_matches', 0)} "
+                f"stored={ingestion_stats.get('stored_count', 0)} "
+                f"fast_lane={len(ingestion_stats.get('fast_lane_article_ids', []))}"
+            )
 
             # Get tracked symbols from database config
             db = SessionLocal()
@@ -82,14 +105,15 @@ async def _data_ingestion_scheduler_loop():
 
             status = "ok" if not quotes_failed else "partial"
             summary = (
-                f"Fetched {len(articles)} RSS articles and {len(quotes_ok)}/{len(quotes_ok) + len(quotes_failed)} quotes"
+                f"Ingested {ingestion_stats.get('stored_count', 0)} queued articles and "
+                f"fetched {len(quotes_ok)}/{len(quotes_ok) + len(quotes_failed)} quotes"
             )
             record_data_pull(
                 status=status,
                 source="scheduler",
                 summary=summary,
                 details={
-                    "articles_fetched": len(articles),
+                    "ingestion": ingestion_stats,
                     "quotes_ok": quotes_ok,
                     "quotes_failed": quotes_failed,
                 },

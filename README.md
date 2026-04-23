@@ -1,6 +1,6 @@
 # Sentiment Trading Alpha
 
-Geopolitical sentiment pipeline that ingests live RSS headlines, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
+Geopolitical sentiment pipeline that now uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
 
 This app is untested in the real world, not financial advice, and for amusement purposes only. 
 
@@ -22,6 +22,235 @@ This repo is intended for local single-user use by default.
 - Generated build output, caches, and local databases are excluded from git
 - Sensitive local-admin routes can be protected with an optional shared secret via `ADMIN_API_TOKEN`
 
+## Setup
+
+Note these instructions are intentionally vague - if you don't have the experience (or know how to ask a LLM) to set this up - you should probably not be giving it money to trade stocks. 
+
+### Prerequisites
+
+- Python 3.12
+- Node.js 20.9+
+- [Ollama](https://ollama.com) with any compatible local model you want to serve (Qwen 3.5 9b is one tested option)
+
+Use Python 3.12 for the backend. The current Playwright-backed ingestion path is not considered supported here on Python 3.14 yet, especially on Windows.
+
+Platform notes:
+
+- `python run.py` is the recommended backend launcher on both macOS and Windows
+- On Windows, `run.py` is especially important because it sets the event loop policy before Uvicorn starts, which is safer for Playwright browser subprocesses
+- On Windows, `run.py` also defaults `UVICORN_RELOAD` to off, because Uvicorn reload mode switches back to `_WindowsSelectorEventLoop`, which prevents Playwright from launching browser subprocesses
+- On macOS, `run.py` works too, but it does not need the Windows event loop workaround
+
+### 1. Start Ollama
+
+```powershell
+ollama pull qwen3.5:9b
+ollama serve
+```
+
+Optional overrides:
+PC:
+```powershell
+$env:OLLAMA_MODEL = "qwen3.5:9b"
+$env:OLLAMA_URL = "http://localhost:11434/api/generate"
+```
+Mac: Add to ~/.zshrc
+```
+export OLLAMA_MODEL="qwen3.5:9b"
+export OLLAMA_URL="http://localhost:11434/api/generate"
+```
+
+If `OLLAMA_MODEL` is unset, the backend will use the selected/requested Ollama model where applicable, and the dashboard runtime panel will prefer the currently running model from Ollama `/api/ps` before falling back to configured or installed models.
+
+### 2. Start the backend (ideally in a venv)
+
+Make sure the venv is created with Python 3.12 before installing dependencies.
+
+Windows PowerShell:
+
+```powershell
+pip install -r requirements.txt
+python run.py
+```
+
+macOS / zsh / bash:
+
+```bash
+python3.12 -m pip install -r requirements.txt
+python3.12 run.py
+```
+
+`run.py` is the recommended startup path on both platforms. Avoid launching `uvicorn main:app --reload` directly from the shell if you want the repo's startup defaults and Windows Playwright safeguards applied consistently.
+
+Reload behavior:
+
+- Windows: `python run.py` starts with reload off by default so Playwright-backed article rendering can work
+- macOS: `python3.12 run.py` keeps reload on by default
+- If you want to override that behavior, set `UVICORN_RELOAD`
+
+Windows PowerShell:
+
+```powershell
+$env:UVICORN_RELOAD = "true"
+python run.py
+```
+
+macOS / zsh / bash:
+
+```bash
+export UVICORN_RELOAD="false"
+python3.12 run.py
+```
+
+Optional startup tuning:
+
+```powershell
+$env:INGESTION_STARTUP_GRACE_SECONDS = "20"
+```
+
+macOS / zsh / bash:
+
+```bash
+export INGESTION_STARTUP_GRACE_SECONDS="20"
+```
+
+The background ingestion worker waits briefly on startup and also defers while an analysis lease is active, which helps avoid SQLite write contention during first boot and urgent off-cycle runs.
+
+Optional local admin protection:
+
+```powershell
+$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
+```
+
+macOS / zsh / bash:
+
+```bash
+export ADMIN_API_TOKEN="choose-a-long-random-string"
+```
+
+If `ADMIN_API_TOKEN` is set, these routes require the `X-Admin-Token` header:
+
+- `GET /api/v1/config`
+- `PUT /api/v1/config`
+- `POST /api/v1/trades/{trade_id}/execute`
+
+Admin also controls:
+
+- saved snapshot retention limit for Advanced Mode replay
+- display timezone (persisted in the database and mirrored into the browser)
+- removing accidental execution records from tracked trades
+- tracked symbols, custom test symbols, RSS feed enablement, custom RSS feeds, RSS article depth presets, and prompt overrides
+
+### 3. Start the frontend
+
+```powershell
+cd frontend
+npm install
+- optional Light Web Research prompt grounding
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+Notes:
+
+- Restart the dev server once after the first `npm install` so PostCSS picks up Tailwind config
+- The frontend targets Next.js 16 and React 19
+- If you have stale `node_modules` or `.next` output from older versions, clear them before debugging upgrade issues
+
+If you enabled the admin token above, set it for the frontend server too before `npm run dev`:
+
+```powershell
+$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
+npm run dev
+```
+
+## Testing Your Extraction Model (Stage 1)
+
+Before committing to a model for Stage 1 entity extraction, run the smoke test:
+
+```powershell
+cd backend
+python test_stage1.py
+```
+
+Or with a specific model:
+
+```powershell
+python test_stage1.py llama3.2:latest
+```
+
+The test covers both built-in symbols (USO/BITO/QQQ/SPY, which use a static keyword map and require no LLM call) and custom symbols (NVDA/NOW, which call the LLM once to generate proxy keywords). It prints:
+
+- Which keyword source was used per symbol: `(static)` or `(LLM-generated)`
+- The generated keywords for each custom symbol
+- How many articles each path caught
+- Separate pass/fail for built-in catch rate, custom symbol coverage, and noise filtering
+
+**What to look for:**
+
+| Output | Meaning |
+|---|---|
+| `Stage 1 keyword filter: 10/13 articles matched` | Working correctly |
+| `✓ PASS: Custom symbols (NVDA/NOW) caught at least 1 article` | LLM keyword generation is working |
+| `✓ PASS: LLM generated keywords for custom symbols (>1 term each)` | Keywords were successfully generated and cached |
+| `✓ PASS: Noise headlines correctly filtered out` | Sports / celebrity articles removed |
+| `Stage 1: keyword generation failed for NVDA (...)` | LLM call failed — check Ollama is running and the model is loaded |
+
+**If Stage 1 fails:**
+
+The pipeline degrades gracefully — it falls back to sending all articles to Stage 2 instead of only the relevant ones. Analysis still completes and produces signals, but Stage 2 receives more noise. If keyword generation fails for a custom symbol, the ticker name itself is used as the fallback keyword.
+
+**Model guidance:**
+
+- Stage 1 now calls the LLM only to answer "what keywords appear in [SYMBOL] news?" — a short factual question. Even llama3.2 (3B) handles this reliably.
+- The article classification step (reading all headlines) has been removed — Stage 1 is now fast regardless of article count.
+- Keyword generation results are cached for the server session. Restarting the server will re-generate keywords for custom symbols on the next run.
+- The test only takes a few seconds since it skips RSS ingestion, price fetching, and validation entirely.
+
+## Schema Migration / Upgrading
+
+The backend runs `migrate.py` automatically on every startup. No manual SQL is required.
+
+If you deployed a previous build and are pulling new code, just restart the backend:
+
+```powershell
+python run.py
+```
+
+The migration script will detect any missing columns and add them with safe defaults. Current migrations cover:
+
+| Column / Table | Table | Default | Added |
+|---|---|---|---|
+| `price_history` | table | — | OHLCV price history (never cleared by reset-data) |
+| `extraction_model` | `app_config` | `''` | Two-stage pipeline |
+| `reasoning_model` | `app_config` | `''` | Two-stage pipeline |
+| `risk_profile` | `app_config` | `'aggressive'` | Risk profile selector |
+| `rss_article_detail_mode` | `app_config` | `'normal'` | Depth mode selector |
+| `rss_article_limits` | `app_config` | `{"light":5,"normal":15,"detailed":25}` | Per-depth article caps |
+| `snapshot_retention_limit` | `app_config` | `12` | Snapshot pruning |
+| `display_timezone` | `app_config` | `''` | Timezone display |
+| `custom_symbols` | `app_config` | `[]` | Custom symbol support |
+| `underlying_symbol` | `trades` | `NULL` | Execution ticker mapping |
+| `conviction_level` | `trades` | `'MEDIUM'` | Signal conviction |
+| `holding_period_hours` | `trades` | `4` | Holding horizon |
+| `trading_type` | `trades` | `'SWING'` | Trade duration type |
+| `trade_closes` | table | — | Realized P&L recording |
+| `paper_trades` | table | — | Auto-simulated $100 paper trades (independent of analysis tables) |
+| `scraped_articles` | table | — | DB-backed article queue for producer/consumer ingestion |
+| `analysis_lock_request_id` | `app_config` | `''` | Active analysis lease owner |
+| `analysis_lock_acquired_at` | `app_config` | `NULL` | Analysis lease start time |
+| `analysis_lock_expires_at` | `app_config` | `NULL` | Analysis lease expiry time |
+| `trailing_stop_price` | `paper_trades` | `NULL` | Trailing stop level set when HOLD fires on open position |
+| `best_price_seen` | `paper_trades` | `NULL` | High/low-water mark used to update trailing stop each run |
+
+To run the migration manually (e.g. to confirm it applied):
+
+```powershell
+cd backend
+python -m database.migrate
+```
+
 ## Architecture
 
 Frontend:
@@ -32,14 +261,18 @@ Frontend:
 
 Backend:
 - FastAPI analysis pipeline and config endpoints
-- RSS ingestion, yfinance price pulls, FRED/EIA validation bundle
-- Local Ollama-served symbol-specialist runs, signal generation, and rolling-window backtest
+- DB-backed RSS/article ingestion queue, yfinance price pulls, FRED/EIA validation bundle
+- Local Ollama-served symbol-specialist runs, signal generation, and paper-trade persistence
 - Frozen analysis snapshot persistence for model-to-model replay in Advanced Mode
 - Persistent admin configuration stored in the local database so saved symbols, feeds, prompt overrides, and timezone survive rebuilds/restarts
 - Paper trading hook wired into every analysis save — simulates $100 per signal, manages position lifecycle, stores results in a dedicated `paper_trades` table independent of all other analysis tables
 
+- Analysis lease/lock coordination in `app_config` so scheduled runs and urgent off-cycle runs do not process the same queued articles in parallel
+
 Model flow:
-- RSS items are filtered for relevance before analysis
+- A background ingestion worker polls RSS feeds, runs a Stage 0 relevance filter, extracts full article text, and stores pending rows in `scraped_articles`
+- The main batch `/analyze` path no longer scrapes the web inline â€” it consumes queued `processed = false` articles from the database
+- High-impact macro headlines can trigger a Fast Lane off-cycle analysis run for the affected symbols
 - Each symbol gets its own specialist prompt and its own narrowed validation context
 - `USO` uses `EIA` validation
 - `BITO`, `QQQ`, and `SPY` use `FRED` validation
@@ -52,6 +285,7 @@ Model flow:
 - When price history has been pulled, 7 technical indicators (RSI, SMA50/200, MACD, Volume Profile, Bollinger Bands %B, ATR, OBV trend) are computed from stored OHLCV data and injected into each specialist prompt alongside the validation context
 - After the initial per-symbol signal is generated, a second red-team review challenges the thesis against recent news, technicals, source concentration, and cross-asset portfolio risk
 - The primary displayed trade recommendation is now the final consensus signal after the blue-team proposal and red-team challenge are reconciled; the original signal is retained for audit/debug views
+- On first startup, the ingestion scheduler waits briefly and also defers while an analysis lease is active, reducing SQLite write contention during initial boot
 
 ## Features
 
@@ -64,13 +298,18 @@ Model flow:
 - Optional light web research layer that pulls a small number of recent trusted news items per active symbol and injects them into the specialist prompt
 - Runtime model status so the UI reflects whichever model Ollama is currently serving; shows `Stage 1 → Stage 2` when multi-model is active
 - Health page with running model, recent runtime, request stats, and latest data-pull status
-- History tab — pull-to-pull signal diff showing how recommendations change across runs, expandable per-symbol details, available without needing a current run
+- History tab — pull-to-pull signal diff showing how recommendations change across runs, expandable per-symbol details, available without needing a current run; history labels show both extraction and reasoning model names when the two-stage pipeline is used
 - **Trading tab** (link in nav) — dedicated `/trading` page showing the paper trading simulation with equity curve, open positions (live P&L), and full closed trade history
 - Compare tab — replay any frozen snapshot with Stage 1 and Stage 2 model selectors; "Rerun original" button re-runs with the exact models the snapshot was originally run with
 - Comparison results now show clearer baseline vs comparison labeling plus per-symbol reasoning summaries to explain disagreements
 - Compare can also load two saved historical runs directly and show why a symbol changed, including recommendation flips, score deltas, confidence moves, and leverage-threshold changes
 - P&L tracking with live prices, forward-horizon snapshots (1h / 4h / 1d / 3d / 1w), and realized close price recording
-- **Paper trading simulation** — every analysis run auto-simulates a $100 paper trade per signal during extended market hours (4am–8pm ET); position lifecycle mirrors what a real trader following every signal would do (HOLD = do nothing, same direction/leverage = hold, any change = close and reopen); results visible on the `/trading` page with equity curve, open positions with live P&L, and closed trade history
+- **Paper trading simulation** — every analysis run auto-simulates a $100 paper trade per signal during extended market hours (4am–8pm ET); position lifecycle mirrors what a real trader following every signal would do; results visible on the `/trading` page with equity curve, open positions with live P&L, and closed trade history
+- **ATR-scaled leverage caps** — leverage assigned to a new paper trade is capped by the symbol's 14-day ATR %; high volatility forces 1x regardless of confidence score; thresholds configurable in `logic_config.json`
+- **Trailing stop on HOLD** — a HOLD signal on an open position sets a tightened trailing stop instead of force-closing; stop tracks `best_price_seen` and closes only if price crosses; thesis re-confirmation clears the trailing stop
+- **Conviction window reset** — when a re-run confirms the same direction, the holding window resets to a full window; same/upgraded trade type resets fully; downgraded type shrinks proportionally; capped by `max_holding_minutes` per type
+- **Dynamic materiality gate** — thesis-flip guard uses a rolling per-symbol article baseline (last 20 runs, mean ± 1 stddev) instead of a fixed count; falls back to fixed threshold until 5 runs of history exist
+- **Price history auto-pull** — adding a custom symbol in Admin triggers a background price history pull automatically; history is retained even after the symbol is removed
 - Timezone selector in Admin — all timestamps across the app follow the configured zone, defaulting to the OS timezone, including saved snapshots and history rows
 - Admin can remove accidental execution records without deleting the underlying trade recommendation
 - Two-stage LLM pipeline with configurable depth (Light / Normal / Detailed) and optional different models per stage
@@ -90,7 +329,6 @@ Model flow:
 - Auto-run every 30 minutes
 - 7 RSS sources with fair per-feed distribution
 - Keyword relevance filtering before specialist analysis
-- Rolling window backtest over 6 months of data
 
 ## Admin Controls
 
@@ -210,9 +448,7 @@ qwen-3.5-9b-getrich/
 |     |  `- prompts.py           # includes SYMBOL_KEYWORD_GENERATION_PROMPT
 |     |- runtime_health.py
 |     |- trading_instruments.py
-|     |- paper_trading.py        # $100/signal simulation, position lifecycle, get_summary
-|     `- backtesting/
-|        `- optimization.py
+|     `- paper_trading.py        # Trading simulation, position lifecycle, get_summary
 |- frontend/
 |  |- src/app/page.tsx
 |  |- src/app/admin/page.tsx     # includes Price History section
@@ -220,174 +456,12 @@ qwen-3.5-9b-getrich/
 |  |- src/app/trading/           # paper trading page
 |  |- src/lib/
 |  `- src/app/api/
-|     |- paper-trading/route.ts              (new)
-|     |- admin/price-history/pull/route.ts   (new)
-|     `- admin/price-history/status/route.ts (new)
+|     |- paper-trading/route.ts  
+|     |- admin/price-history/pull/route.ts
+|     `- admin/price-history/status/route.ts
 |- CHANGES.md
 |- RELEASENOTES.md
 `- README.md
-```
-
-## Testing Your Extraction Model (Stage 1)
-
-Before committing to a model for Stage 1 entity extraction, run the smoke test:
-
-```powershell
-cd backend
-python test_stage1.py
-```
-
-Or with a specific model:
-
-```powershell
-python test_stage1.py llama3.2:latest
-```
-
-The test covers both built-in symbols (USO/BITO/QQQ/SPY, which use a static keyword map and require no LLM call) and custom symbols (NVDA/NOW, which call the LLM once to generate proxy keywords). It prints:
-
-- Which keyword source was used per symbol: `(static)` or `(LLM-generated)`
-- The generated keywords for each custom symbol
-- How many articles each path caught
-- Separate pass/fail for built-in catch rate, custom symbol coverage, and noise filtering
-
-**What to look for:**
-
-| Output | Meaning |
-|---|---|
-| `Stage 1 keyword filter: 10/13 articles matched` | Working correctly |
-| `✓ PASS: Custom symbols (NVDA/NOW) caught at least 1 article` | LLM keyword generation is working |
-| `✓ PASS: LLM generated keywords for custom symbols (>1 term each)` | Keywords were successfully generated and cached |
-| `✓ PASS: Noise headlines correctly filtered out` | Sports / celebrity articles removed |
-| `Stage 1: keyword generation failed for NVDA (...)` | LLM call failed — check Ollama is running and the model is loaded |
-
-**If Stage 1 fails:**
-
-The pipeline degrades gracefully — it falls back to sending all articles to Stage 2 instead of only the relevant ones. Analysis still completes and produces signals, but Stage 2 receives more noise. If keyword generation fails for a custom symbol, the ticker name itself is used as the fallback keyword.
-
-**Model guidance:**
-
-- Stage 1 now calls the LLM only to answer "what keywords appear in [SYMBOL] news?" — a short factual question. Even llama3.2 (3B) handles this reliably.
-- The article classification step (reading all headlines) has been removed — Stage 1 is now fast regardless of article count.
-- Keyword generation results are cached for the server session. Restarting the server will re-generate keywords for custom symbols on the next run.
-- The test only takes a few seconds since it skips RSS ingestion, price fetching, and validation entirely.
-
-## Schema Migration / Upgrading
-
-The backend runs `migrate.py` automatically on every startup. No manual SQL is required.
-
-If you deployed a previous build and are pulling new code, just restart the backend:
-
-```powershell
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-The migration script will detect any missing columns and add them with safe defaults. Current migrations cover:
-
-| Column / Table | Table | Default | Added |
-|---|---|---|---|
-| `price_history` | table | — | OHLCV price history (never cleared by reset-data) |
-| `extraction_model` | `app_config` | `''` | Two-stage pipeline |
-| `reasoning_model` | `app_config` | `''` | Two-stage pipeline |
-| `risk_profile` | `app_config` | `'aggressive'` | Risk profile selector |
-| `rss_article_detail_mode` | `app_config` | `'normal'` | Depth mode selector |
-| `rss_article_limits` | `app_config` | `{"light":5,"normal":15,"detailed":25}` | Per-depth article caps |
-| `snapshot_retention_limit` | `app_config` | `12` | Snapshot pruning |
-| `display_timezone` | `app_config` | `''` | Timezone display |
-| `custom_symbols` | `app_config` | `[]` | Custom symbol support |
-| `underlying_symbol` | `trades` | `NULL` | Execution ticker mapping |
-| `conviction_level` | `trades` | `'MEDIUM'` | Signal conviction |
-| `holding_period_hours` | `trades` | `4` | Holding horizon |
-| `trading_type` | `trades` | `'SWING'` | Trade duration type |
-| `trade_closes` | table | — | Realized P&L recording |
-| `paper_trades` | table | — | Auto-simulated $100 paper trades (independent of analysis tables) |
-
-To run the migration manually (e.g. to confirm it applied):
-
-```powershell
-cd backend
-python -m database.migrate
-```
-
-## Setup
-
-Note these instructions are intentionally vague - if you don't have the experience (or know how to ask a LLM) to set this up - you should probably not be giving it money to trade stocks. 
-
-### Prerequisites
-
-- Python 3.10+
-- Node.js 20.9+
-- [Ollama](https://ollama.com) with any compatible local model you want to serve (Qwen 3.5 9b is one tested option)
-
-### 1. Start Ollama
-
-```powershell
-ollama pull qwen3.5:9b
-ollama serve
-```
-
-Optional overrides:
-PC:
-```powershell
-$env:OLLAMA_MODEL = "qwen3.5:9b"
-$env:OLLAMA_URL = "http://localhost:11434/api/generate"
-```
-Mac: Add to ~/.zshrc
-```
-export OLLAMA_MODEL="qwen3.5:9b"
-export OLLAMA_URL="http://localhost:11434/api/generate"
-```
-
-If `OLLAMA_MODEL` is unset, the backend will use the selected/requested Ollama model where applicable, and the dashboard runtime panel will prefer the currently running model from Ollama `/api/ps` before falling back to configured or installed models.
-
-### 2. Start the backend (ideally in a venv)
-
-```powershell
-cd backend
-pip install -r ../requirements.txt
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Optional local admin protection:
-
-```powershell
-$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
-```
-
-If `ADMIN_API_TOKEN` is set, these routes require the `X-Admin-Token` header:
-
-- `GET /api/v1/config`
-- `PUT /api/v1/config`
-- `POST /api/v1/trades/{trade_id}/execute`
-
-Admin also controls:
-
-- saved snapshot retention limit for Advanced Mode replay
-- display timezone (persisted in the database and mirrored into the browser)
-- removing accidental execution records from tracked trades
-- tracked symbols, custom test symbols, RSS feed enablement, custom RSS feeds, RSS article depth presets, and prompt overrides
-
-### 3. Start the frontend
-
-```powershell
-cd frontend
-npm install
-- optional Light Web Research prompt grounding
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000).
-
-Notes:
-
-- Restart the dev server once after the first `npm install` so PostCSS picks up Tailwind config
-- The frontend targets Next.js 16 and React 19
-- If you have stale `node_modules` or `.next` output from older versions, clear them before debugging upgrade issues
-
-If you enabled the admin token above, set it for the frontend server too before `npm run dev`:
-
-```powershell
-$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
-npm run dev
 ```
 
 ## API Reference
@@ -399,7 +473,7 @@ SSE pipeline. Events: `log`, `article`, `result`, `error`.
 Example request:
 
 ```json
-{ "symbols": ["USO", "BITO", "QQQ", "SPY"], "max_posts": 50, "include_backtest": true, "lookback_days": 14 }
+{ "symbols": ["USO", "BITO", "QQQ", "SPY"], "max_posts": 50, "lookback_days": 14 }
 ```
 
 `result` payloads now include:

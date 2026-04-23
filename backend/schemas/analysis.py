@@ -305,6 +305,7 @@ class ModelInputArticle(BaseModel):
     source: str = Field(default="")
     title: str = Field(default="")
     description: str = Field(default="")
+    content: str = Field(default="")
     keywords: List[str] = Field(default_factory=list)
 
 
@@ -353,6 +354,20 @@ class ModelInputDebug(BaseModel):
         default_factory=dict,
         description="Structured recent web research items shown in Advanced Mode"
     )
+
+
+class IngestionTraceDebug(BaseModel):
+    """Visible ingestion trace returned to the UI for Advanced Mode debugging."""
+
+    source: str = Field(default="")
+    trigger_source: str = Field(default="")
+    request_max_posts: Optional[int] = Field(default=None)
+    selected_article_ids: List[int] = Field(default_factory=list)
+    selected_fast_lane_article_ids: List[int] = Field(default_factory=list)
+    total_items: int = Field(default=0)
+    queue: Dict[str, Any] = Field(default_factory=dict)
+    truth_social: Dict[str, Any] = Field(default_factory=dict)
+    rss: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisResponse(BaseModel):
@@ -405,6 +420,11 @@ class AnalysisResponse(BaseModel):
     model_inputs: Optional[ModelInputDebug] = Field(
         default=None,
         description="Debug view of the compiled inputs supplied to the sentiment model"
+    )
+
+    ingestion_trace: Optional[IngestionTraceDebug] = Field(
+        default=None,
+        description="Visible ingestion trace showing which queued articles were selected for this run"
     )
 
     red_team_review: Optional[RedTeamReview] = Field(

@@ -7,13 +7,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import json
 import sqlite3
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database.engine import LEGACY_BACKEND_DB_PATH, ROOT_DB_PATH
 from database.models import AppConfig, AnalysisResult
+from config.logic_loader import LOGIC as _L
 
 
 DEFAULT_TRACKED_SYMBOLS = ["USO", "BITO", "QQQ", "SPY"]
@@ -173,6 +175,26 @@ def _normalize_rss_article_limits(data: Any) -> Dict[str, int]:
                 value = limits[key]
             limits[key] = max(1, min(50, value))
     return limits
+
+
+def _normalize_trading_logic_float(value: Any, min_val: float, max_val: float) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(max(min_val, min(max_val, v)), 4)
+
+
+def _normalize_trading_logic_int(value: Any, min_val: int, max_val: int) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(min_val, min(max_val, v))
 
 
 def _normalize_risk_profile(value: Any) -> str:
@@ -518,6 +540,18 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
     if "web_research_enabled" in payload:
         config.web_research_enabled = bool(payload.get("web_research_enabled"))
+    if "paper_trade_amount" in payload:
+        config.paper_trade_amount = _normalize_trading_logic_float(payload.get("paper_trade_amount"), 1.0, 100000.0)
+    if "entry_threshold" in payload:
+        config.entry_threshold = _normalize_trading_logic_float(payload.get("entry_threshold"), 0.05, 1.0)
+    if "stop_loss_pct" in payload:
+        config.stop_loss_pct = _normalize_trading_logic_float(payload.get("stop_loss_pct"), 0.1, 50.0)
+    if "take_profit_pct" in payload:
+        config.take_profit_pct = _normalize_trading_logic_float(payload.get("take_profit_pct"), 0.1, 100.0)
+    if "materiality_min_posts_delta" in payload:
+        config.materiality_min_posts_delta = _normalize_trading_logic_int(payload.get("materiality_min_posts_delta"), 1, 100)
+    if "materiality_min_sentiment_delta" in payload:
+        config.materiality_min_sentiment_delta = _normalize_trading_logic_float(payload.get("materiality_min_sentiment_delta"), 0.01, 1.0)
 
     db.add(config)
     db.commit()
@@ -543,6 +577,78 @@ def mark_analysis_completed(db: Session, request_id: str) -> AppConfig:
     db.commit()
     db.refresh(config)
     return config
+
+
+def try_acquire_analysis_lock(
+    db: Session,
+    request_id: str,
+    lease_seconds: int = 20 * 60,
+) -> bool:
+    """Atomically claim the analysis run lease if it is free or expired."""
+    get_or_create_app_config(db)
+    now = datetime.utcnow()
+    expires_at = now + timedelta(seconds=max(60, int(lease_seconds)))
+    updated = (
+        db.query(AppConfig)
+        .filter(AppConfig.id == 1)
+        .filter(
+            or_(
+                AppConfig.analysis_lock_expires_at.is_(None),
+                AppConfig.analysis_lock_expires_at < now,
+                AppConfig.analysis_lock_request_id == request_id,
+            )
+        )
+        .update(
+            {
+                AppConfig.analysis_lock_request_id: request_id,
+                AppConfig.analysis_lock_acquired_at: now,
+                AppConfig.analysis_lock_expires_at: expires_at,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return bool(updated)
+
+
+def refresh_analysis_lock(
+    db: Session,
+    request_id: str,
+    lease_seconds: int = 20 * 60,
+) -> bool:
+    """Extend an existing analysis lease for long-running jobs."""
+    now = datetime.utcnow()
+    expires_at = now + timedelta(seconds=max(60, int(lease_seconds)))
+    updated = (
+        db.query(AppConfig)
+        .filter(AppConfig.id == 1, AppConfig.analysis_lock_request_id == request_id)
+        .update(
+            {
+                AppConfig.analysis_lock_acquired_at: now,
+                AppConfig.analysis_lock_expires_at: expires_at,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return bool(updated)
+
+
+def release_analysis_lock(db: Session, request_id: str) -> None:
+    """Release the analysis lease if the caller still owns it."""
+    (
+        db.query(AppConfig)
+        .filter(AppConfig.id == 1, AppConfig.analysis_lock_request_id == request_id)
+        .update(
+            {
+                AppConfig.analysis_lock_request_id: None,
+                AppConfig.analysis_lock_acquired_at: None,
+                AppConfig.analysis_lock_expires_at: None,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
 
 
 def config_to_dict(config: AppConfig) -> Dict[str, Any]:
@@ -602,6 +708,22 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
+        # Trading logic overrides — null means "use JSON default"
+        "paper_trade_amount": getattr(config, "paper_trade_amount", None),
+        "entry_threshold": getattr(config, "entry_threshold", None),
+        "stop_loss_pct": getattr(config, "stop_loss_pct", None),
+        "take_profit_pct": getattr(config, "take_profit_pct", None),
+        "materiality_min_posts_delta": getattr(config, "materiality_min_posts_delta", None),
+        "materiality_min_sentiment_delta": getattr(config, "materiality_min_sentiment_delta", None),
+        # JSON defaults (read-only, for display)
+        "logic_defaults": {
+            "paper_trade_amount": _L["paper_trade_amount"],
+            "entry_threshold": _L["entry_thresholds"]["normal"],
+            "stop_loss_pct": _L["stop_loss_pct"],
+            "take_profit_pct": _L["take_profit_pct"],
+            "materiality_min_posts_delta": _L["materiality_gate"]["min_posts_delta"],
+            "materiality_min_sentiment_delta": _L["materiality_gate"]["min_sentiment_delta"],
+        },
         "last_analysis_started_at": config.last_analysis_started_at.isoformat() if config.last_analysis_started_at else None,
         "last_analysis_completed_at": config.last_analysis_completed_at.isoformat() if config.last_analysis_completed_at else None,
         "last_analysis_request_id": config.last_analysis_request_id,
