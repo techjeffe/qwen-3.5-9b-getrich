@@ -24,146 +24,148 @@ This repo is intended for local single-user use by default.
 
 ## Setup
 
-Note these instructions are intentionally vague - if you don't have the experience (or know how to ask a LLM) to set this up - you should probably not be giving it money to trade stocks. 
+Note these instructions are intentionally vague — if you don't have the experience (or know how to ask an LLM) to set this up, you should probably not be giving it money to trade stocks.
 
-### Prerequisites
+### Prerequisites (both platforms)
 
-- Python 3.12
+- Python 3.12 — use exactly 3.12; the Playwright-backed ingestion path is not tested on 3.14+
 - Node.js 20.9+
-- [Ollama](https://ollama.com) with any compatible local model you want to serve (Qwen 3.5 9b is one tested option)
+- [Ollama](https://ollama.com) with at least one compatible model installed (Qwen 3.5:9b, 0xroyce/plutus:latest, qwen3:8b have all been tested and seem to work)
 
-Use Python 3.12 for the backend. The current Playwright-backed ingestion path is not considered supported here on Python 3.14 yet, especially on Windows.
+---
 
-Platform notes:
+### Windows Setup (PowerShell)
 
-- `python run.py` is the recommended backend launcher on both macOS and Windows
-- On Windows, `run.py` is especially important because it sets the event loop policy before Uvicorn starts, which is safer for Playwright browser subprocesses
-- On Windows, `run.py` also defaults `UVICORN_RELOAD` to off, because Uvicorn reload mode switches back to `_WindowsSelectorEventLoop`, which prevents Playwright from launching browser subprocesses
-- On macOS, `run.py` works too, but it does not need the Windows event loop workaround
-
-### 1. Start Ollama
+#### 1. Start Ollama
 
 ```powershell
 ollama pull qwen3.5:9b
 ollama serve
 ```
 
-Optional overrides:
-PC:
+Optional model overrides (set before starting the backend):
+
 ```powershell
 $env:OLLAMA_MODEL = "qwen3.5:9b"
-$env:OLLAMA_URL = "http://localhost:11434/api/generate"
-```
-Mac: Add to ~/.zshrc
-```
-export OLLAMA_MODEL="qwen3.5:9b"
-export OLLAMA_URL="http://localhost:11434/api/generate"
+$env:OLLAMA_URL   = "http://localhost:11434/api/generate"
 ```
 
-If `OLLAMA_MODEL` is unset, the backend will use the selected/requested Ollama model where applicable, and the dashboard runtime panel will prefer the currently running model from Ollama `/api/ps` before falling back to configured or installed models.
+If `OLLAMA_MODEL` is unset, the backend uses whichever model Ollama is currently serving.
 
-### 2. Start the backend (ideally in a venv)
+#### 2. Start the backend
 
-Make sure the venv is created with Python 3.12 before installing dependencies.
-
-Windows PowerShell:
+Create a venv with Python 3.12, then:
 
 ```powershell
 pip install -r requirements.txt
 python run.py
 ```
 
-macOS / zsh / bash:
+`run.py` sets the Windows event loop policy before Uvicorn starts, which is required for Playwright browser subprocesses. It also defaults `UVICORN_RELOAD` to off — Uvicorn's reload mode switches back to `_WindowsSelectorEventLoop` and breaks Playwright.
+
+Optional overrides:
+
+```powershell
+$env:UVICORN_RELOAD                 = "true"   # enable hot reload (breaks Playwright)
+$env:INGESTION_STARTUP_GRACE_SECONDS = "20"    # delay before ingestion worker starts
+$env:ADMIN_API_TOKEN                = "choose-a-long-random-string"  # gate admin routes
+python run.py
+```
+
+If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
+`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
+
+#### 3. Start the frontend
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+If `ADMIN_API_TOKEN` is set on the backend, set it here too before `npm run dev`:
+
+```powershell
+$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+> Restart the dev server once after the first `npm install` so PostCSS picks up Tailwind config. If you have stale `node_modules` or `.next` output from older versions, clear them before debugging.
+
+---
+
+### macOS Setup (zsh / bash)
+
+#### 1. Start Ollama
+
+```bash
+ollama pull qwen3.5:9b
+ollama serve
+```
+
+Optional model overrides — add to `~/.zshrc` to persist, or set inline:
+
+```bash
+export OLLAMA_MODEL="qwen3.5:9b"
+export OLLAMA_URL="http://localhost:11434/api/generate"
+```
+
+If `OLLAMA_MODEL` is unset, the backend uses whichever model Ollama is currently serving.
+
+#### 2. Start the backend
+
+Create a venv with Python 3.12, then:
 
 ```bash
 python3.12 -m pip install -r requirements.txt
 python3.12 run.py
 ```
 
-`run.py` is the recommended startup path on both platforms. Avoid launching `uvicorn main:app --reload` directly from the shell if you want the repo's startup defaults and Windows Playwright safeguards applied consistently.
+`run.py` works on macOS without the Windows event loop workaround and defaults `UVICORN_RELOAD` to on.
 
-Reload behavior:
-
-- Windows: `python run.py` starts with reload off by default so Playwright-backed article rendering can work
-- macOS: `python3.12 run.py` keeps reload on by default
-- If you want to override that behavior, set `UVICORN_RELOAD`
-
-Windows PowerShell:
-
-```powershell
-$env:UVICORN_RELOAD = "true"
-python run.py
-```
-
-macOS / zsh / bash:
+Optional overrides:
 
 ```bash
-export UVICORN_RELOAD="false"
+export UVICORN_RELOAD="false"              # disable hot reload
+export INGESTION_STARTUP_GRACE_SECONDS="20"  # delay before ingestion worker starts
+export ADMIN_API_TOKEN="choose-a-long-random-string"  # gate admin routes
 python3.12 run.py
 ```
 
-Optional startup tuning:
+If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
+`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
 
-```powershell
-$env:INGESTION_STARTUP_GRACE_SECONDS = "20"
-```
-
-macOS / zsh / bash:
+#### 3. Start the frontend
 
 ```bash
-export INGESTION_STARTUP_GRACE_SECONDS="20"
+cd frontend
+npm install
+npm run dev
 ```
 
-The background ingestion worker waits briefly on startup and also defers while an analysis lease is active, which helps avoid SQLite write contention during first boot and urgent off-cycle runs.
-
-Optional local admin protection:
-
-```powershell
-$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
-```
-
-macOS / zsh / bash:
+If `ADMIN_API_TOKEN` is set on the backend, set it here too before `npm run dev`:
 
 ```bash
 export ADMIN_API_TOKEN="choose-a-long-random-string"
-```
-
-If `ADMIN_API_TOKEN` is set, these routes require the `X-Admin-Token` header:
-
-- `GET /api/v1/config`
-- `PUT /api/v1/config`
-- `POST /api/v1/trades/{trade_id}/execute`
-
-Admin also controls:
-
-- saved snapshot retention limit for Advanced Mode replay
-- display timezone (persisted in the database and mirrored into the browser)
-- removing accidental execution records from tracked trades
-- tracked symbols, custom test symbols, RSS feed enablement, custom RSS feeds, RSS article depth presets, and prompt overrides
-
-### 3. Start the frontend
-
-```powershell
-cd frontend
-npm install
-- optional Light Web Research prompt grounding
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
 
-Notes:
+> Restart the dev server once after the first `npm install` so PostCSS picks up Tailwind config. If you have stale `node_modules` or `.next` output from older versions, clear them before debugging.
 
-- Restart the dev server once after the first `npm install` so PostCSS picks up Tailwind config
-- The frontend targets Next.js 16 and React 19
-- If you have stale `node_modules` or `.next` output from older versions, clear them before debugging upgrade issues
+---
 
-If you enabled the admin token above, set it for the frontend server too before `npm run dev`:
+### Admin controls (both platforms)
 
-```powershell
-$env:ADMIN_API_TOKEN = "choose-a-long-random-string"
-npm run dev
-```
+The following are configurable from the Admin page and persist in the database:
+
+- saved snapshot retention limit
+- display timezone (mirrored to the browser)
+- tracked symbols, custom symbols, RSS feed enablement, custom feeds, article depth presets, prompt overrides
+- removing accidental execution records without deleting the underlying trade recommendation
 
 ## Testing Your Extraction Model (Stage 1)
 
@@ -459,7 +461,6 @@ qwen-3.5-9b-getrich/
 |     |- paper-trading/route.ts  
 |     |- admin/price-history/pull/route.ts
 |     `- admin/price-history/status/route.ts
-|- CHANGES.md
 |- RELEASENOTES.md
 `- README.md
 ```
