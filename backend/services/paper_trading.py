@@ -377,6 +377,36 @@ def process_signals(
 
         actions.append(action_summary)
 
+    # Close any open position whose underlying was not covered by this run.
+    # Absence of a recommendation = thesis gone; treat the same as a HOLD with no window.
+    covered_underlyings = {
+        str(rec.get("underlying") or rec.get("symbol") or "").upper()
+        for rec in recommendations
+        if str(rec.get("underlying") or rec.get("symbol") or "").strip()
+    }
+    orphaned = (
+        db.query(PaperTrade)
+        .filter(PaperTrade.exited_at.is_(None))
+        .all()
+    )
+    for pos in orphaned:
+        if pos.underlying in covered_underlyings:
+            continue
+        price_data = quotes_by_symbol.get(pos.execution_ticker) or quotes_by_symbol.get(pos.underlying) or {}
+        exit_price = float(price_data.get("current_price") or price_data.get("price") or pos.entry_price or 0.0)
+        if exit_price > 0:
+            _close_position(pos, exit_price, now, db, reason="no_recommendation")
+            actions.append({
+                "underlying": pos.underlying,
+                "execution_ticker": pos.execution_ticker,
+                "signal_type": pos.signal_type,
+                "action": "closed",
+                "reason": "no_recommendation",
+                "exit_price": exit_price,
+                "closed_pnl": pos.realized_pnl,
+                "session": session["label"],
+            })
+
     db.commit()
     return actions
 

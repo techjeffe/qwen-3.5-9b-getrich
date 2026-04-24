@@ -194,10 +194,10 @@ def build_remote_snapshot_payload(db, request_id: Optional[str] = None) -> Dict[
     max_recommendations = max(1, int(getattr(config, "remote_snapshot_max_recommendations", 4) or 4))
     last_sent_at = _ensure_utc(getattr(config, "last_remote_snapshot_sent_at", None))
 
-    if bool(getattr(config, "remote_snapshot_include_closed_trades", False)):
-        closed_trades = _filter_closed_trades_since_last_send(closed_trades, last_sent_at)
-    else:
-        closed_trades = []
+    # Gate detection: always filter by time regardless of image-inclusion setting
+    closed_trades_since_last_send = _filter_closed_trades_since_last_send(closed_trades, last_sent_at)
+    # Image rendering: only include closed trades if the user opted in
+    closed_trades_for_render = closed_trades_since_last_send if bool(getattr(config, "remote_snapshot_include_closed_trades", False)) else []
 
     return {
         "request_id": current.request_id,
@@ -218,7 +218,8 @@ def build_remote_snapshot_payload(db, request_id: Optional[str] = None) -> Dict[
         "recommendation_fingerprint": _recommendation_fingerprint(recommendations),
         "pnl_summary": paper_summary,
         "positions": open_positions,
-        "closed_trades": closed_trades,
+        "closed_trades": closed_trades_for_render,
+        "closed_trades_since_last_send": closed_trades_since_last_send,
         "market": dict(paper.get("market") or {}),
     }
 
@@ -650,7 +651,7 @@ def should_send_remote_snapshot(config, payload: Dict[str, Any]) -> Dict[str, An
     if bool(getattr(config, "remote_snapshot_send_on_position_change", True)):
         position_changed = _has_position_changes_since_last_send(
             list(payload.get("positions") or []),
-            list(payload.get("closed_trades") or []),
+            list(payload.get("closed_trades_since_last_send") or payload.get("closed_trades") or []),
             last_sent_at,
         )
     return {
