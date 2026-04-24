@@ -254,12 +254,19 @@ async def trigger_fast_lane(article_ids: List[int], symbols: List[str]) -> None:
 
     db = SessionLocal()
     try:
-        await run_analysis_for_pending_articles(
-            db=db,
-            symbols=symbols,
-            article_ids=article_ids,
-            trigger_source="fast_lane",
-        )
+        try:
+            await run_analysis_for_pending_articles(
+                db=db,
+                symbols=symbols,
+                article_ids=article_ids,
+                trigger_source="fast_lane",
+            )
+        except Exception:
+            logger.exception(
+                "Fast-lane analysis failed for article_ids=%s symbols=%s",
+                article_ids,
+                symbols,
+            )
     finally:
         db.close()
 

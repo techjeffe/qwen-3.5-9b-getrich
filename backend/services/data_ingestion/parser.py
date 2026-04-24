@@ -12,6 +12,8 @@ from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlparse
 
+from services.app_config import DEFAULT_RSS_FEEDS
+
 
 @dataclass
 class NewsArticle:
@@ -31,21 +33,16 @@ class RSSFeedParser:
     Parser for geopolitical news RSS feeds using BeautifulSoup.
     
     Supports:
-    - Multiple feed sources (Reuters, AP News, Al Jazeera)
+    - Multiple feed sources (Reuters, AP News, NYT Business, etc.)
     - HTML content extraction
     - Keyword-based filtering
     - Date-based filtering
     """
     
-    # Configured RSS feeds for geopolitical/market coverage (verified working)
+    # Canonical built-in feeds come from app_config so the parser and settings stay aligned.
     GEOPOLITICAL_FEEDS = {
-        "trump_truth":     "https://trumpstruth.org/feed",
-        "bbc_world":       "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "aljazeera_all":   "https://www.aljazeera.com/xml/rss/all.xml",
-        "nyt_world":       "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "marketwatch":     "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
-        "npr_world":       "https://feeds.npr.org/1017/rss.xml",
-        "guardian_world":  "https://www.theguardian.com/world/rss",
+        feed["key"]: feed["url"]
+        for feed in DEFAULT_RSS_FEEDS
     }
     
     # Keywords used to tag articles with chips in the UI (not used for routing)

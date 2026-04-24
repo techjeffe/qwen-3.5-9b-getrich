@@ -24,13 +24,9 @@ DEFAULT_RSS_ARTICLE_LIMITS = {"light": 5, "normal": 15, "detailed": 25}
 DEFAULT_WEB_RESEARCH_ITEMS = {"light": 3, "normal": 4, "detailed": 6}
 DEFAULT_WEB_RESEARCH_RECENCY_DAYS = {"light": 14, "normal": 30, "detailed": 45}
 DEFAULT_RSS_FEEDS: List[Dict[str, str]] = [
-    {"key": "trump_truth", "label": "Trump Truth", "url": "https://trumpstruth.org/feed"},
-    {"key": "bbc_world", "label": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
-    {"key": "aljazeera_all", "label": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
-    {"key": "nyt_world", "label": "New York Times World", "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"},
-    {"key": "marketwatch", "label": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"},
-    {"key": "npr_world", "label": "NPR World", "url": "https://feeds.npr.org/1017/rss.xml"},
-    {"key": "guardian_world", "label": "The Guardian World", "url": "https://www.theguardian.com/world/rss"},
+    {"key": "calculated_risk_rss", "label": "Calculated Risk RSS", "url": "https://feeds.feedburner.com/CalculatedRisk"},
+    {"key": "nyt_business", "label": "New York Times Business", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"},
+    {"key": "reuters_business", "label": "Reuters Business", "url": "https://www.reutersagency.com/feed/?best-topics=business&post-type=best"},
 ]
 DEFAULT_EXTRACTION_MODEL = ""
 DEFAULT_REASONING_MODEL = ""

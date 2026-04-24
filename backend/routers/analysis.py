@@ -852,7 +852,7 @@ async def _run_analysis_pipeline(
     article_ids: Optional[List[int]] = None,
     trigger_source: str = "api",
     progress_callback: ProgressCallback = None,
-) -> AnalysisResponse:
+) -> Optional[AnalysisResponse]:
     start_time = time.time()
     request_id = str(uuid.uuid4())[:8]
     pipeline_events: List[str] = []
@@ -875,6 +875,12 @@ async def _run_analysis_pipeline(
             article_ids=article_ids,
             trigger_source=trigger_source,
         )
+        skipped_empty_ids = list(ingestion_trace.get("queue", {}).get("skipped_empty_article_ids") or [])
+        if skipped_empty_ids:
+            _mark_scraped_articles_processed(db, skipped_empty_ids)
+            skip_message = f"Skipped {len(skipped_empty_ids)} queued articles with no usable text"
+            pipeline_events.append(skip_message)
+            await _emit_progress(progress_callback, "log", {"message": skip_message})
         pipeline_events.append(f"Loaded {len(posts)} queued articles from the database")
         await _emit_progress(progress_callback, "log", {"message": f"Loaded {len(posts)} queued articles from the database"})
         for post in posts:
@@ -891,6 +897,20 @@ async def _run_analysis_pipeline(
                     "keywords": list(getattr(post, "keywords", None) or [])[:6],
                 },
             )
+
+        if not posts:
+            message = "No queued articles contained usable text for sentiment analysis"
+            mark_analysis_completed(db, request_id)
+            record_analysis_result(
+                status="skipped",
+                request_id=request_id,
+                active_model=active_model,
+                error=message,
+            )
+            if trigger_source in {"worker", "fast_lane"}:
+                await _emit_progress(progress_callback, "log", {"message": message})
+                return None
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
 
         refresh_analysis_lock(db, request_id)
         await _emit_progress(progress_callback, "log", {"message": f"Fetching real-time price data for {', '.join(effective_request.symbols)}..."})
@@ -1523,6 +1543,12 @@ async def _ingest_data(
     )
 
     posts = build_analysis_posts(rows)
+    usable_posts = [post for post in posts if _post_has_analysis_text(post)]
+    skipped_empty_ids = [
+        int(getattr(post, "id", 0) or 0)
+        for post in posts
+        if not _post_has_analysis_text(post) and getattr(post, "id", None) is not None
+    ]
     selected_ids = [int(row.id) for row in rows]
     fast_lane_ids = [int(row.id) for row in rows if bool(row.fast_lane_triggered)]
     trace: Dict[str, Any] = {
@@ -1530,36 +1556,51 @@ async def _ingest_data(
         "trigger_source": trigger_source,
         "request_max_posts": request.max_posts,
         "selected_article_ids": selected_ids,
+        "usable_article_ids": [int(getattr(post, "id", 0) or 0) for post in usable_posts if getattr(post, "id", None) is not None],
+        "skipped_empty_article_ids": skipped_empty_ids,
         "selected_fast_lane_article_ids": fast_lane_ids,
-        "total_items": len(posts),
+        "total_items": len(usable_posts),
         "queue": {
             "status": "ok",
             "pending_count": int(
                 db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False)).count()
             ),
             "selected_count": len(rows),
-            "selected_articles": [_post_trace_summary(post) for post in posts],
+            "usable_count": len(usable_posts),
+            "skipped_empty_count": len(skipped_empty_ids),
+            "selected_articles": [_post_trace_summary(post) for post in usable_posts],
+            "skipped_empty_articles": [
+                _post_trace_summary(post)
+                for post in posts
+                if int(getattr(post, "id", 0) or 0) in skipped_empty_ids
+            ],
+            "skipped_empty_article_ids": skipped_empty_ids,
             "selected_urls": [str(row.url or "") for row in rows],
             "fast_lane_count": len(fast_lane_ids),
         },
         "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
-        "rss": {"status": "replaced_by_db_queue", "feeds": [], "total_count": len(posts), "error": None},
+        "rss": {"status": "replaced_by_db_queue", "feeds": [], "total_count": len(usable_posts), "error": None},
     }
 
     record_data_pull(
         status="ok",
         source="analysis_ingestion_queue",
-        summary=f"Loaded {len(posts)} pending articles from the DB queue",
+        summary=(
+            f"Loaded {len(usable_posts)} usable pending articles from the DB queue"
+            + (f"; skipped {len(skipped_empty_ids)} empty items" if skipped_empty_ids else "")
+        ),
         details={
             "trigger_source": trigger_source,
             "selected_article_ids": selected_ids,
+            "usable_article_ids": trace["usable_article_ids"],
+            "skipped_empty_article_ids": skipped_empty_ids,
             "fast_lane_article_ids": fast_lane_ids,
             "pending_count": trace["queue"]["pending_count"],
         },
         error=None,
     )
 
-    return posts, trace
+    return usable_posts, trace
 
 
 def _apply_request_defaults(request: AnalysisRequest, config: Any) -> AnalysisRequest:
@@ -1830,17 +1871,33 @@ def _build_aggregated_news_context(posts: List[Any]) -> str:
             or "Unknown Source"
         )
         title = (getattr(post, 'title', '') or '').strip()
+        summary = (getattr(post, 'summary', '') or '').strip()
         content = (getattr(post, 'content', '') or '').strip()
+        details = content or summary
         section_lines: List[str] = []
         if title:
             section_lines.append(f"Source: {source}")
             section_lines.append(f"Headline: {title}")
-        if content and content != title:
-            section_lines.append(f"Details: {content}")
+        elif details:
+            section_lines.append(f"Source: {source}")
+        if details and details != title:
+            section_lines.append(f"Details: {details}")
         if section_lines:
             aggregated_sections.append("\n".join(section_lines))
 
     return "\n\n".join(aggregated_sections)[:12000]
+
+
+def _post_has_analysis_text(post: Any) -> bool:
+    return any(
+        str(value or "").strip()
+        for value in [
+            getattr(post, "title", ""),
+            getattr(post, "summary", ""),
+            getattr(post, "content", ""),
+            " ".join(getattr(post, "keywords", None) or []),
+        ]
+    )
 
 
 def _ensure_execution_quotes(signal: TradingSignal, quotes_by_symbol: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
