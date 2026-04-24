@@ -103,8 +103,23 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
         return []
 
     session = market_status(_allow_extended_hours_trading(db))
-    if not session["tradeable"] and not _cv.get("close_expired_during_closed_hours", True):
+    _hold_overnight = False
+    _cfg = None
+    try:
+        from services.app_config import get_or_create_app_config as _get_cfg
+        _cfg = _get_cfg(db)
+        _hold_overnight = bool(getattr(_cfg, "hold_overnight", False))
+    except Exception:
+        pass
+    if not session["tradeable"] and (_hold_overnight or not _cv.get("close_expired_during_closed_hours", True)):
         return []
+
+    _trail_on_expiry = bool(_cv.get("trail_on_window_expiry", True))
+    if _cfg is not None:
+        try:
+            _trail_on_expiry = bool(getattr(_cfg, "trail_on_window_expiry", _trail_on_expiry))
+        except Exception:
+            pass
 
     now = datetime.utcnow()
     now_utc = now.replace(tzinfo=timezone.utc)
@@ -128,6 +143,8 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
 
     price_client = PriceClient()
     closed = []
+    _ts_cfg = _L.get("trailing_stop", {})
+    _tight_pct = float(_ts_cfg.get("tighten_factor", 0.5)) * float(_L["stop_loss_pct"]) / 100.0
     for pos in expired:
         exit_price = 0.0
         try:
@@ -139,15 +156,38 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
             exit_price = float(pos.entry_price or 0.0)
         if exit_price <= 0:
             continue
-        _close_position(pos, exit_price, now, db, reason="window_expired")
-        closed.append({
-            "underlying": pos.underlying,
-            "execution_ticker": pos.execution_ticker,
-            "signal_type": pos.signal_type,
-            "exit_price": exit_price,
-            "realized_pnl": pos.realized_pnl,
-            "reason": "window_expired",
-        })
+        if _trail_on_expiry:
+            # Activate trailing stop instead of closing — lets winners run
+            if pos.signal_type == "LONG":
+                cur_best = float(pos.best_price_seen or 0) or float(pos.entry_price or 0)
+                best = max(cur_best, exit_price)
+                new_stop = round(best * (1.0 - _tight_pct), 4)
+            else:
+                cur_best = float(pos.best_price_seen or 0)
+                best = min(cur_best, exit_price) if cur_best > 0 else exit_price
+                new_stop = round(best * (1.0 + _tight_pct), 4)
+            pos.best_price_seen = best
+            pos.trailing_stop_price = new_stop
+            pos.holding_window_until = None  # prevent re-triggering expiry
+            closed.append({
+                "underlying": pos.underlying,
+                "execution_ticker": pos.execution_ticker,
+                "signal_type": pos.signal_type,
+                "exit_price": exit_price,
+                "realized_pnl": None,
+                "reason": "trailing_activated",
+                "trailing_stop_price": new_stop,
+            })
+        else:
+            _close_position(pos, exit_price, now, db, reason="window_expired")
+            closed.append({
+                "underlying": pos.underlying,
+                "execution_ticker": pos.execution_ticker,
+                "signal_type": pos.signal_type,
+                "exit_price": exit_price,
+                "realized_pnl": pos.realized_pnl,
+                "reason": "window_expired",
+            })
 
     if closed:
         db.commit()
@@ -178,20 +218,32 @@ def process_signals(
 
     _cv = _L["conviction"]
 
+    # Re-entry cooldown: same-direction re-entry blocked for this many minutes after a close
+    _reentry_cooldown = int(_L.get("reentry_cooldown_minutes", 0))
+    try:
+        from services.app_config import get_or_create_app_config as _get_cfg_rc
+        _cfg_rc = _get_cfg_rc(db)
+        _rc_override = getattr(_cfg_rc, "reentry_cooldown_minutes", None)
+        if _rc_override is not None:
+            _reentry_cooldown = int(_rc_override)
+    except Exception:
+        pass
+
     # Always check for expired windows first, even if market is closed
     expired_actions = close_expired_positions(db)
 
+    def _expired_action(ea: Dict[str, Any]) -> Dict[str, Any]:
+        action = "trailing" if ea.get("reason") == "trailing_activated" else "closed"
+        return {**ea, "action": action, "auto_expired": True}
+
     session = market_status(_allow_extended_hours_trading(db))
     if not session["tradeable"]:
-        return [
-            {**ea, "action": "closed", "auto_expired": True} for ea in expired_actions
-        ] or [{"skipped": True, "reason": "market_closed", "session": session["label"]}]
+        return [_expired_action(ea) for ea in expired_actions] or [
+            {"skipped": True, "reason": "market_closed", "session": session["label"]}
+        ]
 
     now = datetime.utcnow()
-    actions: List[Dict[str, Any]] = [
-        {**ea, "action": "closed", "auto_expired": True}
-        for ea in expired_actions
-    ]
+    actions: List[Dict[str, Any]] = [_expired_action(ea) for ea in expired_actions]
 
     for rec in recommendations:
         underlying = str(rec.get("underlying") or rec.get("symbol") or "").upper()
@@ -345,6 +397,29 @@ def process_signals(
             action_summary["holding_window_until"] = _utc_iso(open_pos.holding_window_until)
             actions.append(action_summary)
             continue
+
+        # Re-entry cooldown: skip same-direction re-entry if too soon after a close
+        if entry_price > 0 and _reentry_cooldown > 0:
+            _recent = (
+                db.query(PaperTrade)
+                .filter(
+                    PaperTrade.underlying == underlying,
+                    PaperTrade.exited_at.isnot(None),
+                    PaperTrade.signal_type == signal_type,
+                )
+                .order_by(PaperTrade.exited_at.desc())
+                .first()
+            )
+            if _recent and _recent.exited_at:
+                _exited = _recent.exited_at
+                if _exited.tzinfo is None:
+                    _exited = _exited.replace(tzinfo=timezone.utc)
+                _now_utc = now.replace(tzinfo=timezone.utc)
+                if _now_utc < _exited + timedelta(minutes=_reentry_cooldown):
+                    action_summary["action"] = "skipped"
+                    action_summary["reason"] = "reentry_cooldown"
+                    actions.append(action_summary)
+                    continue
 
         # Open new position
         _amount = trade_amount if trade_amount and trade_amount > 0 else _L["paper_trade_amount"]

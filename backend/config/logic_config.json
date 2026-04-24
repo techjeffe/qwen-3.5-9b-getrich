@@ -4,13 +4,15 @@
   "paper_trade_amount": 100.0,
 
   "entry_thresholds": {
-    "normal": 0.30,
+    "normal": 0.42,
     "closed_market": 0.42,
     "keep_normal": 0.30,
     "keep_closed_market": 0.22,
     "hysteresis_max_post_delta": 5,
     "hysteresis_max_sentiment_delta": 0.20
   },
+
+  "reentry_cooldown_minutes": 120,
 
   "stop_loss_pct": 2.0,
   "take_profit_pct": 3.0,
@@ -115,6 +117,7 @@
 
     "_comment_expiry": "What happens when the holding window expires.",
     "close_on_window_expiry": true,
+    "trail_on_window_expiry": true,
     "close_expired_during_closed_hours": true,
 
     "_comment_hold_signal": "Whether a HOLD signal is blocked from closing a position while the window is still active. true = window protects the position.",

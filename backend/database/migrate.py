@@ -74,10 +74,21 @@ def migrate():
                 ("take_profit_pct", "REAL"),
                 ("materiality_min_posts_delta", "INTEGER"),
                 ("materiality_min_sentiment_delta", "REAL"),
+                ("reentry_cooldown_minutes", "INTEGER"),
             ]:
                 if column_name not in existing_cols:
                     print(f"Adding {column_name} to app_config...")
                     conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+
+            # ── app_config: boolean trading-logic flags ────────────────────
+            for column_name, column_type, default_value in [
+                ("hold_overnight", "BOOLEAN", "0"),
+                ("trail_on_window_expiry", "BOOLEAN", "1"),
+            ]:
+                if column_name not in existing_cols:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}")
                     conn.commit()
 
             # ── trades table: conviction and holding period columns ──────────
@@ -268,6 +279,7 @@ def migrate():
                 ("take_profit_pct", "FLOAT"),
                 ("materiality_min_posts_delta", "INTEGER"),
                 ("materiality_min_sentiment_delta", "FLOAT"),
+                ("reentry_cooldown_minutes", "INTEGER"),
             ]:
                 result = conn.execute(
                     text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
@@ -276,6 +288,20 @@ def migrate():
                 if not result:
                     print(f"Adding {column_name} to app_config...")
                     conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}"))
+                    conn.commit()
+
+            # ── app_config: boolean trading-logic flags ────────────────────
+            for column_name, column_type, default_value in [
+                ("hold_overnight", "BOOLEAN", "FALSE"),
+                ("trail_on_window_expiry", "BOOLEAN", "TRUE"),
+            ]:
+                result = conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
+                    {"col": column_name},
+                ).fetchone()
+                if not result:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}"))
                     conn.commit()
 
             # ── trades table: conviction and holding period columns ──────────

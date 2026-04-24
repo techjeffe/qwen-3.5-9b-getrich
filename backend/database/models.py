@@ -354,6 +354,9 @@ class AppConfig(Base):
     take_profit_pct = Column(Float, nullable=True, default=None)
     materiality_min_posts_delta = Column(Integer, nullable=True, default=None)
     materiality_min_sentiment_delta = Column(Float, nullable=True, default=None)
+    hold_overnight = Column(Boolean, nullable=False, default=False)
+    trail_on_window_expiry = Column(Boolean, nullable=False, default=True)
+    reentry_cooldown_minutes = Column(Integer, nullable=True, default=None)
 
     last_analysis_started_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_completed_at = Column(DateTime(timezone=True), nullable=True)

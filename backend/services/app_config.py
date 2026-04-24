@@ -670,6 +670,12 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.materiality_min_posts_delta = _normalize_trading_logic_int(payload.get("materiality_min_posts_delta"), 1, 100)
     if "materiality_min_sentiment_delta" in payload:
         config.materiality_min_sentiment_delta = _normalize_trading_logic_float(payload.get("materiality_min_sentiment_delta"), 0.01, 1.0)
+    if "hold_overnight" in payload:
+        config.hold_overnight = bool(payload.get("hold_overnight"))
+    if "trail_on_window_expiry" in payload:
+        config.trail_on_window_expiry = bool(payload.get("trail_on_window_expiry"))
+    if "reentry_cooldown_minutes" in payload:
+        config.reentry_cooldown_minutes = _normalize_trading_logic_int(payload.get("reentry_cooldown_minutes"), 0, 10080)
 
     db.add(config)
     db.commit()
@@ -840,6 +846,9 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "take_profit_pct": getattr(config, "take_profit_pct", None),
         "materiality_min_posts_delta": getattr(config, "materiality_min_posts_delta", None),
         "materiality_min_sentiment_delta": getattr(config, "materiality_min_sentiment_delta", None),
+        "hold_overnight": bool(getattr(config, "hold_overnight", False)),
+        "trail_on_window_expiry": bool(getattr(config, "trail_on_window_expiry", True)),
+        "reentry_cooldown_minutes": getattr(config, "reentry_cooldown_minutes", None),
         # JSON defaults (read-only, for display)
         "logic_defaults": {
             "paper_trade_amount": _L["paper_trade_amount"],
@@ -848,6 +857,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "take_profit_pct": _L["take_profit_pct"],
             "materiality_min_posts_delta": _L["materiality_gate"]["min_posts_delta"],
             "materiality_min_sentiment_delta": _L["materiality_gate"]["min_sentiment_delta"],
+            "reentry_cooldown_minutes": int(_L.get("reentry_cooldown_minutes", 120)),
         },
         "last_analysis_started_at": config.last_analysis_started_at.isoformat() if config.last_analysis_started_at else None,
         "last_analysis_completed_at": config.last_analysis_completed_at.isoformat() if config.last_analysis_completed_at else None,

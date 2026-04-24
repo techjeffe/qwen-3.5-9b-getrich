@@ -29,6 +29,9 @@ type AppConfig = {
     risk_profile: string;
     web_research_enabled: boolean;
     allow_extended_hours_trading: boolean;
+    hold_overnight: boolean;
+    trail_on_window_expiry: boolean;
+    reentry_cooldown_minutes: number | null;
     remote_snapshot_enabled: boolean;
     remote_snapshot_mode: "telegram" | "signed_link" | "email";
     remote_snapshot_interval_minutes: number;
@@ -48,6 +51,7 @@ type AppConfig = {
         take_profit_pct: number;
         materiality_min_posts_delta: number;
         materiality_min_sentiment_delta: number;
+        reentry_cooldown_minutes: number;
     };
     available_models: string[];
     last_analysis_started_at: string | null;
@@ -93,6 +97,9 @@ const EMPTY_CONFIG: AppConfig = {
     risk_profile: "moderate",
     web_research_enabled: false,
     allow_extended_hours_trading: true,
+    hold_overnight: false,
+    trail_on_window_expiry: true,
+    reentry_cooldown_minutes: null,
     remote_snapshot_enabled: false,
     remote_snapshot_mode: "telegram",
     remote_snapshot_interval_minutes: 360,
@@ -107,11 +114,12 @@ const EMPTY_CONFIG: AppConfig = {
     materiality_min_sentiment_delta: null,
     logic_defaults: {
         paper_trade_amount: 100,
-        entry_threshold: 0.30,
+        entry_threshold: 0.42,
         stop_loss_pct: 2.0,
         take_profit_pct: 3.0,
         materiality_min_posts_delta: 6,
         materiality_min_sentiment_delta: 0.24,
+        reentry_cooldown_minutes: 120,
     },
     available_models: [],
     last_analysis_started_at: null,
@@ -1404,6 +1412,87 @@ python run.py`}</code></pre>
                                 onChange={(e) => setConfig((current) => ({ ...current, allow_extended_hours_trading: e.target.checked }))}
                             />
                             Allow pre-market and after-hours paper trading
+                        </label>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                        <div>
+                            <p className="text-sm font-semibold text-slate-200">Hold overnight</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                                When enabled, a position whose conviction window expires while the market is closed will
+                                not be automatically closed. The position survives until the next open-market run, at
+                                which point the normal signal logic applies — it may get re-confirmed, given a new
+                                window, or closed based on the latest recommendation.
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                                When disabled (default), an expired window closes the position as soon as the next
+                                analysis run fires, even overnight. This keeps the simulation conservative — you are
+                                never holding a position with no active thesis — but it means a trade that would have
+                                re-confirmed at the next open is closed first, then reopened, incurring unnecessary
+                                slippage in the simulated P&L.
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                                Good choice if: you are trading instruments that can gap significantly overnight (e.g.
+                                leveraged ETFs after a macro event) and want the simulation to mirror a trader who
+                                sets a hard stop at close. Disable if you want the simulation to carry positions
+                                through the night the same way a swing trader would.
+                            </p>
+                        </div>
+                        <label className="flex items-center gap-3 text-sm">
+                            <input
+                                type="checkbox"
+                                checked={config.hold_overnight}
+                                onChange={(e) => setConfig((current) => ({ ...current, hold_overnight: e.target.checked }))}
+                            />
+                            Hold positions overnight when the conviction window expires during closed hours
+                        </label>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                        <div>
+                            <p className="text-sm font-semibold text-slate-200">Trail on window expiry</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                                When enabled (default), a position whose conviction window expires is not immediately
+                                closed. Instead, a trailing stop is activated at half the normal stop-loss distance from
+                                the best price seen. The position then stays open until price reverses through the stop.
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                                This lets winners run past the original window — if USO is up 2% and the conviction
+                                window expires, the trailing stop locks in most of that gain rather than closing flat.
+                                The stop tightens each run as price moves further in your favour.
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                                When disabled, window expiry closes the position immediately at the current price, the
+                                same as a hard time-stop. Use this if you prefer strict time discipline over letting
+                                momentum extend the hold.
+                            </p>
+                        </div>
+                        <label className="flex items-center gap-3 text-sm">
+                            <input
+                                type="checkbox"
+                                checked={config.trail_on_window_expiry}
+                                onChange={(e) => setConfig((current) => ({ ...current, trail_on_window_expiry: e.target.checked }))}
+                            />
+                            Activate trailing stop when conviction window expires instead of closing immediately
+                        </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Re-entry Cooldown (minutes)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">
+                                Block re-opening the same direction on a symbol for this many minutes after a close.
+                                Prevents rapid flip-and-re-enter churn. 0 = no cooldown.
+                                Default: {config.logic_defaults.reentry_cooldown_minutes} min
+                            </p>
+                            <input
+                                type="number"
+                                min={0} max={10080} step={15}
+                                value={config.reentry_cooldown_minutes ?? ""}
+                                placeholder={String(config.logic_defaults.reentry_cooldown_minutes)}
+                                onChange={(e) => setConfig((c) => ({ ...c, reentry_cooldown_minutes: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
                         </label>
                     </div>
 
