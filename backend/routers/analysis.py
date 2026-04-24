@@ -67,6 +67,7 @@ from services.app_config import (
 )
 from config.logic_loader import LOGIC as _L
 from services.pnl_tracker import PnLTracker, persist_recommendation_trades
+from services.remote_snapshot import trigger_remote_snapshot_delivery
 from services.runtime_health import record_analysis_result, record_data_pull
 from services.trading_instruments import build_execution_recommendation
 from services.web_research import fetch_recent_symbol_web_context
@@ -3318,6 +3319,7 @@ def _save_analysis_result(
         retention_limit = int(getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT))
         _prune_saved_analyses(db, retention_limit)
         db.commit()
+        trigger_remote_snapshot_delivery(request_id)
     except Exception as e:
         print(f"Error saving analysis result: {e}")
         db.rollback()

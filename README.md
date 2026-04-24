@@ -58,6 +58,8 @@ Create a venv with Python 3.12, then:
 
 ```powershell
 pip install -r requirements.txt
+# If you need to install the secure OS keychain dependency by itself:
+# pip install keyring
 python run.py
 ```
 
@@ -74,6 +76,12 @@ python run.py
 
 If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
 `GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
+
+Secure remote snapshot secrets:
+
+- `keyring` is included in `requirements.txt` and is used to store Telegram secrets in the OS keychain
+- On Windows, secrets saved from the Admin UI go to Credential Manager
+- If you prefer to install it directly: `pip install keyring`
 
 #### 3. Start the frontend
 
@@ -120,6 +128,8 @@ Create a venv with Python 3.12, then:
 
 ```bash
 python3.12 -m pip install -r requirements.txt
+# If you need to install the secure OS keychain dependency by itself:
+# python3.12 -m pip install keyring
 python3.12 run.py
 ```
 
@@ -136,6 +146,12 @@ python3.12 run.py
 
 If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
 `GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
+
+Secure remote snapshot secrets:
+
+- `keyring` is included in `requirements.txt` and is used to store Telegram secrets in the OS keychain
+- On macOS, secrets saved from the Admin UI go to Keychain Access
+- If you prefer to install it directly: `python3.12 -m pip install keyring`
 
 #### 3. Start the frontend
 
@@ -166,6 +182,12 @@ The following are configurable from the Admin page and persist in the database:
 - display timezone (mirrored to the browser)
 - tracked symbols, custom symbols, RSS feed enablement, custom feeds, article depth presets, prompt overrides
 - removing accidental execution records without deleting the underlying trade recommendation
+
+Remote snapshot delivery can also be configured from Admin:
+
+- enable/disable remote snapshot delivery and tune resend thresholds
+- save Telegram `bot token` and `chat id` securely from the UI without storing them in the repo
+- secrets are stored in the OS keychain through `keyring` and only masked status is shown back in the UI
 
 ## Testing Your Extraction Model (Stage 1)
 
@@ -243,6 +265,14 @@ The migration script will detect any missing columns and add them with safe defa
 | `analysis_lock_request_id` | `app_config` | `''` | Active analysis lease owner |
 | `analysis_lock_acquired_at` | `app_config` | `NULL` | Analysis lease start time |
 | `analysis_lock_expires_at` | `app_config` | `NULL` | Analysis lease expiry time |
+| `remote_snapshot_enabled` | `app_config` | `false` | Enable outbound remote PNG delivery |
+| `remote_snapshot_mode` | `app_config` | `'telegram'` | Delivery backend |
+| `remote_snapshot_min_pnl_change_usd` | `app_config` | `5.0` | Re-send threshold |
+| `remote_snapshot_heartbeat_minutes` | `app_config` | `360` | Re-send heartbeat |
+| `remote_snapshot_include_closed_trades` | `app_config` | `false` | Include recent closed positions in image |
+| `remote_snapshot_max_recommendations` | `app_config` | `4` | Max recommendations rendered in image |
+| `last_remote_snapshot_sent_at` | `app_config` | `NULL` | Last successful outbound snapshot time |
+| `last_remote_snapshot_request_id` | `app_config` | `NULL` | Request id tied to last outbound snapshot |
 | `trailing_stop_price` | `paper_trades` | `NULL` | Trailing stop level set when HOLD fires on open position |
 | `best_price_seen` | `paper_trades` | `NULL` | High/low-water mark used to update trailing stop each run |
 
@@ -341,11 +371,13 @@ The Admin page is organized around the things users change most often first.
    - Light: single "Analysis Model" (same model for Stage 1 and Stage 2)
    - Normal: optional Stage 1 and Stage 2 selectors; single-stage if only one is set
    - Detailed: both models required; amber warning shown until both are selected
-3. **Symbols** — enable/disable default symbols, add up to 3 custom symbols
-4. **RSS Sources** — enable/disable feeds, add up to 3 custom feeds
-5. **Prompt Overrides** — per-symbol specialist prompt guidance
-6. **Price History** — pull and status panel: per-symbol row count, date range, ready/needs-pull indicator, and a pull trigger button; the `price_history` table is independent of the analysis database and is never cleared by reset-data
+3. **Trading Logic** — session hours toggle (allow pre-market / after-hours paper trading), and threshold overrides for paper trade amount, entry threshold, stop loss, take profit, and the materiality gate; leave fields blank to use `logic_config.json` defaults
+4. **Symbols** — enable/disable default symbols, add up to 3 custom symbols
+5. **RSS Sources** — enable/disable feeds, add up to 3 custom feeds
+6. **Prompt Overrides** — per-symbol specialist prompt guidance
 7. **Scheduling & System** — auto-run cadence, snapshot retention, display timezone
+8. **Remote Snapshot Delivery** — enable outbound PNG delivery after qualifying runs; configure Telegram bot token and chat ID securely (stored in the OS keychain, never in the repo); tune resend interval, P&L threshold, and heartbeat; **Send Snapshot Now** button bypasses all gates and immediately queues the most recent run for delivery
+9. **Price History** — pull and status panel: per-symbol row count, date range, ready/needs-pull indicator, and a pull trigger button; the `price_history` table is independent of the analysis database and is never cleared by reset-data
 
 Advanced additions:
 

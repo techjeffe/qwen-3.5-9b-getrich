@@ -5,7 +5,7 @@ Configuration API router.
 import asyncio
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database.engine import get_db
@@ -21,6 +21,13 @@ from services.app_config import (
 )
 from services.ollama import get_ollama_status
 from services.paper_trading import close_positions_for_removed_symbols
+from services.remote_snapshot import trigger_remote_snapshot_delivery
+from services.secret_store import (
+    get_telegram_credentials,
+    clear_telegram_secrets,
+    get_telegram_secret_status,
+    save_telegram_secrets,
+)
 
 
 router = APIRouter()
@@ -93,6 +100,93 @@ async def put_config(
     return response
 
 
+@router.get("/admin/remote-snapshot-secrets", tags=["Admin"])
+async def get_remote_snapshot_secrets(
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    return get_telegram_secret_status()
+
+
+@router.put("/admin/remote-snapshot-secrets", tags=["Admin"])
+async def put_remote_snapshot_secrets(
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        previous = get_telegram_credentials()
+        next_bot_token = str(payload.get("bot_token") or "")
+        next_chat_id = str(payload.get("chat_id") or "")
+        changed = (
+            str(previous.get("bot_token") or "").strip() != next_bot_token.strip()
+            or str(previous.get("chat_id") or "").strip() != next_chat_id.strip()
+        )
+        saved = save_telegram_secrets(
+            bot_token=str(payload.get("bot_token") or ""),
+            chat_id=str(payload.get("chat_id") or ""),
+        )
+        config = get_or_create_app_config(db)
+        if not bool(getattr(config, "remote_snapshot_enabled", False)):
+            config.remote_snapshot_enabled = True
+            db.add(config)
+            db.commit()
+            db.refresh(config)
+
+        latest_analysis = (
+            db.query(AnalysisResult)
+            .order_by(AnalysisResult.timestamp.desc(), AnalysisResult.id.desc())
+            .first()
+        )
+        if changed and latest_analysis and latest_analysis.request_id:
+            background_tasks.add_task(trigger_remote_snapshot_delivery, latest_analysis.request_id, True)
+            saved["test_delivery_started"] = True
+            saved["test_delivery_request_id"] = latest_analysis.request_id
+        else:
+            saved["test_delivery_started"] = False
+            saved["test_delivery_request_id"] = None
+            if changed and not latest_analysis:
+                saved["test_delivery_note"] = "No completed analysis run is available yet."
+        saved["remote_snapshot_enabled"] = True
+        return saved
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.delete("/admin/remote-snapshot-secrets", tags=["Admin"])
+async def delete_remote_snapshot_secrets(
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    try:
+        return clear_telegram_secrets()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/admin/remote-snapshot-send", tags=["Admin"])
+async def send_remote_snapshot_now(
+    background_tasks: BackgroundTasks,
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    latest_analysis = (
+        db.query(AnalysisResult)
+        .order_by(AnalysisResult.timestamp.desc(), AnalysisResult.id.desc())
+        .first()
+    )
+    if not latest_analysis or not latest_analysis.request_id:
+        raise HTTPException(status_code=400, detail="No completed analysis run is available yet.")
+
+    background_tasks.add_task(trigger_remote_snapshot_delivery, latest_analysis.request_id, True)
+    return {
+        "ok": True,
+        "request_id": latest_analysis.request_id,
+        "message": "Remote snapshot send has been queued.",
+    }
+
+
 @router.post("/admin/reset-data", tags=["Admin"])
 async def reset_data(
     _admin: None = Depends(require_admin_token),
@@ -112,6 +206,10 @@ async def reset_data(
     config.last_analysis_started_at = None
     config.last_analysis_completed_at = None
     config.last_analysis_request_id = None
+    config.last_remote_snapshot_sent_at = None
+    config.last_remote_snapshot_request_id = None
+    config.last_remote_snapshot_net_pnl = None
+    config.last_remote_snapshot_recommendation_fingerprint = None
     config.analysis_lock_request_id = None
     config.analysis_lock_acquired_at = None
     config.analysis_lock_expires_at = None

@@ -25,6 +25,17 @@ _REGULAR_OPEN   = time_cls(9, 30)
 _REGULAR_CLOSE  = time_cls(16, 0)
 
 
+def _allow_extended_hours_trading(db=None) -> bool:
+    if db is None:
+        return True
+    try:
+        from services.app_config import get_or_create_app_config
+        config = get_or_create_app_config(db)
+        return bool(getattr(config, "allow_extended_hours_trading", True))
+    except Exception:
+        return True
+
+
 def _directional_return_pct(signal_type: str, entry_price: float, current_price: float) -> float:
     """Return percentage P&L with correct sign for long vs short paper trades."""
     if entry_price <= 0 or current_price <= 0:
@@ -42,7 +53,7 @@ def _directional_pnl(signal_type: str, entry_price: float, current_price: float,
     return amount * (_directional_return_pct(signal_type, entry_price, current_price) / 100.0)
 
 
-def market_status() -> Dict[str, Any]:
+def market_status(allow_extended_hours: bool = True) -> Dict[str, Any]:
     """Return current market session for display and gate-keeping."""
     now_et = datetime.now(_MARKET_TZ)
     t = now_et.time()
@@ -53,9 +64,17 @@ def market_status() -> Dict[str, Any]:
     if _REGULAR_OPEN <= t <= _REGULAR_CLOSE:
         return {"status": "open", "label": "Market Open", "tradeable": True}
     if _EXTENDED_OPEN <= t < _REGULAR_OPEN:
-        return {"status": "pre-market", "label": "Pre-Market", "tradeable": True}
+        return {
+            "status": "pre-market",
+            "label": "Pre-Market" if allow_extended_hours else "Pre-Market (Trading Disabled)",
+            "tradeable": allow_extended_hours,
+        }
     if _REGULAR_CLOSE < t <= _EXTENDED_CLOSE:
-        return {"status": "after-hours", "label": "After-Hours", "tradeable": True}
+        return {
+            "status": "after-hours",
+            "label": "After-Hours" if allow_extended_hours else "After-Hours (Trading Disabled)",
+            "tradeable": allow_extended_hours,
+        }
     return {"status": "closed", "label": "Closed", "tradeable": False}
 
 
@@ -83,7 +102,7 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
     if not _cv.get("close_on_window_expiry", True):
         return []
 
-    session = market_status()
+    session = market_status(_allow_extended_hours_trading(db))
     if not session["tradeable"] and not _cv.get("close_expired_during_closed_hours", True):
         return []
 
@@ -162,7 +181,7 @@ def process_signals(
     # Always check for expired windows first, even if market is closed
     expired_actions = close_expired_positions(db)
 
-    session = market_status()
+    session = market_status(_allow_extended_hours_trading(db))
     if not session["tradeable"]:
         return [
             {**ea, "action": "closed", "auto_expired": True} for ea in expired_actions
@@ -533,7 +552,7 @@ def get_summary(db) -> Dict[str, Any]:
         })
 
     return {
-        "market": market_status(),
+        "market": market_status(_allow_extended_hours_trading(db)),
         "summary": {
             "total_trades": len(trades),
             "open_positions": len(open_positions),

@@ -1,4 +1,29 @@
+# Release Notes — April 24, 2026
+
+## Admin UI Reorganization
+
+- **Trading Logic section moved** — now sits between Model Orchestration and Symbols so trading behavior controls are grouped with the pipeline config they affect, rather than buried after Remote Snapshot
+- **Extended-hours trading toggle moved into Trading Logic** — the "Allow pre-market and after-hours paper trading" checkbox now lives in the Trading Logic section alongside the other simulation controls; the description explains the liquidity/spread characteristics of each session
+
+---
+
 # Release Notes — April 23, 2026
+
+## Remote Snapshot Delivery and Secure Telegram Secrets
+
+This release added outbound remote run snapshots plus cross-platform secure Telegram secret storage.
+
+- Added **remote snapshot delivery** that renders a compact PNG after qualifying runs with latest recommendations, current P&L, timestamp, model label, and request ID
+- Added **material-change gating** so snapshots only send when recommendations changed, net P&L moved enough, or the heartbeat window elapsed
+- Added **Telegram photo delivery** as the primary remote destination, with signed-link and email plumbing available behind the same snapshot pipeline
+- Added Admin controls for remote snapshot settings: enable/disable, delivery mode, max recommendations, P&L resend threshold, heartbeat, and whether to include recent closed trades
+- Added a **Send Snapshot Now** button in Admin that immediately queues delivery of the most recent completed analysis run, bypassing the normal interval/change-detection gates — useful for testing credentials or manually pushing an update
+- Added a Telegram setup modal in Admin with step-by-step instructions for bot creation and chat ID discovery
+- Added secure **UI-managed Telegram secrets** using the OS keychain through `keyring`
+  - Windows stores them in Credential Manager
+  - macOS stores them in Keychain Access
+- Raw bot token and chat ID are never stored in repo config, never returned to the UI after save, and only masked status is shown back in Admin
+- Added a new backend admin secret-management API and a frontend proxy route so secrets stay backend-only
 
 ## Paper Trading Logic Overhaul
 

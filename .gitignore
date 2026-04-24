@@ -23,6 +23,7 @@ backend/node_modules/
 
 # Virtual environments
 venv/
+venvbk/
 
 # OS/editor noise
 .DS_Store

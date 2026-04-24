@@ -36,6 +36,8 @@ DEFAULT_EXTRACTION_MODEL = ""
 DEFAULT_REASONING_MODEL = ""
 DEFAULT_RISK_PROFILE = "moderate"
 VALID_RISK_PROFILES = {"conservative", "moderate", "aggressive", "crazy"}
+DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
+VALID_REMOTE_SNAPSHOT_MODES = {"telegram", "signed_link", "email"}
 MAX_CUSTOM_SYMBOLS = 3
 MAX_CUSTOM_RSS_FEEDS = 3
 MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
@@ -202,6 +204,11 @@ def _normalize_risk_profile(value: Any) -> str:
     return profile if profile in VALID_RISK_PROFILES else DEFAULT_RISK_PROFILE
 
 
+def _normalize_remote_snapshot_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in VALID_REMOTE_SNAPSHOT_MODES else DEFAULT_REMOTE_SNAPSHOT_MODE
+
+
 def _normalize_rss_article_detail_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
     return mode if mode in {"light", "normal", "detailed"} else DEFAULT_RSS_ARTICLE_DETAIL_MODE
@@ -322,9 +329,22 @@ def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
         data_ingestion_interval_seconds=int(row["data_ingestion_interval_seconds"] or 900),
         snapshot_retention_limit=int(row["snapshot_retention_limit"] or DEFAULT_SNAPSHOT_RETENTION_LIMIT),
         web_research_enabled=bool(row["web_research_enabled"]) if "web_research_enabled" in row.keys() else False,
+        allow_extended_hours_trading=bool(row["allow_extended_hours_trading"]) if "allow_extended_hours_trading" in row.keys() else True,
+        remote_snapshot_enabled=bool(row["remote_snapshot_enabled"]) if "remote_snapshot_enabled" in row.keys() else False,
+        remote_snapshot_mode=_normalize_remote_snapshot_mode(row["remote_snapshot_mode"] if "remote_snapshot_mode" in row.keys() else DEFAULT_REMOTE_SNAPSHOT_MODE),
+        remote_snapshot_min_pnl_change_usd=float(row["remote_snapshot_min_pnl_change_usd"] or 5.0) if "remote_snapshot_min_pnl_change_usd" in row.keys() else 5.0,
+        remote_snapshot_heartbeat_minutes=int(row["remote_snapshot_heartbeat_minutes"] or 360) if "remote_snapshot_heartbeat_minutes" in row.keys() else 360,
+        remote_snapshot_interval_minutes=int(row["remote_snapshot_interval_minutes"] or 360) if "remote_snapshot_interval_minutes" in row.keys() else int(row["remote_snapshot_heartbeat_minutes"] or 360) if "remote_snapshot_heartbeat_minutes" in row.keys() else 360,
+        remote_snapshot_send_on_position_change=bool(row["remote_snapshot_send_on_position_change"]) if "remote_snapshot_send_on_position_change" in row.keys() else True,
+        remote_snapshot_include_closed_trades=bool(row["remote_snapshot_include_closed_trades"]) if "remote_snapshot_include_closed_trades" in row.keys() else False,
+        remote_snapshot_max_recommendations=int(row["remote_snapshot_max_recommendations"] or 4) if "remote_snapshot_max_recommendations" in row.keys() else 4,
         last_analysis_started_at=datetime.fromisoformat(row["last_analysis_started_at"]) if row["last_analysis_started_at"] else None,
         last_analysis_completed_at=datetime.fromisoformat(row["last_analysis_completed_at"]) if row["last_analysis_completed_at"] else None,
         last_analysis_request_id=row["last_analysis_request_id"],
+        last_remote_snapshot_sent_at=datetime.fromisoformat(row["last_remote_snapshot_sent_at"]) if ("last_remote_snapshot_sent_at" in row.keys() and row["last_remote_snapshot_sent_at"]) else None,
+        last_remote_snapshot_request_id=row["last_remote_snapshot_request_id"] if "last_remote_snapshot_request_id" in row.keys() else None,
+        last_remote_snapshot_net_pnl=float(row["last_remote_snapshot_net_pnl"]) if ("last_remote_snapshot_net_pnl" in row.keys() and row["last_remote_snapshot_net_pnl"] is not None) else None,
+        last_remote_snapshot_recommendation_fingerprint=row["last_remote_snapshot_recommendation_fingerprint"] if "last_remote_snapshot_recommendation_fingerprint" in row.keys() else None,
     )
     db.add(config)
     db.commit()
@@ -411,6 +431,58 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         if getattr(config, "web_research_enabled", None) is None:
             config.web_research_enabled = False
             changed = True
+        if getattr(config, "allow_extended_hours_trading", None) is None:
+            config.allow_extended_hours_trading = True
+            changed = True
+        if getattr(config, "remote_snapshot_enabled", None) is None:
+            config.remote_snapshot_enabled = False
+            changed = True
+        normalized_remote_snapshot_mode = _normalize_remote_snapshot_mode(
+            getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)
+        )
+        if getattr(config, "remote_snapshot_mode", None) != normalized_remote_snapshot_mode:
+            config.remote_snapshot_mode = normalized_remote_snapshot_mode
+            changed = True
+        try:
+            remote_snapshot_min_pnl_change_usd = float(getattr(config, "remote_snapshot_min_pnl_change_usd", 5.0) or 5.0)
+        except (TypeError, ValueError):
+            remote_snapshot_min_pnl_change_usd = 5.0
+        remote_snapshot_min_pnl_change_usd = round(max(0.0, min(100000.0, remote_snapshot_min_pnl_change_usd)), 2)
+        if getattr(config, "remote_snapshot_min_pnl_change_usd", None) != remote_snapshot_min_pnl_change_usd:
+            config.remote_snapshot_min_pnl_change_usd = remote_snapshot_min_pnl_change_usd
+            changed = True
+        try:
+            remote_snapshot_heartbeat_minutes = int(getattr(config, "remote_snapshot_heartbeat_minutes", 360) or 360)
+        except (TypeError, ValueError):
+            remote_snapshot_heartbeat_minutes = 360
+        remote_snapshot_heartbeat_minutes = max(15, min(7 * 24 * 60, remote_snapshot_heartbeat_minutes))
+        if getattr(config, "remote_snapshot_heartbeat_minutes", None) != remote_snapshot_heartbeat_minutes:
+            config.remote_snapshot_heartbeat_minutes = remote_snapshot_heartbeat_minutes
+            changed = True
+        try:
+            remote_snapshot_interval_minutes = int(
+                getattr(config, "remote_snapshot_interval_minutes", getattr(config, "remote_snapshot_heartbeat_minutes", 360)) or 360
+            )
+        except (TypeError, ValueError):
+            remote_snapshot_interval_minutes = 360
+        remote_snapshot_interval_minutes = max(15, min(7 * 24 * 60, remote_snapshot_interval_minutes))
+        if getattr(config, "remote_snapshot_interval_minutes", None) != remote_snapshot_interval_minutes:
+            config.remote_snapshot_interval_minutes = remote_snapshot_interval_minutes
+            changed = True
+        if getattr(config, "remote_snapshot_send_on_position_change", None) is None:
+            config.remote_snapshot_send_on_position_change = True
+            changed = True
+        if getattr(config, "remote_snapshot_include_closed_trades", None) is None:
+            config.remote_snapshot_include_closed_trades = False
+            changed = True
+        try:
+            remote_snapshot_max_recommendations = int(getattr(config, "remote_snapshot_max_recommendations", 4) or 4)
+        except (TypeError, ValueError):
+            remote_snapshot_max_recommendations = 4
+        remote_snapshot_max_recommendations = max(1, min(12, remote_snapshot_max_recommendations))
+        if getattr(config, "remote_snapshot_max_recommendations", None) != remote_snapshot_max_recommendations:
+            config.remote_snapshot_max_recommendations = remote_snapshot_max_recommendations
+            changed = True
         if changed:
             db.add(config)
             db.commit()
@@ -441,6 +513,15 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         data_ingestion_interval_seconds=900,
         snapshot_retention_limit=DEFAULT_SNAPSHOT_RETENTION_LIMIT,
         web_research_enabled=False,
+        allow_extended_hours_trading=True,
+        remote_snapshot_enabled=False,
+        remote_snapshot_mode=DEFAULT_REMOTE_SNAPSHOT_MODE,
+        remote_snapshot_min_pnl_change_usd=5.0,
+        remote_snapshot_heartbeat_minutes=360,
+        remote_snapshot_interval_minutes=360,
+        remote_snapshot_send_on_position_change=True,
+        remote_snapshot_include_closed_trades=False,
+        remote_snapshot_max_recommendations=4,
     )
     db.add(config)
     db.commit()
@@ -540,6 +621,43 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
     if "web_research_enabled" in payload:
         config.web_research_enabled = bool(payload.get("web_research_enabled"))
+    if "allow_extended_hours_trading" in payload:
+        config.allow_extended_hours_trading = bool(payload.get("allow_extended_hours_trading"))
+    if "remote_snapshot_enabled" in payload:
+        config.remote_snapshot_enabled = bool(payload.get("remote_snapshot_enabled"))
+    if "remote_snapshot_mode" in payload:
+        config.remote_snapshot_mode = _normalize_remote_snapshot_mode(payload.get("remote_snapshot_mode"))
+    if "remote_snapshot_min_pnl_change_usd" in payload:
+        try:
+            value = float(payload.get("remote_snapshot_min_pnl_change_usd"))
+        except (TypeError, ValueError):
+            value = getattr(config, "remote_snapshot_min_pnl_change_usd", 5.0)
+        config.remote_snapshot_min_pnl_change_usd = round(max(0.0, min(100000.0, value)), 2)
+    if "remote_snapshot_heartbeat_minutes" in payload:
+        try:
+            value = int(payload.get("remote_snapshot_heartbeat_minutes"))
+        except (TypeError, ValueError):
+            value = getattr(config, "remote_snapshot_heartbeat_minutes", 360)
+        config.remote_snapshot_heartbeat_minutes = max(15, min(7 * 24 * 60, value))
+    if "remote_snapshot_interval_minutes" in payload:
+        try:
+            value = int(payload.get("remote_snapshot_interval_minutes"))
+        except (TypeError, ValueError):
+            value = getattr(config, "remote_snapshot_interval_minutes", 360)
+        normalized_interval = max(15, min(7 * 24 * 60, value))
+        config.remote_snapshot_interval_minutes = normalized_interval
+        if hasattr(config, "remote_snapshot_heartbeat_minutes"):
+            config.remote_snapshot_heartbeat_minutes = normalized_interval
+    if "remote_snapshot_send_on_position_change" in payload:
+        config.remote_snapshot_send_on_position_change = bool(payload.get("remote_snapshot_send_on_position_change"))
+    if "remote_snapshot_include_closed_trades" in payload:
+        config.remote_snapshot_include_closed_trades = bool(payload.get("remote_snapshot_include_closed_trades"))
+    if "remote_snapshot_max_recommendations" in payload:
+        try:
+            value = int(payload.get("remote_snapshot_max_recommendations"))
+        except (TypeError, ValueError):
+            value = getattr(config, "remote_snapshot_max_recommendations", 4)
+        config.remote_snapshot_max_recommendations = max(1, min(12, value))
     if "paper_trade_amount" in payload:
         config.paper_trade_amount = _normalize_trading_logic_float(payload.get("paper_trade_amount"), 1.0, 100000.0)
     if "entry_threshold" in payload:
@@ -708,6 +826,13 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
+        "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),
+        "remote_snapshot_enabled": bool(getattr(config, "remote_snapshot_enabled", False)),
+        "remote_snapshot_mode": _normalize_remote_snapshot_mode(getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
+        "remote_snapshot_interval_minutes": max(15, int(getattr(config, "remote_snapshot_interval_minutes", getattr(config, "remote_snapshot_heartbeat_minutes", 360)) or 360)),
+        "remote_snapshot_send_on_position_change": bool(getattr(config, "remote_snapshot_send_on_position_change", True)),
+        "remote_snapshot_include_closed_trades": bool(getattr(config, "remote_snapshot_include_closed_trades", False)),
+        "remote_snapshot_max_recommendations": max(1, int(getattr(config, "remote_snapshot_max_recommendations", 4) or 4)),
         # Trading logic overrides — null means "use JSON default"
         "paper_trade_amount": getattr(config, "paper_trade_amount", None),
         "entry_threshold": getattr(config, "entry_threshold", None),
@@ -727,6 +852,8 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "last_analysis_started_at": config.last_analysis_started_at.isoformat() if config.last_analysis_started_at else None,
         "last_analysis_completed_at": config.last_analysis_completed_at.isoformat() if config.last_analysis_completed_at else None,
         "last_analysis_request_id": config.last_analysis_request_id,
+        "last_remote_snapshot_sent_at": config.last_remote_snapshot_sent_at.isoformat() if getattr(config, "last_remote_snapshot_sent_at", None) else None,
+        "last_remote_snapshot_request_id": getattr(config, "last_remote_snapshot_request_id", None),
         "seconds_until_next_auto_run": seconds_until_next,
         "can_auto_run_now": can_auto_run_now,
         "supported_symbols": build_supported_symbols(custom_symbols),

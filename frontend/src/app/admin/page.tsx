@@ -28,6 +28,13 @@ type AppConfig = {
     reasoning_model: string;
     risk_profile: string;
     web_research_enabled: boolean;
+    allow_extended_hours_trading: boolean;
+    remote_snapshot_enabled: boolean;
+    remote_snapshot_mode: "telegram" | "signed_link" | "email";
+    remote_snapshot_interval_minutes: number;
+    remote_snapshot_send_on_position_change: boolean;
+    remote_snapshot_include_closed_trades: boolean;
+    remote_snapshot_max_recommendations: number;
     paper_trade_amount: number | null;
     entry_threshold: number | null;
     stop_loss_pct: number | null;
@@ -46,6 +53,8 @@ type AppConfig = {
     last_analysis_started_at: string | null;
     last_analysis_completed_at: string | null;
     last_analysis_request_id: string | null;
+    last_remote_snapshot_sent_at: string | null;
+    last_remote_snapshot_request_id: string | null;
     seconds_until_next_auto_run: number;
     can_auto_run_now: boolean;
     supported_symbols: string[];
@@ -83,6 +92,13 @@ const EMPTY_CONFIG: AppConfig = {
     reasoning_model: "",
     risk_profile: "moderate",
     web_research_enabled: false,
+    allow_extended_hours_trading: true,
+    remote_snapshot_enabled: false,
+    remote_snapshot_mode: "telegram",
+    remote_snapshot_interval_minutes: 360,
+    remote_snapshot_send_on_position_change: true,
+    remote_snapshot_include_closed_trades: false,
+    remote_snapshot_max_recommendations: 4,
     paper_trade_amount: null,
     entry_threshold: null,
     stop_loss_pct: null,
@@ -101,6 +117,8 @@ const EMPTY_CONFIG: AppConfig = {
     last_analysis_started_at: null,
     last_analysis_completed_at: null,
     last_analysis_request_id: null,
+    last_remote_snapshot_sent_at: null,
+    last_remote_snapshot_request_id: null,
     seconds_until_next_auto_run: 0,
     can_auto_run_now: true,
     supported_symbols: ["USO", "BITO", "QQQ", "SPY"],
@@ -125,6 +143,16 @@ type UnexecutedTrade = {
     request_id: string;
 };
 
+type RemoteSnapshotSecretsStatus = {
+    available: boolean;
+    configured: boolean;
+    has_bot_token: boolean;
+    has_chat_id: boolean;
+    bot_token_masked: string;
+    chat_id_masked: string;
+    error: string;
+};
+
 function normalizeSymbolInput(value: string) {
     return value.toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 10);
 }
@@ -139,6 +167,38 @@ function normalizeArticleLimit(value: string, fallback: number) {
     return Math.max(1, Math.min(50, Math.round(parsed)));
 }
 
+function normalizeConfigPayload(payload: Partial<AppConfig> | null | undefined): AppConfig {
+    const next = {
+        ...EMPTY_CONFIG,
+        ...(payload ?? {}),
+    } as AppConfig;
+
+    return {
+        ...next,
+        tracked_symbols: Array.isArray(next.tracked_symbols) ? next.tracked_symbols : EMPTY_CONFIG.tracked_symbols,
+        custom_symbols: Array.isArray(next.custom_symbols) ? next.custom_symbols : EMPTY_CONFIG.custom_symbols,
+        default_symbols: Array.isArray(next.default_symbols) ? next.default_symbols : EMPTY_CONFIG.default_symbols,
+        symbol_prompt_overrides: next.symbol_prompt_overrides ?? {},
+        symbol_company_aliases: next.symbol_company_aliases ?? {},
+        logic_defaults: {
+            ...EMPTY_CONFIG.logic_defaults,
+            ...(next.logic_defaults ?? {}),
+        },
+        available_models: Array.isArray(next.available_models) ? next.available_models : [],
+        supported_symbols: Array.isArray(next.supported_symbols) ? next.supported_symbols : EMPTY_CONFIG.supported_symbols,
+        default_rss_feeds: Array.isArray(next.default_rss_feeds) ? next.default_rss_feeds : [],
+        custom_rss_feeds: Array.isArray(next.custom_rss_feeds) ? next.custom_rss_feeds : [],
+        custom_rss_feed_labels: next.custom_rss_feed_labels ?? {},
+        enabled_rss_feeds: Array.isArray(next.enabled_rss_feeds) ? next.enabled_rss_feeds : [],
+        supported_rss_feeds: Array.isArray(next.supported_rss_feeds) ? next.supported_rss_feeds : [],
+        rss_article_limits: {
+            ...EMPTY_CONFIG.rss_article_limits,
+            ...(next.rss_article_limits ?? {}),
+        },
+        notices: Array.isArray(next.notices) ? next.notices : [],
+    };
+}
+
 export default function AdminPage() {
     const router = useRouter();
     const [config, setConfig] = useState<AppConfig>(EMPTY_CONFIG);
@@ -151,6 +211,22 @@ export default function AdminPage() {
     const [showDirtyModal, setShowDirtyModal] = useState(false);
     const [pendingNav, setPendingNav] = useState<string | null>(null);
     const [showResetModal, setShowResetModal] = useState(false);
+    const [showRemoteSnapshotSetupModal, setShowRemoteSnapshotSetupModal] = useState(false);
+    const [remoteSecrets, setRemoteSecrets] = useState<RemoteSnapshotSecretsStatus>({
+        available: false,
+        configured: false,
+        has_bot_token: false,
+        has_chat_id: false,
+        bot_token_masked: "",
+        chat_id_masked: "",
+        error: "",
+    });
+    const [secretForm, setSecretForm] = useState({ bot_token: "", chat_id: "" });
+    const [isSavingSecrets, setIsSavingSecrets] = useState(false);
+    const [secretStatus, setSecretStatus] = useState<string>("");
+    const [showTelegramInstructions, setShowTelegramInstructions] = useState(false);
+    const [isSendingSnapshotNow, setIsSendingSnapshotNow] = useState(false);
+    const [sendSnapshotStatus, setSendSnapshotStatus] = useState<string>("");
     const [resetConfirmText, setResetConfirmText] = useState("");
     const [isResetting, setIsResetting] = useState(false);
     const [resetStatus, setResetStatus] = useState<{ ok: boolean; message: string } | null>(null);
@@ -208,12 +284,17 @@ export default function AdminPage() {
         },
     ];
     const jumpOptions = [
-        { value: "symbols", label: "Symbols" },
-        { value: "rss", label: "RSS Sources" },
-        { value: "prompts", label: "Prompt Overrides" },
-        { value: "executions", label: "Manage Executions" },
-        { value: "models", label: "Model Orchestration" },
-        { value: "system", label: "Scheduling & System" },
+        { value: "overview", label: "Overview", description: "Depth, leverage, and overall runtime posture." },
+        { value: "models", label: "Models", description: "Pipeline mode, research, and Ollama model selection." },
+        { value: "trading-logic", label: "Trading Logic", description: "Session hours, thresholds, and logic overrides." },
+        { value: "symbols", label: "Symbols", description: "Tracked defaults, custom symbols, and aliases." },
+        { value: "rss", label: "RSS Sources", description: "Feed universe and article depth controls." },
+        { value: "prompts", label: "Prompt Overrides", description: "Per-symbol specialist guidance." },
+        { value: "executions", label: "Executions", description: "Manual execution cleanup and review." },
+        { value: "system", label: "System", description: "Scheduling, timezone, and run status." },
+        { value: "remote-snapshot", label: "Remote Snapshot", description: "Outbound delivery, Telegram setup, and manual sends." },
+        { value: "price-history", label: "Price History", description: "Indicator data readiness and pulls." },
+        { value: "danger-zone", label: "Danger Zone", description: "Destructive reset actions." },
     ];
     const riskOptions: Array<{
         key: string;
@@ -282,12 +363,43 @@ export default function AdminPage() {
         } catch { /* silent */ }
     }, []);
 
+    const fetchRemoteSnapshotSecrets = useCallback(async () => {
+        try {
+            const res = await fetch("/api/admin/remote-snapshot-secrets", { cache: "no-store" });
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                setRemoteSecrets((current) => ({
+                    ...current,
+                    available: false,
+                    configured: false,
+                    error: payload?.error || "Failed to load secret status",
+                }));
+                return;
+            }
+            setRemoteSecrets({
+                available: !!payload.available,
+                configured: !!payload.configured,
+                has_bot_token: !!payload.has_bot_token,
+                has_chat_id: !!payload.has_chat_id,
+                bot_token_masked: String(payload.bot_token_masked || ""),
+                chat_id_masked: String(payload.chat_id_masked || ""),
+                error: String(payload.error || ""),
+            });
+        } catch {
+            setRemoteSecrets((current) => ({
+                ...current,
+                available: false,
+                configured: false,
+                error: "Failed to load secret status",
+            }));
+        }
+    }, []);
+
     useEffect(() => {
         const load = async () => {
             const response = await fetch("/api/config", { cache: "no-store" });
             if (!response.ok) return;
-            const nextConfig = await response.json();
-            if (!Array.isArray(nextConfig.available_models)) nextConfig.available_models = [];
+            const nextConfig = normalizeConfigPayload(await response.json());
             setConfig(nextConfig);
             setSavedConfig(nextConfig);
             setTimeZone(nextConfig.display_timezone || "");
@@ -295,7 +407,8 @@ export default function AdminPage() {
         void load();
         void fetchUnexecuted();
         void fetchPriceHistoryStatus();
-    }, [fetchUnexecuted, fetchPriceHistoryStatus]);
+        void fetchRemoteSnapshotSecrets();
+    }, [fetchUnexecuted, fetchPriceHistoryStatus, fetchRemoteSnapshotSecrets]);
 
     useEffect(() => {
         if (!isDirty) return;
@@ -306,6 +419,104 @@ export default function AdminPage() {
         window.addEventListener("beforeunload", handler);
         return () => window.removeEventListener("beforeunload", handler);
     }, [isDirty]);
+
+    const toggleRemoteSnapshotEnabled = (enabled: boolean) => {
+        setConfig((current) => ({ ...current, remote_snapshot_enabled: enabled }));
+        if (enabled) {
+            setSecretStatus("");
+            setShowRemoteSnapshotSetupModal(true);
+        }
+    };
+
+    const saveRemoteSnapshotSecrets = async () => {
+        setIsSavingSecrets(true);
+        setSecretStatus("");
+        try {
+            const response = await fetch("/api/admin/remote-snapshot-secrets", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(secretForm),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setSecretStatus(payload?.error || "Failed to save secrets");
+                return;
+            }
+            setRemoteSecrets({
+                available: !!payload.available,
+                configured: !!payload.configured,
+                has_bot_token: !!payload.has_bot_token,
+                has_chat_id: !!payload.has_chat_id,
+                bot_token_masked: String(payload.bot_token_masked || ""),
+                chat_id_masked: String(payload.chat_id_masked || ""),
+                error: String(payload.error || ""),
+            });
+            setConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
+            setSavedConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
+            setSecretForm({ bot_token: "", chat_id: "" });
+            if (payload?.test_delivery_started) {
+                setSecretStatus("Secrets saved. A test snapshot is being sent now.");
+            } else if (payload?.test_delivery_note) {
+                setSecretStatus(`Secrets saved. ${payload.test_delivery_note}`);
+            } else {
+                setSecretStatus("Secrets saved to OS keychain");
+            }
+        } catch {
+            setSecretStatus("Failed to save secrets");
+        } finally {
+            setIsSavingSecrets(false);
+        }
+    };
+
+    const clearRemoteSnapshotSecrets = async () => {
+        setIsSavingSecrets(true);
+        setSecretStatus("");
+        try {
+            const response = await fetch("/api/admin/remote-snapshot-secrets", {
+                method: "DELETE",
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setSecretStatus(payload?.error || "Failed to clear secrets");
+                return;
+            }
+            setRemoteSecrets({
+                available: !!payload.available,
+                configured: !!payload.configured,
+                has_bot_token: !!payload.has_bot_token,
+                has_chat_id: !!payload.has_chat_id,
+                bot_token_masked: String(payload.bot_token_masked || ""),
+                chat_id_masked: String(payload.chat_id_masked || ""),
+                error: String(payload.error || ""),
+            });
+            setSecretForm({ bot_token: "", chat_id: "" });
+            setSecretStatus("Secrets cleared from OS keychain");
+        } catch {
+            setSecretStatus("Failed to clear secrets");
+        } finally {
+            setIsSavingSecrets(false);
+        }
+    };
+
+    const sendRemoteSnapshotNow = async () => {
+        setIsSendingSnapshotNow(true);
+        setSendSnapshotStatus("");
+        try {
+            const response = await fetch("/api/admin/remote-snapshot-send", {
+                method: "POST",
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setSendSnapshotStatus(payload?.error || "Failed to queue snapshot send");
+                return;
+            }
+            setSendSnapshotStatus(payload?.message || "Remote snapshot send has been queued.");
+        } catch {
+            setSendSnapshotStatus("Failed to queue snapshot send");
+        } finally {
+            setIsSendingSnapshotNow(false);
+        }
+    };
 
     const toggleTrackedSymbol = (symbol: string) => {
         setConfig((current) => {
@@ -509,8 +720,7 @@ export default function AdminPage() {
             if (!response.ok) {
                 throw new Error("Failed to save config");
             }
-            const committed = await response.json();
-            if (!Array.isArray(committed.available_models)) committed.available_models = [];
+            const committed = normalizeConfigPayload(await response.json());
             setConfig(committed);
             setSavedConfig(committed);
             const notices = Array.isArray(committed.notices) ? committed.notices.filter(Boolean) : [];
@@ -574,8 +784,7 @@ export default function AdminPage() {
             // Refresh config timestamps
             const cfgRes = await fetch("/api/config", { cache: "no-store" });
             if (cfgRes.ok) {
-                const nextConfig = await cfgRes.json();
-                if (!Array.isArray(nextConfig.available_models)) nextConfig.available_models = [];
+                const nextConfig = normalizeConfigPayload(await cfgRes.json());
                 setConfig(nextConfig);
                 setSavedConfig(nextConfig);
             }
@@ -684,13 +893,200 @@ export default function AdminPage() {
                     </div>
                 </div>
             )}
-            <div className="max-w-4xl mx-auto space-y-6">
+            {showRemoteSnapshotSetupModal && (
+                <div className="fixed inset-0 z-50 overflow-y-auto bg-black/70 backdrop-blur-sm p-4">
+                    <div className="flex min-h-full items-start justify-center py-4">
+                    <div className="w-full max-w-2xl max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">
+                        <div className="flex items-start justify-between gap-4">
+                            <div>
+                                <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Remote Snapshot Setup</p>
+                                <h2 className="mt-2 text-xl font-semibold text-slate-100">Telegram Bot Setup</h2>
+                                <p className="mt-2 text-sm text-slate-400">
+                                    Remote snapshots send a PNG to a private Telegram chat. You can store the bot token and chat ID
+                                    securely in the OS keychain here, and the backend will read them at send time.
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setShowRemoteSnapshotSetupModal(false)}
+                                className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+                            >
+                                Close
+                            </button>
+                        </div>
+
+                        <div className="mt-5 space-y-4 text-sm text-slate-300">
+                            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-4">
+                                <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                        <p className="font-medium text-slate-100">Secure keychain storage</p>
+                                        <p className="mt-1 text-xs text-slate-500">
+                                            Windows uses Credential Manager. macOS uses Keychain Access.
+                                        </p>
+                                    </div>
+                                    <span className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${
+                                        remoteSecrets.configured ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-800 text-slate-400"
+                                    }`}>
+                                        {remoteSecrets.configured ? "Configured" : "Not configured"}
+                                    </span>
+                                </div>
+
+                                {remoteSecrets.error && (
+                                    <p className="text-xs text-amber-300">{remoteSecrets.error}</p>
+                                )}
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                                    <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                                        <p className="text-slate-500 uppercase tracking-[0.18em]">Saved bot token</p>
+                                        <p className="mt-2 truncate font-mono text-slate-200" title={remoteSecrets.bot_token_masked || "Not saved"}>
+                                            {remoteSecrets.bot_token_masked || "Not saved"}
+                                        </p>
+                                    </div>
+                                    <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                                        <p className="text-slate-500 uppercase tracking-[0.18em]">Saved chat ID</p>
+                                        <p className="mt-2 truncate font-mono text-slate-200" title={remoteSecrets.chat_id_masked || "Not saved"}>
+                                            {remoteSecrets.chat_id_masked || "Not saved"}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 gap-4">
+                                    <label className="block">
+                                        <span className="text-xs text-slate-400">Telegram bot token</span>
+                                        <input
+                                            type="password"
+                                            value={secretForm.bot_token}
+                                            onChange={(e) => setSecretForm((current) => ({ ...current, bot_token: e.target.value }))}
+                                            placeholder="123456789:AAExampleBotTokenFromBotFather"
+                                            className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                        />
+                                    </label>
+                                    <label className="block">
+                                        <span className="text-xs text-slate-400">Telegram chat ID</span>
+                                        <input
+                                            type="password"
+                                            value={secretForm.chat_id}
+                                            onChange={(e) => setSecretForm((current) => ({ ...current, chat_id: e.target.value }))}
+                                            placeholder="123456789"
+                                            className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                        />
+                                    </label>
+                                </div>
+
+                                <div className="flex items-center justify-between gap-3">
+                                    <div className="text-xs text-slate-500">
+                                        Raw secrets are never returned to the UI after save.
+                                    </div>
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={clearRemoteSnapshotSecrets}
+                                            disabled={isSavingSecrets}
+                                            className="rounded-lg border border-red-900/50 px-3 py-2 text-xs text-red-300 hover:bg-red-950/30 disabled:opacity-60"
+                                        >
+                                            Clear Saved Secrets
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={saveRemoteSnapshotSecrets}
+                                            disabled={isSavingSecrets || !secretForm.bot_token.trim() || !secretForm.chat_id.trim()}
+                                            className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                                        >
+                                            {isSavingSecrets ? "Saving..." : "Save To Keychain"}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {secretStatus && (
+                                    <p className={`text-xs ${secretStatus.toLowerCase().includes("failed") ? "text-red-300" : "text-emerald-300"}`}>
+                                        {secretStatus}
+                                    </p>
+                                )}
+                            </div>
+
+                            <div className="rounded-xl border border-blue-900/40 bg-blue-950/20 p-4">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowTelegramInstructions((current) => !current)}
+                                    className="w-full text-left"
+                                >
+                                    <p className="text-sm font-semibold text-sky-300">
+                                        {showTelegramInstructions ? "Hide setup instructions" : "Need instructions? Click here"}
+                                    </p>
+                                    <p className="mt-1 text-xs text-sky-200/80">
+                                        BotFather setup, how to find your chat ID, and the env-var fallback.
+                                    </p>
+                                </button>
+                            </div>
+
+                            {showTelegramInstructions && (
+                                <>
+                                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                                        <p className="font-medium text-slate-100">1. Create the bot and copy the bot token</p>
+                                        <p className="mt-2 text-slate-400">
+                                            In Telegram, open <span className="text-slate-200">@BotFather</span>, send <code>/newbot</code>,
+                                            follow the prompts, and copy the token it returns.
+                                        </p>
+                                        <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs text-slate-200">
+                                            TELEGRAM_BOT_TOKEN=123456789:AAExampleBotTokenFromBotFather
+                                        </div>
+                                    </div>
+
+                                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                                        <p className="font-medium text-slate-100">2. Start a private chat with the bot</p>
+                                        <p className="mt-2 text-slate-400">
+                                            Search for your bot by username in Telegram, open it, and send a simple message like
+                                            <code className="mx-1">hello</code>. That creates a chat record for your account.
+                                        </p>
+                                    </div>
+
+                                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                                        <p className="font-medium text-slate-100">3. Fetch your chat ID</p>
+                                        <p className="mt-2 text-slate-400">
+                                            Open this URL in a browser after replacing the token:
+                                        </p>
+                                        <div className="mt-3 overflow-x-auto rounded-lg border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs text-slate-200">
+                                            https://api.telegram.org/bot&lt;TELEGRAM_BOT_TOKEN&gt;/getUpdates
+                                        </div>
+                                        <p className="mt-3 text-slate-400">
+                                            In the JSON response, find <code>chat</code> then <code>id</code>. For a personal chat it is usually a positive integer.
+                                        </p>
+                                        <div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs text-slate-200">
+                                            TELEGRAM_CHAT_ID=123456789
+                                        </div>
+                                    </div>
+
+                                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                                        <p className="font-medium text-slate-100">4. Save them here or use env vars as a fallback</p>
+                                        <p className="mt-2 text-slate-400">
+                                            Recommended: use <span className="text-slate-200">Save To Keychain</span> above.
+                                            Fallback: set backend env vars manually if you prefer.
+                                        </p>
+                                        <pre className="mt-3 overflow-x-auto rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-200"><code>{`$env:TELEGRAM_BOT_TOKEN = "123456789:AAExampleBotTokenFromBotFather"
+$env:TELEGRAM_CHAT_ID = "123456789"
+python run.py`}</code></pre>
+                                    </div>
+                                </>
+                            )}
+
+                            <div className="rounded-xl border border-amber-900/40 bg-amber-950/20 p-4 text-amber-100">
+                                <p className="font-medium">Security note</p>
+                                <p className="mt-2 text-sm text-amber-200/90">
+                                    Keep the bot token private, use a private chat only, and never place these secrets in frontend code or committed files.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    </div>
+                </div>
+            )}
+            <div className="max-w-7xl mx-auto space-y-6">
                 <div className="flex items-center justify-between gap-4">
                     <div>
                         <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Admin</p>
                         <h1 className="text-3xl font-black mt-2">Runtime Config</h1>
                         <p className="text-sm text-slate-400 mt-2">
-                            Control autorun cadence, tracked symbols, RSS sources, and specialist prompt guidance.
+                            Control models, data sources, execution behavior, and outbound reporting from one place.
                         </p>
                     </div>
                     <button
@@ -702,9 +1098,44 @@ export default function AdminPage() {
                     </button>
                 </div>
 
-                <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
+                <div className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)] lg:items-start">
+                    <aside className="space-y-4 lg:sticky lg:top-8">
+                        <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+                            <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500">Navigate</p>
+                            <nav className="mt-4 space-y-1.5">
+                                {jumpOptions.map((option) => (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        onClick={() => jumpToSection(option.value)}
+                                        className="w-full rounded-xl border border-transparent px-3 py-2.5 text-left transition-colors hover:border-slate-700 hover:bg-slate-800/80"
+                                    >
+                                        <p className="text-sm font-medium text-slate-100">{option.label}</p>
+                                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{option.description}</p>
+                                    </button>
+                                ))}
+                            </nav>
+                        </div>
+
+                        <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 text-xs text-slate-400">
+                            <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Current Posture</p>
+                            <p className="mt-3 font-semibold text-slate-200">
+                                {depthOptions.find((option) => option.key === config.rss_article_detail_mode)?.label ?? "Normal"} depth
+                            </p>
+                            <p className="mt-1 text-slate-500">
+                                {depthOptions.find((option) => option.key === config.rss_article_detail_mode)?.articles}
+                            </p>
+                            <p className="mt-3 text-slate-500">Risk profile</p>
+                            <p className="mt-1 font-semibold text-slate-200 capitalize">{config.risk_profile || "moderate"}</p>
+                            <p className="mt-3 text-slate-500">Tracked symbols</p>
+                            <p className="mt-1 font-semibold text-slate-200">{config.tracked_symbols.length}</p>
+                        </div>
+                    </aside>
+
+                    <div className="space-y-6">
+                        <section id="overview" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-4 items-end">
-                        <label className="block">
+                        <label className="block lg:hidden">
                             <span className="text-xs text-slate-400">Jump to section</span>
                             <select
                                 defaultValue=""
@@ -946,6 +1377,117 @@ export default function AdminPage() {
                     )}
                 </section>
 
+                {/* Trading Logic */}
+                <section id="trading-logic" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-5">
+                    <div>
+                        <h2 className="text-sm font-semibold text-slate-200">Trading Logic</h2>
+                        <p className="text-xs text-slate-500 mt-1">
+                            Override the default trading thresholds. Leave blank to use the system defaults from <code className="text-slate-400">logic_config.json</code>.
+                        </p>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                        <div>
+                            <p className="text-sm font-semibold text-slate-200">Extended-hours trading</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                                Pre-market runs from 4:00 AM to 9:30 AM ET. After-hours runs from 4:00 PM to 8:00 PM ET.
+                            </p>
+                            <p className="mt-2 text-xs text-slate-500">
+                                These sessions usually have fewer active participants, which can mean thinner liquidity, wider bid/ask spreads,
+                                more price gaps, and faster moves on relatively small order flow.
+                            </p>
+                        </div>
+                        <label className="flex items-center gap-3 text-sm">
+                            <input
+                                type="checkbox"
+                                checked={config.allow_extended_hours_trading}
+                                onChange={(e) => setConfig((current) => ({ ...current, allow_extended_hours_trading: e.target.checked }))}
+                            />
+                            Allow pre-market and after-hours paper trading
+                        </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Paper Trade Amount ($)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Dollar size of each simulated trade. Default: ${config.logic_defaults.paper_trade_amount}</p>
+                            <input
+                                type="number"
+                                min={1} max={100000} step={1}
+                                value={config.paper_trade_amount ?? ""}
+                                placeholder={String(config.logic_defaults.paper_trade_amount)}
+                                onChange={(e) => setConfig((c) => ({ ...c, paper_trade_amount: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Entry Threshold (directional score)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum directional score needed to open a trade (0.05–1.0). Default: {config.logic_defaults.entry_threshold}</p>
+                            <input
+                                type="number"
+                                min={0.05} max={1.0} step={0.01}
+                                value={config.entry_threshold ?? ""}
+                                placeholder={String(config.logic_defaults.entry_threshold)}
+                                onChange={(e) => setConfig((c) => ({ ...c, entry_threshold: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Stop Loss (%)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Max loss before closing a position. Default: {config.logic_defaults.stop_loss_pct}%</p>
+                            <input
+                                type="number"
+                                min={0.1} max={50} step={0.1}
+                                value={config.stop_loss_pct ?? ""}
+                                placeholder={String(config.logic_defaults.stop_loss_pct)}
+                                onChange={(e) => setConfig((c) => ({ ...c, stop_loss_pct: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Take Profit (%)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Target gain before closing a position. Default: {config.logic_defaults.take_profit_pct}%</p>
+                            <input
+                                type="number"
+                                min={0.1} max={100} step={0.1}
+                                value={config.take_profit_pct ?? ""}
+                                placeholder={String(config.logic_defaults.take_profit_pct)}
+                                onChange={(e) => setConfig((c) => ({ ...c, take_profit_pct: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Materiality Gate — Min New Articles</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">How many new articles are needed to justify a thesis flip. Default: {config.logic_defaults.materiality_min_posts_delta}</p>
+                            <input
+                                type="number"
+                                min={1} max={100} step={1}
+                                value={config.materiality_min_posts_delta ?? ""}
+                                placeholder={String(config.logic_defaults.materiality_min_posts_delta)}
+                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_posts_delta: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Materiality Gate — Min Sentiment Delta</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum change in sentiment score to justify a thesis flip (0.01–1.0). Default: {config.logic_defaults.materiality_min_sentiment_delta}</p>
+                            <input
+                                type="number"
+                                min={0.01} max={1.0} step={0.01}
+                                value={config.materiality_min_sentiment_delta ?? ""}
+                                placeholder={String(config.logic_defaults.materiality_min_sentiment_delta)}
+                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_sentiment_delta: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+                    </div>
+                </section>
+
                 <section id="symbols" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <h2 className="text-sm font-semibold text-slate-200">Symbols</h2>
 
@@ -1147,17 +1689,17 @@ export default function AdminPage() {
                     </div>
                 </section>
 
-                {unexecutedTrades.length > 0 && (
-                    <section id="executions" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
-                        <div>
-                            <h2 className="text-sm font-semibold text-slate-200">Manage Executions</h2>
-                            <p className="text-xs text-slate-500 mt-1">
-                                Remove an execution record if it was entered by mistake. The trade recommendation will remain but revert to unexecuted.
-                            </p>
-                        </div>
-                        {deleteError && (
-                            <p className="text-xs text-red-400">{deleteError}</p>
-                        )}
+                <section id="executions" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
+                    <div>
+                        <h2 className="text-sm font-semibold text-slate-200">Manage Executions</h2>
+                        <p className="text-xs text-slate-500 mt-1">
+                            Remove an execution record if it was entered by mistake. The trade recommendation will remain but revert to unexecuted.
+                        </p>
+                    </div>
+                    {deleteError && (
+                        <p className="text-xs text-red-400">{deleteError}</p>
+                    )}
+                    {unexecutedTrades.length > 0 ? (
                         <div className="space-y-2">
                             {unexecutedTrades.map((trade) => (
                                 <div
@@ -1186,8 +1728,12 @@ export default function AdminPage() {
                                 </div>
                             ))}
                         </div>
-                    </section>
-                )}
+                    ) : (
+                        <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-5 text-sm text-slate-500">
+                            No execution records are available to manage right now.
+                        </div>
+                    )}
+                </section>
 
                 <section id="system" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <h2 className="text-sm font-semibold text-slate-200">Scheduling & System</h2>
@@ -1270,93 +1816,131 @@ export default function AdminPage() {
                     </div>
                 </section>
 
-                {/* Trading Logic */}
-                <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-5">
-                    <div>
-                        <h2 className="text-sm font-semibold text-slate-200">Trading Logic</h2>
-                        <p className="text-xs text-slate-500 mt-1">
-                            Override the default trading thresholds. Leave blank to use the system defaults from <code className="text-slate-400">logic_config.json</code>.
-                        </p>
+                <section id="remote-snapshot" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
+                    <div className="flex items-start justify-between gap-4">
+                        <div>
+                            <h2 className="text-sm font-semibold text-slate-200">Remote Snapshot Delivery</h2>
+                            <p className="mt-1 text-xs text-slate-500">
+                                Generates a PNG summary after qualifying runs and sends it outbound. Secrets stay in the OS keychain or backend env vars.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={sendRemoteSnapshotNow}
+                            disabled={isSendingSnapshotNow}
+                            className="rounded-lg border border-blue-700 px-3 py-2 text-xs font-semibold text-blue-200 hover:bg-blue-950/30 disabled:opacity-50"
+                        >
+                            {isSendingSnapshotNow ? "Queueing..." : "Send Snapshot Now"}
+                        </button>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    {sendSnapshotStatus && (
+                        <p className={`text-xs ${sendSnapshotStatus.toLowerCase().includes("failed") || sendSnapshotStatus.toLowerCase().includes("no completed") ? "text-amber-300" : "text-emerald-300"}`}>
+                            {sendSnapshotStatus}
+                        </p>
+                    )}
+
+                    <label className="flex items-center gap-3 text-sm">
+                        <input
+                            type="checkbox"
+                            checked={config.remote_snapshot_enabled}
+                            onChange={(e) => toggleRemoteSnapshotEnabled(e.target.checked)}
+                        />
+                        Enable remote snapshot delivery
+                    </label>
+
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm">
+                        <div>
+                            <p className="text-slate-200">Telegram bot setup</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                                Stored in your OS keychain, not in the repo or frontend bundle.
+                            </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <span className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${
+                                remoteSecrets.configured ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-800 text-slate-400"
+                            }`}>
+                                {remoteSecrets.configured ? "Configured" : "Not configured"}
+                            </span>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setSecretStatus("");
+                                    setShowRemoteSnapshotSetupModal(true);
+                                }}
+                                className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
+                            >
+                                Manage Secrets
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <label className="block">
-                            <span className="text-xs text-slate-400">Paper Trade Amount ($)</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">Dollar size of each simulated trade. Default: ${config.logic_defaults.paper_trade_amount}</p>
+                            <span className="text-xs text-slate-400">Delivery mode</span>
+                            <select
+                                value={config.remote_snapshot_mode}
+                                onChange={(e) => setConfig((current) => ({ ...current, remote_snapshot_mode: e.target.value as AppConfig["remote_snapshot_mode"] }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            >
+                                <option value="telegram">Telegram photo</option>
+                                <option value="signed_link">Signed link</option>
+                                <option value="email">Email attachment</option>
+                            </select>
+                        </label>
+
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Max recommendations on image</span>
                             <input
                                 type="number"
-                                min={1} max={100000} step={1}
-                                value={config.paper_trade_amount ?? ""}
-                                placeholder={String(config.logic_defaults.paper_trade_amount)}
-                                onChange={(e) => setConfig((c) => ({ ...c, paper_trade_amount: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                min={1}
+                                max={12}
+                                value={config.remote_snapshot_max_recommendations}
+                                onChange={(e) => setConfig((current) => ({ ...current, remote_snapshot_max_recommendations: Number(e.target.value) || 4 }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2"
                             />
                         </label>
 
                         <label className="block">
-                            <span className="text-xs text-slate-400">Entry Threshold (directional score)</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum directional score needed to open a trade (0.05–1.0). Default: {config.logic_defaults.entry_threshold}</p>
+                            <span className="text-xs text-slate-400">Send every (minutes)</span>
                             <input
                                 type="number"
-                                min={0.05} max={1.0} step={0.01}
-                                value={config.entry_threshold ?? ""}
-                                placeholder={String(config.logic_defaults.entry_threshold)}
-                                onChange={(e) => setConfig((c) => ({ ...c, entry_threshold: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                min={15}
+                                max={10080}
+                                value={config.remote_snapshot_interval_minutes}
+                                onChange={(e) => setConfig((current) => ({ ...current, remote_snapshot_interval_minutes: Number(e.target.value) || 360 }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2"
                             />
                         </label>
+                    </div>
 
-                        <label className="block">
-                            <span className="text-xs text-slate-400">Stop Loss (%)</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">Max loss before closing a position. Default: {config.logic_defaults.stop_loss_pct}%</p>
-                            <input
-                                type="number"
-                                min={0.1} max={50} step={0.1}
-                                value={config.stop_loss_pct ?? ""}
-                                placeholder={String(config.logic_defaults.stop_loss_pct)}
-                                onChange={(e) => setConfig((c) => ({ ...c, stop_loss_pct: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
-                            />
-                        </label>
+                    <label className="flex items-center gap-3 text-sm">
+                        <input
+                            type="checkbox"
+                            checked={config.remote_snapshot_send_on_position_change}
+                            onChange={(e) => setConfig((current) => ({ ...current, remote_snapshot_send_on_position_change: e.target.checked }))}
+                        />
+                        Send when a position changes (open / close / flip)
+                    </label>
 
-                        <label className="block">
-                            <span className="text-xs text-slate-400">Take Profit (%)</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">Target gain before closing a position. Default: {config.logic_defaults.take_profit_pct}%</p>
-                            <input
-                                type="number"
-                                min={0.1} max={100} step={0.1}
-                                value={config.take_profit_pct ?? ""}
-                                placeholder={String(config.logic_defaults.take_profit_pct)}
-                                onChange={(e) => setConfig((c) => ({ ...c, take_profit_pct: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
-                            />
-                        </label>
+                    <label className="flex items-center gap-3 text-sm">
+                        <input
+                            type="checkbox"
+                            checked={config.remote_snapshot_include_closed_trades}
+                            onChange={(e) => setConfig((current) => ({ ...current, remote_snapshot_include_closed_trades: e.target.checked }))}
+                        />
+                        Include recent closed trades on the image
+                    </label>
 
-                        <label className="block">
-                            <span className="text-xs text-slate-400">Materiality Gate — Min New Articles</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">How many new articles are needed to justify a thesis flip. Default: {config.logic_defaults.materiality_min_posts_delta}</p>
-                            <input
-                                type="number"
-                                min={1} max={100} step={1}
-                                value={config.materiality_min_posts_delta ?? ""}
-                                placeholder={String(config.logic_defaults.materiality_min_posts_delta)}
-                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_posts_delta: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
-                            />
-                        </label>
-
-                        <label className="block">
-                            <span className="text-xs text-slate-400">Materiality Gate — Min Sentiment Delta</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">Minimum change in sentiment score to justify a thesis flip (0.01–1.0). Default: {config.logic_defaults.materiality_min_sentiment_delta}</p>
-                            <input
-                                type="number"
-                                min={0.01} max={1.0} step={0.01}
-                                value={config.materiality_min_sentiment_delta ?? ""}
-                                placeholder={String(config.logic_defaults.materiality_min_sentiment_delta)}
-                                onChange={(e) => setConfig((c) => ({ ...c, materiality_min_sentiment_delta: e.target.value === "" ? null : Number(e.target.value) }))}
-                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
-                            />
-                        </label>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+                            <p className="text-xs text-slate-500 uppercase tracking-[0.2em]">Last Snapshot Sent</p>
+                            <p className="mt-2">{config.last_remote_snapshot_sent_at ? formatTs(config.last_remote_snapshot_sent_at, timeZone) : "Never"}</p>
+                        </div>
+                        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+                            <p className="text-xs text-slate-500 uppercase tracking-[0.2em]">Last Snapshot Request</p>
+                            <p className="mt-2 font-mono text-xs text-slate-300">{config.last_remote_snapshot_request_id || "None"}</p>
+                        </div>
                     </div>
                 </section>
 
@@ -1373,7 +1957,7 @@ export default function AdminPage() {
                 </div>
 
                 {/* Price History */}
-                <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
+                <section id="price-history" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
                     <div>
                         <h2 className="text-sm font-semibold text-slate-300">Price History</h2>
                         <p className="text-xs text-slate-500 mt-1">
@@ -1423,7 +2007,7 @@ export default function AdminPage() {
                     </p>
                 </section>
 
-                <section className="rounded-2xl border border-red-900/50 bg-red-950/20 p-5 space-y-4">
+                <section id="danger-zone" className="scroll-mt-24 rounded-2xl border border-red-900/50 bg-red-950/20 p-5 space-y-4">
                     <div>
                         <h2 className="text-sm font-semibold text-red-400">Danger Zone</h2>
                         <p className="text-xs text-slate-500 mt-1">
@@ -1446,6 +2030,8 @@ export default function AdminPage() {
                         </button>
                     </div>
                 </section>
+                    </div>
+                </div>
             </div>
         </main>
     );
