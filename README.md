@@ -58,6 +58,7 @@ Create a venv with Python 3.12, then:
 
 ```powershell
 pip install -r requirements.txt
+playwright install chromium
 # If you need to install the secure OS keychain dependency by itself:
 # pip install keyring
 python run.py
@@ -141,6 +142,7 @@ Create a venv with Python 3.12, then:
 
 ```bash
 python3.12 -m pip install -r requirements.txt
+playwright install chromium
 # If you need to install the secure OS keychain dependency by itself:
 # python3.12 -m pip install keyring
 python3.12 run.py

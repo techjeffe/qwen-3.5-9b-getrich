@@ -21,9 +21,10 @@ from services.data_ingestion.parser import NewsArticle, RSSFeedParser
 from services.sentiment.prompts import expand_proxy_terms_for_matching, normalize_text_for_matching
 
 try:
-    from playwright.async_api import async_playwright
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _playwright_available = True
 except Exception:  # pragma: no cover - optional runtime dependency
-    async_playwright = None
+    _playwright_available = False
 
 logger = logging.getLogger(__name__)
 
@@ -138,34 +139,25 @@ def _fetch_with_requests(url: str, timeout: int = 15) -> str:
 
 
 async def _fetch_with_playwright(url: str, timeout_ms: int = 20000) -> str:
-    if async_playwright is None:
+    if not _playwright_available:
         return ""
 
-    loop = asyncio.get_running_loop()
-    if "Proactor" not in loop.__class__.__name__:
-        logger.warning(
-            "Skipping Playwright article rendering because the active event loop "
-            "does not support subprocess transport on this platform: %s",
-            loop.__class__.__name__,
-        )
-        return ""
+    def _run_sync() -> str:
+        try:
+            with _sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                try:
+                    page = browser.new_page()
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.wait_for_timeout(1200)
+                    return page.content()
+                finally:
+                    browser.close()
+        except Exception as exc:
+            logger.warning("Playwright fetch failed for %s: %s", url, exc)
+            return ""
 
-    try:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                await page.wait_for_timeout(1200)
-                return await page.content()
-            finally:
-                await browser.close()
-    except NotImplementedError:
-        logger.warning(
-            "Playwright browser launch is not supported by the current runtime/event loop; "
-            "falling back to requests + trafilatura extraction."
-        )
-        return ""
+    return await asyncio.to_thread(_run_sync)
 
 
 async def fetch_article_text(url: str, fallback_text: str = "") -> str:
