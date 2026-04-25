@@ -56,8 +56,8 @@ def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
                 ],
             },
             "confirmed": {"type": "boolean"},
-            "bluster_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-            "substance_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+            "bluster_phrases": {"type": "array", "items": {"type": "string"}},
+            "substance_phrases": {"type": "array", "items": {"type": "string"}},
             "exposure_type": {
                 "type": "string",
                 "enum": ["DIRECT", "INDIRECT", "BROAD", "UNRELATED"],
@@ -673,7 +673,55 @@ class SentimentEngine:
                 except json.JSONDecodeError:
                     continue
 
+        # Last resort: the response was token-truncated mid-JSON. Close any open
+        # string, then close unclosed arrays/objects in reverse stack order.
+        for candidate in [raw] + [b.strip() for b in fenced_blocks if b.strip()]:
+            sanitized = SentimentEngine._sanitize_json(candidate)
+            closed = SentimentEngine._close_truncated_json(sanitized)
+            if closed != sanitized:
+                try:
+                    return SentimentEngine._parse_json_with_repair(closed)
+                except Exception:
+                    pass
+
         raise ValueError("No decodable JSON payload found in model response")
+
+    @staticmethod
+    def _close_truncated_json(s: str) -> str:
+        """Best-effort close of a token-truncated JSON string.
+
+        Walks the string tracking open strings, arrays, and objects.  If the
+        string ends inside an open string we close it first, then close any
+        unclosed containers in reverse order.  This lets us parse the partial
+        payload rather than discarding the whole response.
+        """
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in s:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\" and in_string:
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if ch in ("{", "["):
+                    stack.append(ch)
+                elif ch == "}" and stack and stack[-1] == "{":
+                    stack.pop()
+                elif ch == "]" and stack and stack[-1] == "[":
+                    stack.pop()
+
+        suffix = ""
+        if in_string:
+            suffix += '"'
+        for opener in reversed(stack):
+            suffix += "}" if opener == "{" else "]"
+        return s + suffix
 
     async def _call_ollama(
         self,
