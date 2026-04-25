@@ -91,18 +91,18 @@ class SentimentEngine:
     TEMPERATURE = 0.10
     MAX_TOKENS = 1024  # JSON response is ~300-700 tokens; 4096 wasted generation time
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-    
+
+    # Limit concurrent Ollama requests — local GPU processes one at a time, so parallel
+    # requests queue up inside Ollama and each one's HTTP timeout starts ticking from
+    # the moment it's sent, not when GPU work begins. Serializing here means every call
+    # gets immediate GPU attention and its full timeout budget.
+    _ollama_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
+
     # Caching
     _cache: Dict[str, SentimentAnalysisResponse] = {}
     _cache_ttl: int = 300  # 5 minutes
-    
+
     def __init__(self, api_url: Optional[str] = None, model_name: Optional[str] = None):
-        """
-        Initialize sentiment engine.
-        
-        Args:
-            api_url: Ollama API URL (default: localhost:11434)
-        """
         self.api_url = api_url or self.API_URL
         self.model_name = (model_name or self.MODEL_NAME or "").strip()
         self.session = requests.Session()
@@ -551,7 +551,8 @@ class SentimentEngine:
         force_json: bool = False,
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
-        return await asyncio.to_thread(self._call_ollama_sync, prompt, model_override, force_json, max_tokens)
+        async with self._ollama_semaphore:
+            return await asyncio.to_thread(self._call_ollama_sync, prompt, model_override, force_json, max_tokens)
 
     async def _generate_symbol_keywords(
         self,
@@ -740,6 +741,12 @@ class SentimentEngine:
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         model = (model_override or self.model_name or "").strip()
+        effective_max_tokens = max_tokens if max_tokens is not None else self.MAX_TOKENS
+        # Estimate prompt tokens (4 chars ≈ 1 token for English) and size the KV cache
+        # to match. Ollama defaults to the model's full context window (often 32k+),
+        # which wastes VRAM and adds prefill latency even for short prompts.
+        estimated_prompt_tokens = len(prompt) // 4
+        num_ctx = min(8192, estimated_prompt_tokens + effective_max_tokens + 256)
         payload: Dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -747,7 +754,8 @@ class SentimentEngine:
             "think": False,  # Disables Qwen3 thinking mode; response goes to "response" field
             "options": {
                 "temperature": self.TEMPERATURE,
-                "num_predict": max_tokens if max_tokens is not None else self.MAX_TOKENS,
+                "num_predict": effective_max_tokens,
+                "num_ctx": num_ctx,
             },
         }
         if force_json:
