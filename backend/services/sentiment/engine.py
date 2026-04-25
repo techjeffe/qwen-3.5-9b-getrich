@@ -56,8 +56,8 @@ def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
                 ],
             },
             "confirmed": {"type": "boolean"},
-            "bluster_phrases": {"type": "array", "items": {"type": "string"}},
-            "substance_phrases": {"type": "array", "items": {"type": "string"}},
+            "bluster_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+            "substance_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
             "exposure_type": {
                 "type": "string",
                 "enum": ["DIRECT", "INDIRECT", "BROAD", "UNRELATED"],
@@ -175,7 +175,7 @@ class SentimentEngine:
     # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.10
-    MAX_TOKENS = 1536  # 1024 truncated verbose substance_phrases; 4096 caused fast-lane timeouts
+    MAX_TOKENS = 2048  # 1536 still truncated; maxItems:6 on phrase arrays caps output length
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
     # Limit concurrent Ollama requests — local GPU processes one at a time, so parallel
