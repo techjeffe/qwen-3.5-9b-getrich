@@ -175,7 +175,7 @@ class SentimentEngine:
     # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.10
-    MAX_TOKENS = 1024  # JSON response is ~300-700 tokens; 4096 wasted generation time
+    MAX_TOKENS = 1536  # 1024 truncated verbose substance_phrases; 4096 caused fast-lane timeouts
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
     # Limit concurrent Ollama requests — local GPU processes one at a time, so parallel
