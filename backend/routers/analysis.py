@@ -1300,7 +1300,12 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 yield emit(f"Stage 2 financial reasoning with {reasoning_model}...")
             else:
                 yield emit(f"Running sentiment analysis with {active_model} on collected text...")
-            sentiment_results, sentiment_trace = await _analyze_sentiment(
+            # Stage 2 serializes per-symbol Ollama calls behind a semaphore and
+            # can run silent for several minutes. Without periodic output the
+            # SSE pipe trips undici's 5-min body timeout in the Next.js proxy.
+            # Yield an SSE comment (": ...") every 20s — comments are ignored
+            # by the EventSource client but keep the byte stream alive.
+            sentiment_task = asyncio.create_task(_analyze_sentiment(
                 posts,
                 effective_request.symbols,
                 price_context,
@@ -1309,7 +1314,12 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 extraction_model=extraction_model,
                 reasoning_model=reasoning_model,
                 web_context_by_symbol=web_context_by_symbol,
-            )
+            ))
+            while not sentiment_task.done():
+                done, _pending = await asyncio.wait({sentiment_task}, timeout=20)
+                if not done:
+                    yield ": stage2-heartbeat\n\n"
+            sentiment_results, sentiment_trace = sentiment_task.result()
             for sym, s in sentiment_results.items():
                 bluster = s.get('bluster_score', 0)
                 policy = s.get('policy_score', 0)
