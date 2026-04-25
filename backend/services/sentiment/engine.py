@@ -250,6 +250,12 @@ class SentimentEngine:
         exposure_type = str(extraction.get("exposure_type") or "").upper()
         if exposure_type not in {"DIRECT", "INDIRECT", "BROAD", "UNRELATED"}:
             exposure_type = "DIRECT" if relevant else "UNRELATED"
+        # Broad-market ETFs are relevant to any non-UNRELATED macro news by definition.
+        # Qwen often returns relevant:false for SPY/QQQ even when exposure_type is DIRECT/BROAD,
+        # which crushes policy_score and confidence via the irrelevance multiplier.
+        _BROAD_MARKET_ETFS = {"SPY", "QQQ"}
+        if symbol.upper() in _BROAD_MARKET_ETFS and exposure_type != "UNRELATED":
+            relevant = True
         transmission_path = str(extraction.get("transmission_path") or "").strip()
         if not transmission_path:
             transmission_path = str(sym_rel.get("mechanism") or "").strip() or "No credible transmission path."
