@@ -1004,17 +1004,8 @@ class SentimentEngine:
         raw_text = self._strip_thinking(raw_text)
 
         try:
-            json_start = raw_text.find("{")
-            json_end = raw_text.rfind("}") + 1
-
-            if json_start >= 0 and json_end > json_start:
-                json_str = self._sanitize_json(raw_text[json_start:json_end])
-            else:
-                json_str = self._sanitize_json(raw_text)
-
-            data = self._parse_json_with_repair(json_str)
-
-        except json.JSONDecodeError:
+            data = self._extract_json_value(raw_text)
+        except (ValueError, json.JSONDecodeError):
             raise ValueError(
                 f"Model did not return valid JSON. Raw response:\n{raw_text[:500]}"
             )
