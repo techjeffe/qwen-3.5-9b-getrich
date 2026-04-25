@@ -175,6 +175,24 @@ def _normalize_rss_article_limits(data: Any) -> Dict[str, int]:
     return limits
 
 
+def _coerce_int(value: Any, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        coerced = default
+    if min_value is not None:
+        coerced = max(min_value, coerced)
+    if max_value is not None:
+        coerced = min(max_value, coerced)
+    return coerced
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    return bool(value)
+
+
 def _normalize_trading_logic_float(value: Any, min_val: float, max_val: float) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -352,6 +370,19 @@ def get_or_create_app_config(db: Session) -> AppConfig:
     config = db.query(AppConfig).filter(AppConfig.id == 1).first()
     if config:
         changed = False
+        normalized_auto_run_enabled = _coerce_bool(getattr(config, "auto_run_enabled", True), True)
+        if getattr(config, "auto_run_enabled", None) != normalized_auto_run_enabled:
+            config.auto_run_enabled = normalized_auto_run_enabled
+            changed = True
+        normalized_auto_run_interval_minutes = _coerce_int(
+            getattr(config, "auto_run_interval_minutes", 30),
+            30,
+            5,
+            360,
+        )
+        if getattr(config, "auto_run_interval_minutes", None) != normalized_auto_run_interval_minutes:
+            config.auto_run_interval_minutes = normalized_auto_run_interval_minutes
+            changed = True
         custom_symbols = _infer_custom_symbols(
             getattr(config, "tracked_symbols", []),
             getattr(config, "custom_symbols", []),
@@ -364,6 +395,18 @@ def get_or_create_app_config(db: Session) -> AppConfig:
             tracked_symbols = DEFAULT_TRACKED_SYMBOLS.copy()
         if getattr(config, "tracked_symbols", None) != tracked_symbols:
             config.tracked_symbols = tracked_symbols
+            changed = True
+        normalized_max_posts = _coerce_int(getattr(config, "max_posts", 50), 50, 1, 200)
+        if getattr(config, "max_posts", None) != normalized_max_posts:
+            config.max_posts = normalized_max_posts
+            changed = True
+        normalized_include_backtest = _coerce_bool(getattr(config, "include_backtest", True), True)
+        if getattr(config, "include_backtest", None) != normalized_include_backtest:
+            config.include_backtest = normalized_include_backtest
+            changed = True
+        normalized_lookback_days = _coerce_int(getattr(config, "lookback_days", 14), 14, 7, 30)
+        if getattr(config, "lookback_days", None) != normalized_lookback_days:
+            config.lookback_days = normalized_lookback_days
             changed = True
         if config.symbol_prompt_overrides is None:
             config.symbol_prompt_overrides = {}
@@ -420,6 +463,15 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         normalized_rss_article_limits = _normalize_rss_article_limits(getattr(config, "rss_article_limits", {}))
         if getattr(config, "rss_article_limits", None) != normalized_rss_article_limits:
             config.rss_article_limits = normalized_rss_article_limits
+            changed = True
+        normalized_data_ingestion_interval_seconds = _coerce_int(
+            getattr(config, "data_ingestion_interval_seconds", 900),
+            900,
+            60,
+            3600,
+        )
+        if getattr(config, "data_ingestion_interval_seconds", None) != normalized_data_ingestion_interval_seconds:
+            config.data_ingestion_interval_seconds = normalized_data_ingestion_interval_seconds
             changed = True
         if getattr(config, "snapshot_retention_limit", None) is None:
             config.snapshot_retention_limit = DEFAULT_SNAPSHOT_RETENTION_LIMIT
@@ -774,13 +826,41 @@ def release_analysis_lock(db: Session, request_id: str) -> None:
 def config_to_dict(config: AppConfig) -> Dict[str, Any]:
     seconds_until_next = 0
     can_auto_run_now = True
+    auto_run_enabled = _coerce_bool(getattr(config, "auto_run_enabled", True), True)
+    auto_run_interval_minutes = _coerce_int(getattr(config, "auto_run_interval_minutes", 30), 30, 5, 360)
+    max_posts = _coerce_int(getattr(config, "max_posts", 50), 50, 1, 200)
+    lookback_days = _coerce_int(getattr(config, "lookback_days", 14), 14, 7, 30)
+    data_ingestion_interval_seconds = _coerce_int(
+        getattr(config, "data_ingestion_interval_seconds", 900),
+        900,
+        60,
+        3600,
+    )
+    snapshot_retention_limit = _coerce_int(
+        getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+        DEFAULT_SNAPSHOT_RETENTION_LIMIT,
+        1,
+        100,
+    )
+    remote_snapshot_interval_minutes = _coerce_int(
+        getattr(config, "remote_snapshot_interval_minutes", getattr(config, "remote_snapshot_heartbeat_minutes", 360)),
+        360,
+        15,
+        7 * 24 * 60,
+    )
+    remote_snapshot_max_recommendations = _coerce_int(
+        getattr(config, "remote_snapshot_max_recommendations", 4),
+        4,
+        1,
+        12,
+    )
 
-    if config.auto_run_enabled and config.last_analysis_started_at:
-        next_run_at = config.last_analysis_started_at + timedelta(minutes=config.auto_run_interval_minutes)
+    if auto_run_enabled and config.last_analysis_started_at:
+        next_run_at = config.last_analysis_started_at + timedelta(minutes=auto_run_interval_minutes)
         remaining = int((next_run_at - datetime.utcnow()).total_seconds())
         seconds_until_next = max(0, remaining)
         can_auto_run_now = seconds_until_next == 0
-    elif not config.auto_run_enabled:
+    elif not auto_run_enabled:
         can_auto_run_now = False
 
     custom_symbols = _normalize_custom_symbols(getattr(config, "custom_symbols", []))
@@ -793,15 +873,15 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
     enabled_rss_feeds = _normalize_enabled_rss_feeds(getattr(config, "enabled_rss_feeds", []), custom_rss_feeds)
 
     return {
-        "auto_run_enabled": config.auto_run_enabled,
-        "auto_run_interval_minutes": config.auto_run_interval_minutes,
+        "auto_run_enabled": auto_run_enabled,
+        "auto_run_interval_minutes": auto_run_interval_minutes,
         "tracked_symbols": tracked_symbols or DEFAULT_TRACKED_SYMBOLS.copy(),
         "custom_symbols": custom_symbols,
         "default_symbols": DEFAULT_TRACKED_SYMBOLS.copy(),
         "max_custom_symbols": MAX_CUSTOM_SYMBOLS,
-        "max_posts": config.max_posts,
-        "include_backtest": config.include_backtest,
-        "lookback_days": config.lookback_days,
+        "max_posts": max_posts,
+        "include_backtest": _coerce_bool(getattr(config, "include_backtest", True), True),
+        "lookback_days": lookback_days,
         "symbol_prompt_overrides": _normalize_prompt_overrides(
             config.symbol_prompt_overrides,
             build_supported_symbols(custom_symbols),
@@ -822,8 +902,8 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         ),
         "rss_article_limits": _normalize_rss_article_limits(getattr(config, "rss_article_limits", {})),
         "rss_articles_per_feed": resolve_rss_articles_per_feed(config),
-        "data_ingestion_interval_seconds": config.data_ingestion_interval_seconds,
-        "snapshot_retention_limit": getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+        "data_ingestion_interval_seconds": data_ingestion_interval_seconds,
+        "snapshot_retention_limit": snapshot_retention_limit,
         "extraction_model": str(getattr(config, "extraction_model", "") or ""),
         "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
@@ -831,10 +911,10 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),
         "remote_snapshot_enabled": bool(getattr(config, "remote_snapshot_enabled", False)),
         "remote_snapshot_mode": _normalize_remote_snapshot_mode(getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
-        "remote_snapshot_interval_minutes": max(15, int(getattr(config, "remote_snapshot_interval_minutes", getattr(config, "remote_snapshot_heartbeat_minutes", 360)) or 360)),
+        "remote_snapshot_interval_minutes": remote_snapshot_interval_minutes,
         "remote_snapshot_send_on_position_change": bool(getattr(config, "remote_snapshot_send_on_position_change", True)),
         "remote_snapshot_include_closed_trades": bool(getattr(config, "remote_snapshot_include_closed_trades", False)),
-        "remote_snapshot_max_recommendations": max(1, int(getattr(config, "remote_snapshot_max_recommendations", 4) or 4)),
+        "remote_snapshot_max_recommendations": remote_snapshot_max_recommendations,
         # Trading logic overrides — null means "use JSON default"
         "paper_trade_amount": getattr(config, "paper_trade_amount", None),
         "entry_threshold": getattr(config, "entry_threshold", None),
