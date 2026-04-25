@@ -661,28 +661,37 @@ class SentimentEngine:
 
         for candidate in candidates:
             sanitized = SentimentEngine._sanitize_json(candidate)
+            # 1) Try parsing the sanitized candidate as-is.
             try:
                 return SentimentEngine._parse_json_with_repair(sanitized)
             except Exception:
                 pass
 
+            # 2) Try truncation recovery on the outer {/[ before falling back to
+            # greedy inner scanning. Otherwise raw_decode below would happily
+            # return an inner empty array (e.g. "bluster_phrases": []) when the
+            # outer object is truncated, masking the real payload.
+            first = re.search(r"[\{\[]", sanitized)
+            if first:
+                outer = sanitized[first.start():]
+                closed = SentimentEngine._close_truncated_json(outer)
+                if closed != outer:
+                    # Re-sanitize: closing may produce trailing commas like ",]}"
+                    # which _parse_json_with_repair (missing-comma only) can't fix.
+                    closed = SentimentEngine._sanitize_json(closed)
+                    try:
+                        return SentimentEngine._parse_json_with_repair(closed)
+                    except Exception:
+                        pass
+
+            # 3) Fallback: scan for any decodable {/[ in the candidate. Handles
+            # the "prose then valid embedded JSON" case.
             for match in re.finditer(r"[\{\[]", sanitized):
                 try:
                     value, _ = decoder.raw_decode(sanitized[match.start():])
                     return value
                 except json.JSONDecodeError:
                     continue
-
-        # Last resort: the response was token-truncated mid-JSON. Close any open
-        # string, then close unclosed arrays/objects in reverse stack order.
-        for candidate in [raw] + [b.strip() for b in fenced_blocks if b.strip()]:
-            sanitized = SentimentEngine._sanitize_json(candidate)
-            closed = SentimentEngine._close_truncated_json(sanitized)
-            if closed != sanitized:
-                try:
-                    return SentimentEngine._parse_json_with_repair(closed)
-                except Exception:
-                    pass
 
         raise ValueError("No decodable JSON payload found in model response")
 
