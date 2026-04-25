@@ -689,7 +689,7 @@ Definitions:
 - relevant: true only if this news has a plausible direct price mechanism for {symbol}. Unrelated-sector news with no transmission path should be false.
 - direction: "bullish" if the news has a specific, direct positive price mechanism for {symbol} (e.g. supply cut → price rise, rate cut → multiple expansion); "bearish" if it has a specific, direct negative mechanism; "neutral" if the connection is vague, macro-level only, the impact direction is unclear, or the news is not directly relevant to {symbol}. Default to "neutral" — only choose "bullish" or "bearish" when the causal chain from the headline to {symbol}'s price is explicit and direct.
 - mechanism: one sentence on WHY this moves {symbol}'s price. If not relevant write "No direct price mechanism."
-- analyst_writeup: 100-200 words in plain English explaining what is happening and its specific impact on {symbol}.
+- analyst_writeup: 75-120 words in plain English explaining what is happening and its specific impact on {symbol}. Be concise.
 
 Extraction rules:
 - Exact verbatim substrings only — short quoted fragments beat paraphrases. Return [] if no exact phrase is present in the text.

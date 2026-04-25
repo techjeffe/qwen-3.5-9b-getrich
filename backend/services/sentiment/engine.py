@@ -89,7 +89,7 @@ class SentimentEngine:
     # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.10
-    MAX_TOKENS = 4096
+    MAX_TOKENS = 1024  # JSON response is ~300-700 tokens; 4096 wasted generation time
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     
     # Caching
@@ -762,7 +762,7 @@ class SentimentEngine:
             response = self.session.post(
                 self.api_url,
                 json=payload,
-                timeout=300,
+                timeout=180,
             )
             response.raise_for_status()
 
