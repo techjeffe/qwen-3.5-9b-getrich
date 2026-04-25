@@ -8,7 +8,6 @@ import { getBackendApiUrl } from "@/lib/backend-api";
 // heartbeats. Edge runtime has no such timeout and is fine for a pure
 // fetch+pipe proxy that uses no Node-only APIs.
 export const runtime = "edge";
-
 export async function POST(request: NextRequest) {
     const body = await request.json();
     const apiUrl = getBackendApiUrl();
