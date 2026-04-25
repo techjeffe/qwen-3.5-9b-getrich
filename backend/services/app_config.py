@@ -29,6 +29,10 @@ LEGACY_DISABLED_RSS_FEED_URLS = {
 DEFAULT_RSS_FEEDS: List[Dict[str, str]] = [
     {"key": "calculated_risk_rss", "label": "Calculated Risk RSS", "url": "https://feeds.feedburner.com/CalculatedRisk"},
     {"key": "nyt_business", "label": "New York Times Business", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"},
+    {"key": "trump_truth", "label": "Trump Truth", "url": "https://trumpstruth.org/feed"},
+    {"key": "bbc_world", "label": "BBC World", "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
+    {"key": "marketwatch", "label": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"},
+    {"key": "npr_world", "label": "NPR World", "url": "https://feeds.npr.org/1017/rss.xml"},
 ]
 DEFAULT_EXTRACTION_MODEL = ""
 DEFAULT_REASONING_MODEL = ""
@@ -42,6 +46,23 @@ MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
 DEFAULT_ESTIMATED_ANALYSIS_SECONDS = 82
 DEFAULT_SNAPSHOT_RETENTION_LIMIT = 12
 DEFAULT_RSS_FEED_URLS = [feed["url"] for feed in DEFAULT_RSS_FEEDS]
+
+# Snapshots of historical DEFAULT_RSS_FEED_URLS sets. Used to detect existing
+# configs whose enabled_rss_feeds list still matches an older default set
+# exactly — those users have never customized their feed selection and should
+# be migrated forward to the current defaults. Anyone whose saved set differs
+# from every snapshot has made a deliberate choice and is left alone.
+_LEGACY_DEFAULT_RSS_FEED_URL_SETS: List[frozenset] = [
+    frozenset([
+        "https://feeds.feedburner.com/CalculatedRisk",
+        "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    ]),
+    frozenset([
+        "https://feeds.feedburner.com/CalculatedRisk",
+        "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+        "https://www.reutersagency.com/feed/?best-topics=business&post-type=best",
+    ]),
+]
 
 
 def is_valid_symbol(symbol: str) -> bool:
@@ -139,7 +160,14 @@ def _normalize_enabled_rss_feeds(feeds: Any, custom_rss_feeds: List[str]) -> Lis
         url = _normalize_url(feed)
         if url and url in allowed and url not in normalized:
             normalized.append(url)
-    return normalized or DEFAULT_RSS_FEED_URLS.copy()
+    if not normalized:
+        return DEFAULT_RSS_FEED_URLS.copy()
+    # Migrate users who never customized their feed selection: if their saved
+    # set matches any historical default snapshot exactly, top up to the
+    # current defaults so newly-added defaults appear automatically.
+    if frozenset(normalized) in _LEGACY_DEFAULT_RSS_FEED_URL_SETS:
+        return DEFAULT_RSS_FEED_URLS.copy()
+    return normalized
 
 
 def _normalize_prompt_overrides(data: Any, allowed_symbols: List[str]) -> Dict[str, str]:

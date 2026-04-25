@@ -18,6 +18,92 @@ from .prompts import expand_proxy_terms_for_matching, normalize_text_for_matchin
 from config.logic_loader import LOGIC as _L
 
 
+def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
+    """JSON Schema for the Stage 2 single-symbol specialist response.
+
+    Passed to Ollama via the `format` field — Ollama constrains token generation
+    to the schema, so any reasonably-capable model produces compliant output.
+    Mirrors the textual schema in SYMBOL_SPECIALIST_RESPONSE_PROMPT.
+    """
+    return {
+        "type": "object",
+        "required": [
+            "event_type",
+            "confirmed",
+            "bluster_phrases",
+            "substance_phrases",
+            "exposure_type",
+            "symbol_relevance",
+            "source_count",
+            "trading_type",
+            "analyst_writeup",
+            "headline_citations",
+            "supporting_points",
+        ],
+        "properties": {
+            "event_type": {
+                "type": "string",
+                "enum": [
+                    "geopolitical",
+                    "regulatory",
+                    "monetary_policy",
+                    "trade_policy",
+                    "fiscal",
+                    "earnings",
+                    "macro_data",
+                    "sector_news",
+                    "noise",
+                ],
+            },
+            "confirmed": {"type": "boolean"},
+            "bluster_phrases": {"type": "array", "items": {"type": "string"}},
+            "substance_phrases": {"type": "array", "items": {"type": "string"}},
+            "exposure_type": {
+                "type": "string",
+                "enum": ["DIRECT", "INDIRECT", "BROAD", "UNRELATED"],
+            },
+            "symbol_relevance": {
+                "type": "object",
+                "required": [symbol],
+                "properties": {
+                    symbol: {
+                        "type": "object",
+                        "required": ["relevant", "direction", "mechanism"],
+                        "properties": {
+                            "relevant": {"type": "boolean"},
+                            "direction": {
+                                "type": "string",
+                                "enum": ["bullish", "bearish", "neutral"],
+                            },
+                            "mechanism": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "source_count": {"type": "integer"},
+            "trading_type": {
+                "type": "string",
+                "enum": ["SCALP", "SWING", "POSITION", "VOLATILE_EVENT"],
+            },
+            "analyst_writeup": {"type": "string"},
+            "headline_citations": {"type": "array", "items": {"type": "string"}},
+            "supporting_points": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def build_keyword_response_schema() -> Dict[str, Any]:
+    """JSON Schema for Stage 1 keyword generation. Constrains the response to
+    `{"terms": [string, ...]}` regardless of model strength."""
+    return {
+        "type": "object",
+        "required": ["terms"],
+        "properties": {
+            "terms": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
 @dataclass
 class SentimentAnalysisResult:
     """Result of a single sentiment analysis."""
@@ -227,10 +313,55 @@ class SentimentEngine:
                 web_research_context=web_research_context,
             )
 
-        response_data = await self._call_ollama(prompt, model_override=model_override, force_json=True)
+        # Stage 2 specialist calls always target a known symbol — pin Ollama's
+        # output to the specialist schema so weaker models can't return free-form
+        # JSON that bypasses our scoring fields.
+        schema = build_specialist_response_schema(specialist_symbol) if specialist_symbol else None
+        response_data = await self._call_ollama(
+            prompt,
+            model_override=model_override,
+            force_json=True,
+            response_schema=schema,
+        )
         parsed = self._parse_response(response_data, text_source)
         parsed.prompt_used = prompt
         return parsed
+
+    @staticmethod
+    def _normalize_event_type(raw: str) -> str:
+        """Map free-form event_type strings to the canonical enum.
+
+        Weaker models (or older Ollama without structured-output support) often
+        return labels like "Economic Report" or "Fed Decision" instead of the
+        snake_case enum values. Without this normalization, unknown labels fall
+        through to a near-zero default score and the symbol shows 0/0/HOLD.
+        """
+        text = (raw or "").strip().lower().replace("-", " ").replace("_", " ")
+        if not text:
+            return "noise"
+        # Exact-match the canonical enum first (after underscore normalization).
+        canonical = {
+            "geopolitical", "regulatory", "monetary policy", "trade policy",
+            "fiscal", "earnings", "macro data", "sector news", "noise",
+        }
+        if text in canonical:
+            return text.replace(" ", "_")
+        # Keyword routing for free-form variants.
+        routes = [
+            (("monetary", "fed", "rate", "fomc", "central bank"), "monetary_policy"),
+            (("tariff", "trade war", "trade policy", "import", "export"), "trade_policy"),
+            (("fiscal", "stimulus", "tax", "spending", "budget"), "fiscal"),
+            (("earning", "revenue", "guidance", "eps"), "earnings"),
+            (("macro", "cpi", "ppi", "jobs", "employment", "gdp", "inflation",
+              "payroll", "unemployment", "economic", "consumer"), "macro_data"),
+            (("regulator", "sec ", "antitrust", "compliance", "ban"), "regulatory"),
+            (("geopol", "war", "sanction", "military", "conflict"), "geopolitical"),
+            (("sector", "industry"), "sector_news"),
+        ]
+        for keywords, target in routes:
+            if any(k in text for k in keywords):
+                return target
+        return "noise"
 
     @staticmethod
     def compute_symbol_scores(extraction: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -238,7 +369,7 @@ class SentimentEngine:
         Derive calibrated scores from LLM-extracted facts.
         All numerical outputs come from this function — the LLM never outputs raw floats.
         """
-        event_type = str(extraction.get("event_type") or "noise").lower()
+        event_type = SentimentEngine._normalize_event_type(str(extraction.get("event_type") or ""))
         confirmed = bool(extraction.get("confirmed", False))
         bluster_phrases = extraction.get("bluster_phrases") or []
         substance_phrases = extraction.get("substance_phrases") or []
@@ -550,9 +681,17 @@ class SentimentEngine:
         model_override: Optional[str] = None,
         force_json: bool = False,
         max_tokens: Optional[int] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         async with self._ollama_semaphore:
-            return await asyncio.to_thread(self._call_ollama_sync, prompt, model_override, force_json, max_tokens)
+            return await asyncio.to_thread(
+                self._call_ollama_sync,
+                prompt,
+                model_override,
+                force_json,
+                max_tokens,
+                response_schema,
+            )
 
     async def _generate_symbol_keywords(
         self,
@@ -597,7 +736,11 @@ class SentimentEngine:
         try:
             prompt = format_keyword_generation_prompt(sym)
             raw = await self._call_ollama(
-                prompt, model_override=model, force_json=True, max_tokens=512
+                prompt,
+                model_override=model,
+                force_json=True,
+                max_tokens=512,
+                response_schema=build_keyword_response_schema(),
             )
             raw_text = self._strip_thinking(raw.get("response", ""))
             data = self._extract_json_value(raw_text)
@@ -739,6 +882,7 @@ class SentimentEngine:
         model_override: Optional[str] = None,
         force_json: bool = False,
         max_tokens: Optional[int] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         model = (model_override or self.model_name or "").strip()
         effective_max_tokens = max_tokens if max_tokens is not None else self.MAX_TOKENS
@@ -758,7 +902,11 @@ class SentimentEngine:
                 "num_ctx": num_ctx,
             },
         }
-        if force_json:
+        # A JSON Schema in `format` constrains generation to the schema (Ollama 0.5+).
+        # Falling back to "json" lets weaker models freelance and break our parser.
+        if response_schema is not None:
+            payload["format"] = response_schema
+        elif force_json:
             payload["format"] = "json"
         # Prevent large models from unloading between batches
         if self._is_large_model(model):
