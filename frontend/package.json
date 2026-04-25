@@ -4,6 +4,8 @@
     "private": true,
     "scripts": {
         "dev": "next dev -p 3000",
+        "dev:webpack": "next dev --webpack -p 3000",
+        "dev:turbo": "next dev -p 3000",
         "build": "next build",
         "start": "next start -p 3000",
         "lint": "next lint"

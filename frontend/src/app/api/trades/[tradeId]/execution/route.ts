@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
+
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
 
 export async function DELETE(
@@ -9,7 +10,7 @@ export async function DELETE(
 ) {
     try {
         const { tradeId } = await context.params;
-        const response = await fetch(`${API_URL}/api/v1/trades/${tradeId}/execution`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/trades/${tradeId}/execution`, {
             method: "DELETE",
             headers: {
                 ...(ADMIN_API_TOKEN ? { "X-Admin-Token": ADMIN_API_TOKEN } : {}),

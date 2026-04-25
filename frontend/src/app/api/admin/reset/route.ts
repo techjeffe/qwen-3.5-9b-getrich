@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
+
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
 
 export async function POST() {
@@ -8,7 +9,7 @@ export async function POST() {
         const headers = new Headers({ "Content-Type": "application/json" });
         if (ADMIN_API_TOKEN) headers.set("X-Admin-Token", ADMIN_API_TOKEN);
 
-        const response = await fetch(`${API_URL}/api/v1/admin/reset-data`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/admin/reset-data`, {
             method: "POST",
             headers,
         });

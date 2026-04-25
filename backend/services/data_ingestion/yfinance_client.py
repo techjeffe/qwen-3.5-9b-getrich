@@ -38,10 +38,10 @@ class PriceClient:
     
     # Supported symbols for the trading system
     SUPPORTED_SYMBOLS = {
-        "SPY", "SPXL", "SPXS",
+        "SPY", "SSO", "SDS", "SPXL", "SPXS",
         "USO", "UCO", "SCO",
         "BITO", "BITU", "SBIT",
-        "QQQ", "TQQQ", "SQQQ",
+        "QQQ", "QLD", "QID", "TQQQ", "SQQQ",
         "UNG",
     }
     MARKET_TZ = ZoneInfo("America/New_York")

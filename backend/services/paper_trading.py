@@ -53,6 +53,18 @@ def _directional_pnl(signal_type: str, entry_price: float, current_price: float,
     return amount * (_directional_return_pct(signal_type, entry_price, current_price) / 100.0)
 
 
+def _resolve_position_market_price(open_pos, quotes_by_symbol: Dict[str, Dict[str, Any]]) -> float:
+    """Price an existing position using its current execution ticker, not an incoming replacement ticker."""
+    if open_pos is None:
+        return 0.0
+    price_data = (
+        quotes_by_symbol.get(str(getattr(open_pos, "execution_ticker", "") or "").upper())
+        or quotes_by_symbol.get(str(getattr(open_pos, "underlying", "") or "").upper())
+        or {}
+    )
+    return float(price_data.get("current_price") or price_data.get("price") or 0.0)
+
+
 def market_status(allow_extended_hours: bool = True) -> Dict[str, Any]:
     """Return current market session for display and gate-keeping."""
     now_et = datetime.now(_MARKET_TZ)
@@ -279,17 +291,19 @@ def process_signals(
         # ── Trailing stop check (before signal processing) ────────────────────
         _prev_signal_type = open_pos.signal_type if open_pos else None
         _trailing_stop_hit = False
-        if open_pos and open_pos.trailing_stop_price is not None and entry_price > 0:
+        existing_pos_price = _resolve_position_market_price(open_pos, quotes_by_symbol)
+
+        if open_pos and open_pos.trailing_stop_price is not None and existing_pos_price > 0:
             stop_px = float(open_pos.trailing_stop_price or 0)
             if stop_px > 0:
                 _trailing_stop_hit = (
-                    (open_pos.signal_type == "LONG" and entry_price <= stop_px) or
-                    (open_pos.signal_type == "SHORT" and entry_price >= stop_px)
+                    (open_pos.signal_type == "LONG" and existing_pos_price <= stop_px) or
+                    (open_pos.signal_type == "SHORT" and existing_pos_price >= stop_px)
                 )
             if _trailing_stop_hit:
-                _close_position(open_pos, entry_price, now, db, reason="trailing_stop_hit")
+                _close_position(open_pos, existing_pos_price, now, db, reason="trailing_stop_hit")
                 action_summary["closed_pnl"] = open_pos.realized_pnl
-                action_summary["exit_price"] = entry_price
+                action_summary["exit_price"] = existing_pos_price
                 open_pos = None
                 # If new signal is HOLD or same direction, stay flat this run
                 if signal_type == "HOLD" or signal_type == _prev_signal_type:
@@ -385,12 +399,13 @@ def process_signals(
             and not _cv.get("flip_overrides_window", True)
             and _window_active(open_pos, now)
         )
-        if open_pos and entry_price > 0 and not window_blocks_close:
+        if open_pos and existing_pos_price > 0 and not window_blocks_close:
             _close_position(
-                open_pos, entry_price, now, db,
+                open_pos, existing_pos_price, now, db,
                 reason="direction_flip" if is_direction_flip else "ticker_leverage_change",
             )
             action_summary["closed_pnl"] = open_pos.realized_pnl
+            action_summary["exit_price"] = existing_pos_price
         elif window_blocks_close:
             action_summary["action"] = "held"
             action_summary["reason"] = "conviction_window_blocks_flip"
@@ -616,6 +631,13 @@ def get_summary(db) -> Dict[str, Any]:
 
     total_deployed = sum(float(t.amount or _L["paper_trade_amount"]) for t in trades)
     total_pnl = realized_pnl + open_pnl
+    configured_trade_amount = float(_L["paper_trade_amount"])
+    try:
+        from services.app_config import get_or_create_app_config
+        config = get_or_create_app_config(db)
+        configured_trade_amount = float(getattr(config, "paper_trade_amount", None) or configured_trade_amount)
+    except Exception:
+        pass
 
     # Equity curve: cumulative realized P&L per closed trade
     equity_curve = []
@@ -658,6 +680,7 @@ def get_summary(db) -> Dict[str, Any]:
 
     return {
         "market": market_status(_allow_extended_hours_trading(db)),
+        "paper_trade_amount": round(configured_trade_amount, 2),
         "summary": {
             "total_trades": len(trades),
             "open_positions": len(open_positions),

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
 
 export async function POST(request: NextRequest) {
     try {
@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
         if (extractionModel) backendPayload.extraction_model = extractionModel;
         if (reasoningModel) backendPayload.reasoning_model = reasoningModel;
 
-        const response = await fetch(`${API_URL}/api/v1/analysis-snapshots/${encodeURIComponent(requestId)}/rerun`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/analysis-snapshots/${encodeURIComponent(requestId)}/rerun`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(backendPayload),

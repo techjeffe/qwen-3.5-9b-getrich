@@ -89,6 +89,9 @@ def expand_proxy_terms_for_matching(terms: list[str]) -> list[str]:
 
     return sorted(expanded)
 
+# NOTE: STAGE1_EXTRACTION_PROMPT is legacy — the main pipeline uses pure keyword
+# matching in extract_relevant_articles() and never calls the LLM with this prompt.
+# Kept for reference and the debug/prompt-preview endpoint only.
 STAGE1_EXTRACTION_PROMPT = """TASK: Classify each numbered headline for relevance to tracked financial instruments.
 
 OUTPUT FORMAT: Return a single JSON object with one key "classifications" whose value is an array — one entry per headline index.
@@ -102,11 +105,12 @@ Rules:
 - Only mark relevant=false for headlines that are clearly unrelated (sports, celebrity, local weather, entertainment).
 - For tickers marked INFER: use your knowledge of that company or asset's sector and news drivers as proxy terms.
 - Every headline index from 0 to N-1 MUST appear in the output array.
+- exposure_hint: "DIRECT" if the article explicitly discusses the asset or its primary driver; "INDIRECT" if the connection is through a sector or second-order channel; "BROAD" if only via general macro/market sentiment spillover; "UNRELATED" if no credible connection exists.
 
 Required output format:
 {{"classifications": [
-  {{"index": 0, "relevant": true, "tickers": ["USO"], "proxy_terms": ["crude oil", "OPEC"]}},
-  {{"index": 1, "relevant": false, "tickers": [], "proxy_terms": []}}
+  {{"index": 0, "relevant": true, "tickers": ["USO"], "proxy_terms": ["crude oil", "OPEC"], "exposure_hint": "DIRECT"}},
+  {{"index": 1, "relevant": false, "tickers": [], "proxy_terms": [], "exposure_hint": "UNRELATED"}}
 ]}}
 
 Headlines to classify:
@@ -173,18 +177,30 @@ def format_keyword_generation_prompt(symbol: str) -> str:
     return SYMBOL_KEYWORD_GENERATION_PROMPT.format(symbol=symbol)
 
 
-def format_stage2_proxy_appendix(symbol: str, proxy_terms: list[str]) -> str:
+def format_stage2_proxy_appendix(symbol: str, proxy_terms: list[str], exposure_hint: str = "") -> str:
     """Return the proxy-context block to inject into Stage 2 specialist prompts."""
     if not proxy_terms:
         return ""
-    return STAGE2_PROXY_CONTEXT.format(
+    block = STAGE2_PROXY_CONTEXT.format(
         symbol=symbol,
         proxy_terms=", ".join(proxy_terms),
     )
+    if exposure_hint:
+        block += (
+            f"\nStage 1 estimated exposure quality for {symbol}: {exposure_hint}."
+            f" Calibrate your exposure_type and confidence accordingly."
+        )
+    return block
 
 
 RED_TEAM_REVIEW_PROMPT = """You are a Senior Quantitative Risk Manager performing a red-team review of trading signals.
 Challenge the current recommendations — do not default to agreement.
+Challenge SHORT signals as vigorously as LONG signals — for a SHORT, argue why the bearish thesis may already be priced in, the timeline is uncertain, or the symbol may have hedges that limit downside.
+
+OVERRIDE THRESHOLDS — Python enforces these; signals below threshold are silently ignored:
+- To override blue team to HOLD: provide at least 2 specific evidence or risk items.
+- To flip direction entirely (e.g. LONG → SELL): provide at least 3 specific evidence items, more evidence than risks, and no source bias applied.
+- If you cannot meet these thresholds, keep adjusted_signal matching the blue team's signal.
 
 STRICT BREVITY RULES — violating these causes parse failures:
 - summary: 1 sentence, max 20 words
@@ -363,37 +379,11 @@ Return your analysis in this exact JSON format:
   "overall_assessment": string,  // Brief summary of the situation
   "supporting_points": [string],  // 3-6 concrete observations from the text
   "headline_citations": [string],  // 2-5 short source-aware references like "BBC: Iran missile strike confirmed"
-  "analyst_writeup": string,  // 120-220 words, plain English, explicitly explain WHY the signal is LONG/SHORT/HOLD using concrete items from the text
-  "symbol_impacts": {{
-    "USO": {{
-      "market_bluster": float,
-      "policy_change": float,
-      "confidence": float,
-      "reasoning": string
-    }},
-    "BITO": {{
-      "market_bluster": float,
-      "policy_change": float,
-      "confidence": float,
-      "reasoning": string
-    }},
-    "QQQ": {{
-      "market_bluster": float,
-      "policy_change": float,
-      "confidence": float,
-      "reasoning": string
-    }},
-    "SPY": {{
-      "market_bluster": float,
-      "policy_change": float,
-      "confidence": float,
-      "reasoning": string
-    }}
-  }}
+  "analyst_writeup": string  // 120-220 words, plain English, explicitly explain WHY the signal is LONG/SHORT/HOLD using concrete items from the text
 }}
 
 Signal generation rules:
-- SHORT signal: Strong bluster (bluster_score < -0.5) with no substantive policy -> take SHORT on most symbols
+- SHORT signal: Strong bluster (bluster_score < -0.65) with no substantive policy -> take SHORT on most symbols
 - LONG signal: Significant substantive policy change (policy_score > 0.7) that positively impacts the target sector
   * Oil/energy policy news positive for energy -> LONG USO
   * Crypto-friendly regulation or announcement -> LONG BITO
@@ -412,15 +402,6 @@ Write the analyst_writeup so it is useful to share with another person:
 - say what is driving the signal decision
 - do not use vague filler like "aggregated across all analyzed sources"
 - if the text contains conflicting items, say that explicitly
-
-For symbol_impacts:
-- USO should reflect oil / energy / Middle East supply sensitivity (highly affected by geopolitical risk, sanctions, military action)
-- BITO should reflect crypto risk appetite, liquidity, regulation, and macro fear (affected by crypto regulation, inflation, USD strength, regulatory crackdowns)
-- QQQ should reflect large-cap tech / growth sensitivity to rates, war risk, risk appetite, and tech-specific regulation
-- SPY should reflect broader equity / macro sensitivity to economic policy, war risk, and systemic risk
-- CRITICAL: Do not copy the same reasoning into all four symbols - analyze the specific transmission mechanism for each
-- Consider directional impact: "crypto_regulation" typically hurts BITO near-term but QQQ may benefit if it reduces regulatory uncertainty
-- Military/geopolitical risk: typically helps USO (energy) and hurts QQQ/SPY (growth stocks), neutral to BITO unless tied to specific sanctions on crypto
 
 Conviction level guidance (to reduce trading churn):
 - LOW conviction (1-2 hour expected hold): Breaking news with immediate headline impact but no fundamental change. Reactive bluster. Positions likely to reverse quickly.
@@ -555,34 +536,25 @@ For symbol_impacts:
 - Consider directional impact: "crypto_regulation" typically hurts BITO near-term but QQQ may benefit if it reduces regulatory uncertainty
 - Military/geopolitical risk: typically helps USO (energy) and hurts QQQ/SPY (growth stocks), neutral to BITO unless tied to specific sanctions on crypto
 
-SCORING CALIBRATION — READ CAREFULLY:
-- Every symbol must receive DIFFERENT scores that reflect this specific news event's unique impact on that symbol's price drivers
-- Do NOT output the same bluster_score and policy_score across multiple symbols — this is a sign of lazy analysis
-- Avoid round numbers (0.5, 0.8, 0.3, 0.9) — use precise values like 0.43, 0.71, 0.28 that reflect actual reasoning
-- Confidence should reflect genuine uncertainty: most analyses should be 0.55-0.78, NOT 0.90
-- If news has weak signal-to-noise for a symbol, policy_score should be near 0.1-0.2 and confidence 0.45-0.60
-- Only use confidence > 0.85 if there is direct, confirmed, actionable news for that exact symbol
+STRICT DIFFERENTIATION PROTOCOL:
+- CROSS-SYMBOL COMPARISON: A geopolitical event cannot have the same impact on a commodity (USO) as it does on a tech index (QQQ). 
+- If USO Policy Score is > 0.60, QQQ Policy Score MUST be adjusted to reflect its secondary status (usually lower and opposite direction).
+- CONFIDENCE JITTER: If the news is unconfirmed (confirmed: false), your confidence MUST be below 0.50. If confirmed, it MUST be above 0.70. 
+- Never output 0.74, 0.58, or 0.15 unless you can point to three distinct 'substance_phrases' justifying that exact level of precision.
 """
 
 
-SYMBOL_SPECIALIST_APPENDIX = """
+SYMBOL_SPECIALIST_LEAN_HEADER = """You are a financial news analyst performing fact extraction for {symbol} on {date}.
 
-You are acting as a DEDICATED {symbol} SPECIALIST for this run.
-This is a SINGLE-SYMBOL analysis. You are NOT analyzing a basket of symbols.
+Your only job: read the news below, then fill in the JSON schema.
+Python computes all scores from your extracted facts. Do NOT invent numbers.
 
-Specialist mandate:
+{symbol} price: ${active_symbol_price}{source_count_block}{validation_block}{web_block}
+
+Specialist focus — what drives {symbol}:
 {specialist_focus}
+{proxy_block}"""
 
-CRITICAL RULES FOR THIS ANALYSIS:
-- You are ONLY analyzing for {symbol}, not for any other symbol
-- Evaluate the headline specifically through the lens of how it affects {symbol}
-- If this news would have different impacts on different symbols, explain WHY and focus on the {symbol} impact
-- The signal (LONG/SHORT/HOLD) must reflect YOUR specialist view for {symbol}
-- Do NOT try to evaluate USO, BITO, QQQ, SPY simultaneously
-- Do NOT include a symbol_impacts dictionary - this is a single-symbol specialist run
-
-Your response should be a SINGLE analysis for {symbol} ONLY:
-"""
 
 
 # ============================================================================
@@ -635,6 +607,13 @@ Focus on large-cap tech, growth, and rate-sensitive factors. Key factors:
 - Geopolitical risk to supply chains (semiconductors, China exposure)
 - Valuation multiple compression from rate changes
 
+Exposure type guidance for QQQ:
+QQQ is a rate-sensitive growth index. Macro policy is a FIRST-ORDER driver, not spillover.
+- DIRECT: Federal Reserve rate decisions and forward guidance; tariffs or trade restrictions affecting tech hardware, semiconductors, or China market access; AI/cloud/antitrust regulation; broad risk-off or risk-on events that compress or expand growth multiples. Mark relevant: true for these even when "QQQ" is not named in the text.
+- INDIRECT: general commodity moves or EM currency events without a tech/rate transmission channel
+- BROAD: highly localized geopolitical events with no tech supply chain or interest rate implications
+- UNRELATED: sports, celebrity, weather, purely local politics with no market mechanism
+
 Validation guidance:
 - Prefer the US 10-Year TIPS real yield as the primary hard macro check for valuation pressure
 - Use FRED DFII10 as the default real-yield source because it is consistently pullable and updated frequently
@@ -651,6 +630,12 @@ Focus on broad market macro drivers and risk sentiment. Key factors:
 - Geopolitical risks (war, sanctions, trade war)
 - Credit spreads and systemic financial stress
 - Risk-on/risk-off market rotation
+
+Exposure type guidance for SPY:
+SPY IS the broad market. Macro policy is not spillover for SPY — it IS the primary driver.
+- DIRECT: Federal Reserve decisions and forward guidance; tariffs and trade war escalation; fiscal stimulus or austerity; economic data releases (GDP, CPI, jobs, PMI); geopolitical risk affecting broad equity sentiment; credit market stress or systemic risk events. Mark relevant: true and exposure_type: DIRECT for all meaningful macro events even when "SPY" or "S&P" is not named in the text.
+- INDIRECT: sector-specific shocks with potential systemic spillover (major bank failure, oil supply shock driving recession fears)
+- UNRELATED: hyper-local events, sports, celebrity, or news with no demonstrated path to broad equity pricing
 
 Validation guidance:
 - Prefer high-yield credit spreads as the primary systemic-risk confirmation signal
@@ -671,10 +656,11 @@ Do NOT invent numbers — identify observable facts and phrases present in the t
 
 Return ONLY this JSON — nothing else:
 {{
-  "event_type": "geopolitical" | "regulatory" | "monetary_policy" | "fiscal" | "earnings" | "macro_data" | "sector_news" | "noise",
+  "event_type": "geopolitical" | "regulatory" | "monetary_policy" | "trade_policy" | "fiscal" | "earnings" | "macro_data" | "sector_news" | "noise",
   "confirmed": boolean,
   "bluster_phrases": [string],
   "substance_phrases": [string],
+  "exposure_type": "DIRECT" | "INDIRECT" | "BROAD" | "UNRELATED",
   "symbol_relevance": {{
     "{symbol}": {{
       "relevant": boolean,
@@ -683,23 +669,31 @@ Return ONLY this JSON — nothing else:
     }}
   }},
   "source_count": integer,
-  "urgency": "LOW" | "MEDIUM" | "HIGH",
-  "conviction": "LOW" | "MEDIUM" | "HIGH",
   "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT",
-  "holding_period_hours": integer,
   "analyst_writeup": string,
   "headline_citations": [string],
   "supporting_points": [string]
 }}
 
 Definitions:
+- event_type: use "trade_policy" for tariffs, import/export restrictions, trade agreements, trade war escalation, sanctions tied to trade. Use "geopolitical" only for military action, territorial conflict, or political instability without a direct trade/commodity mechanism. Use "monetary_policy" for central bank rate decisions, QE/QT, or forward guidance.
 - confirmed: true only if this is a completed, official action (signed, enacted, imposed, executed). Threats, warnings, negotiations, and speculation are false.
-- bluster_phrases: rhetorical/speculative phrases found in the text such as "threatens to", "could possibly", "warns that", "may consider". List actual phrases from the text, up to 6.
-- substance_phrases: concrete action/fact phrases found in the text such as "enacted sanctions", "signed executive order", "raised rates 25bps", "confirmed production cut". List actual phrases, up to 6.
-- source_count: how many distinct news outlets appear in the text; estimate 2 if unclear.
+- bluster_phrases: purely rhetorical or speculative phrases found in the text — language that exaggerates, predicts, or emotes without official commitment, such as "promises to obliterate", "vows to completely destroy", "will change everything", "could be massive", "believes markets will explode", "destined to". Standard hedge language from authorized officials ("warns that", "signals", "suggests") is NOT bluster. These MUST be exact substrings taken from the provided text, not paraphrases or guessed examples. If no such phrase appears verbatim, return [].
+- substance_phrases: concrete action/fact phrases found in the text such as "enacted sanctions", "signed executive order", "raised rates 25bps", "confirmed production cut", "announced policy", "released data showing", "officially imposed". Press conference statements of official policy commitment count as substance. These MUST be exact substrings taken from the provided text, not paraphrases or guessed examples. If no such phrase appears verbatim, return [].
+- exposure_type:
+  DIRECT = the news directly targets the asset, its core commodity, its regulation, or its primary earnings driver
+  INDIRECT = the asset is meaningfully affected through a sector or second-order channel
+  BROAD = the asset is only affected through general market sentiment or macro spillover
+  UNRELATED = no credible transmission path for this symbol
+- source_count: copy the article count stated in the prompt header exactly. Do not estimate.
 - relevant: true only if this news has a plausible direct price mechanism for {symbol}. Unrelated-sector news with no transmission path should be false.
+- direction: "bullish" if the news has a specific, direct positive price mechanism for {symbol} (e.g. supply cut → price rise, rate cut → multiple expansion); "bearish" if it has a specific, direct negative mechanism; "neutral" if the connection is vague, macro-level only, the impact direction is unclear, or the news is not directly relevant to {symbol}. Default to "neutral" — only choose "bullish" or "bearish" when the causal chain from the headline to {symbol}'s price is explicit and direct.
 - mechanism: one sentence on WHY this moves {symbol}'s price. If not relevant write "No direct price mechanism."
 - analyst_writeup: 100-200 words in plain English explaining what is happening and its specific impact on {symbol}.
+
+Extraction rules:
+- Exact verbatim substrings only — short quoted fragments beat paraphrases. Return [] if no exact phrase is present in the text.
+- Score {symbol} specifically. Use the "Exposure type guidance" in the Specialist focus above to determine what counts as DIRECT for this symbol — broad market indexes (SPY, QQQ) treat macro policy as DIRECT; commodity and thematic ETFs (USO, BITO) require news about their specific underlying.
 """
 
 
@@ -776,41 +770,43 @@ def format_symbol_specialist_context_prompt(
     date: str = "",
     active_symbol: str = "",
     active_symbol_price: float = 0.0,
+    validation_context: str = "",
+    web_research_context: str = "",
+    proxy_context: str = "",
+    source_count: int = 0,
+    # Legacy kwargs accepted but ignored to avoid call-site breakage
     uso_price: float = 0.0,
     bito_price: float = 0.0,
     qqq_price: float = 0.0,
     spy_price: float = 0.0,
     recent_sentiment: str = "",
-    validation_context: str = "",
-    web_research_context: str = "",
 ) -> str:
-    """Format the context-aware prompt with symbol-specialist guidance.
-    
-    If specialist_focus is not provided, it will be auto-loaded from SYMBOL_SPECIALIST_FOCUS.
+    """Build a lean, single-symbol specialist prompt.
+
+    Uses only the target symbol's price and focused specialist mandate —
+    no cross-symbol signal rules or basket-analysis instructions.
     """
-    # Auto-load specialist focus if not provided
     if not specialist_focus:
         specialist_focus = SYMBOL_SPECIALIST_FOCUS.get(
             symbol.upper(),
-            f"Analyze this news specifically for {symbol} trading signals."
+            f"Analyze this news specifically for {symbol} trading signals.",
         )
-    
-    base = format_context_aware_prompt(
-        text=text,
-        date=date,
-        active_symbol=active_symbol or symbol,
-        active_symbol_price=active_symbol_price,
-        uso_price=uso_price,
-        bito_price=bito_price,
-        qqq_price=qqq_price,
-        spy_price=spy_price,
-        recent_sentiment=recent_sentiment,
-        validation_context=validation_context,
-        web_research_context=web_research_context,
-    )
-    appendix = SYMBOL_SPECIALIST_APPENDIX.format(
+
+    validation_block = f"\nValidation: {validation_context}" if validation_context else ""
+    web_block = f"\n\nWeb research context:\n{web_research_context}" if web_research_context else ""
+    proxy_block = f"\nProxy-term context:\n{proxy_context}\n" if proxy_context else ""
+    source_count_block = f" | {source_count} articles" if source_count > 0 else ""
+
+    header = SYMBOL_SPECIALIST_LEAN_HEADER.format(
         symbol=symbol,
-        specialist_focus=specialist_focus,
+        date=date or "today",
+        active_symbol_price=active_symbol_price,
+        source_count_block=source_count_block,
+        validation_block=validation_block,
+        web_block=web_block,
+        specialist_focus=specialist_focus.strip(),
+        proxy_block=proxy_block,
     )
-    specialist_schema = SYMBOL_SPECIALIST_RESPONSE_PROMPT.format(symbol=symbol)
-    return f"{base}\n{appendix}\n{specialist_schema}"
+    schema = SYMBOL_SPECIALIST_RESPONSE_PROMPT.format(symbol=symbol)
+    news_block = f"\nNews to analyze:\n{text}\n\nNow fill in the JSON schema above."
+    return f"{header}\n{schema}{news_block}"

@@ -41,12 +41,28 @@
   },
 
   "sentiment_scoring": {
-    "unconfirmed_bluster_penalty": 0.35,
+    "unconfirmed_bluster_penalty": 0.15,
+    "bluster_phrase_weight": 1.25,
+    "substance_phrase_weight": 1.0,
+    "mixed_signal_bluster_floor": -0.15,
     "irrelevance_policy_multiplier": 0.18,
-    "unconfirmed_policy_multiplier": 0.48,
+    "unconfirmed_policy_multiplier": 0.65,
+    "exposure_policy_caps": {
+      "DIRECT": 1.0,
+      "INDIRECT": 0.65,
+      "BROAD": 0.4,
+      "UNRELATED": 0.2
+    },
+    "exposure_confidence_caps": {
+      "DIRECT": 0.91,
+      "INDIRECT": 0.78,
+      "BROAD": 0.62,
+      "UNRELATED": 0.5
+    },
     "event_base_scores": {
       "monetary_policy": 0.82,
       "regulatory":      0.74,
+      "trade_policy":    0.72,
       "fiscal":          0.68,
       "geopolitical":    0.58,
       "macro_data":      0.52,
@@ -61,7 +77,7 @@
     "confidence_unconfirmed_penalty": 0.08,
     "confidence_min": 0.28,
     "confidence_max": 0.91,
-    "bluster_short_threshold": -0.35,
+    "bluster_short_threshold": -0.60,
     "policy_signal_threshold": 0.40,
     "bluster_detection_threshold": -0.20,
     "policy_change_threshold": 0.40,

@@ -196,28 +196,21 @@ class SentimentEngine:
         date = datetime.utcnow().strftime("%Y-%m-%d")
         active_symbol = specialist_symbol or str(context_data.get("active_symbol", "") or "")
         active_symbol_price = context_data.get("active_symbol_price", 0.0)
-        uso_price = context_data.get("uso_price", 0.0)
-        bito_price = context_data.get("bito_price", 0.0)
-        qqq_price = context_data.get("qqq_price", 0.0)
-        spy_price = context_data.get("spy_price", 0.0)
-        recent_sentiment = context_data.get("recent_sentiment", "")
         validation_context = context_data.get("validation_context", "")
+        source_count = int(context_data.get("source_count", 0))
 
         if specialist_symbol:
+            # Lean single-symbol prompt — no cross-symbol rules or basket instructions
             prompt = format_symbol_specialist_context_prompt(
                 symbol=specialist_symbol,
                 specialist_focus=specialist_focus,
                 text=text,
                 date=date,
-                active_symbol=active_symbol,
                 active_symbol_price=active_symbol_price,
-                uso_price=uso_price,
-                bito_price=bito_price,
-                qqq_price=qqq_price,
-                spy_price=spy_price,
-                recent_sentiment=recent_sentiment,
                 validation_context=validation_context,
                 web_research_context=web_research_context,
+                proxy_context=proxy_context,
+                source_count=source_count,
             )
         else:
             prompt = format_context_aware_prompt(
@@ -225,18 +218,14 @@ class SentimentEngine:
                 date=date,
                 active_symbol=active_symbol,
                 active_symbol_price=active_symbol_price,
-                uso_price=uso_price,
-                bito_price=bito_price,
-                qqq_price=qqq_price,
-                spy_price=spy_price,
-                recent_sentiment=recent_sentiment,
+                uso_price=context_data.get("uso_price", 0.0),
+                bito_price=context_data.get("bito_price", 0.0),
+                qqq_price=context_data.get("qqq_price", 0.0),
+                spy_price=context_data.get("spy_price", 0.0),
+                recent_sentiment=context_data.get("recent_sentiment", ""),
                 validation_context=validation_context,
                 web_research_context=web_research_context,
             )
-
-        # Inject Stage 1 proxy context before the closing response schema
-        if proxy_context:
-            prompt = proxy_context + "\n\n" + prompt
 
         response_data = await self._call_ollama(prompt, model_override=model_override, force_json=True)
         parsed = self._parse_response(response_data, text_source)
@@ -258,14 +247,29 @@ class SentimentEngine:
         sym_rel = (extraction.get("symbol_relevance") or {}).get(symbol, {})
         relevant = bool(sym_rel.get("relevant", False))
         direction = str(sym_rel.get("direction") or "neutral").lower()
+        exposure_type = str(extraction.get("exposure_type") or "").upper()
+        if exposure_type not in {"DIRECT", "INDIRECT", "BROAD", "UNRELATED"}:
+            exposure_type = "DIRECT" if relevant else "UNRELATED"
+        transmission_path = str(extraction.get("transmission_path") or "").strip()
+        if not transmission_path:
+            transmission_path = str(sym_rel.get("mechanism") or "").strip() or "No credible transmission path."
 
         _ss = _L["sentiment_scoring"]
 
         # ── Bluster score: −1 (pure rhetoric) → +1 (pure substance) ──────────
         n_sub = len(substance_phrases)
         n_blu = len(bluster_phrases)
-        total = n_sub + n_blu
-        raw_bluster = (n_sub - n_blu) / total if total else 0.0
+        bluster_weight = float(_ss.get("bluster_phrase_weight", 1.25))
+        substance_weight = float(_ss.get("substance_phrase_weight", 1.0))
+        mixed_floor = float(_ss.get("mixed_signal_bluster_floor", -0.15))
+        weighted_sub = n_sub * substance_weight
+        weighted_blu = n_blu * bluster_weight
+        total = weighted_sub + weighted_blu
+        raw_bluster = (weighted_sub - weighted_blu) / total if total else 0.0
+        # If the text contains both rhetoric and substance, keep a modest negative bluster
+        # score instead of collapsing to perfect neutrality.
+        if n_blu > 0 and n_sub > 0:
+            raw_bluster = min(raw_bluster, mixed_floor)
         if not confirmed:
             raw_bluster = max(-1.0, raw_bluster - _ss["unconfirmed_bluster_penalty"])
         bluster_score = round(max(-1.0, min(1.0, raw_bluster)), 3)
@@ -276,6 +280,8 @@ class SentimentEngine:
         policy_score = base_policy * (1.0 if confirmed else _ss["unconfirmed_policy_multiplier"])
         if not relevant:
             policy_score *= _ss["irrelevance_policy_multiplier"]
+        policy_cap = float((_ss.get("exposure_policy_caps") or {}).get(exposure_type, 1.0))
+        policy_score = min(policy_score, policy_cap)
         policy_score = round(max(0.0, min(1.0, policy_score)), 3)
 
         # ── Confidence: grows with source diversity and drops if irrelevant ───
@@ -284,10 +290,14 @@ class SentimentEngine:
             base_conf -= _ss["confidence_irrelevance_penalty"]
         if not confirmed:
             base_conf -= _ss["confidence_unconfirmed_penalty"]
+        confidence_cap = float((_ss.get("exposure_confidence_caps") or {}).get(exposure_type, _ss["confidence_max"]))
+        base_conf = min(base_conf, confidence_cap)
         confidence = round(max(_ss["confidence_min"], min(_ss["confidence_max"], base_conf)), 3)
 
         # ── Signal type: rule-based from scores and direction ─────────────────
         _min_mag = _ss["directional_score_min_magnitude"]
+        # bluster_short_threshold is intentionally more negative than the old -0.35
+        # to require stronger bluster before auto-triggering SHORT without policy backing
         if bluster_score < _ss["bluster_short_threshold"] and policy_score < _ss["policy_signal_threshold"]:
             signal_type = "SHORT"
         elif policy_score >= _ss["policy_signal_threshold"] and relevant:
@@ -304,7 +314,10 @@ class SentimentEngine:
         if signal_type == "LONG":
             directional_score = round(min(1.0, max(_min_mag, policy_score)), 3)
         elif signal_type == "SHORT":
-            directional_score = round(max(-1.0, min(-_min_mag, -(max(abs(bluster_score), policy_score)))), 3)
+            # Weighted blend: policy evidence (60%) + bluster magnitude (40%)
+            # Prevents pure rhetoric from producing a full-strength SHORT score
+            _short_mag = abs(bluster_score) * 0.4 + policy_score * 0.6
+            directional_score = round(max(-1.0, min(-_min_mag, -_short_mag)), 3)
         else:
             directional_score = 0.0
 
@@ -325,6 +338,8 @@ class SentimentEngine:
             "impact_severity":  impact_severity,
             "is_bluster":       bluster_score < _ss["bluster_detection_threshold"],
             "is_policy_change": policy_score >= _ss["policy_change_threshold"] and relevant,
+            "exposure_type":    exposure_type,
+            "transmission_path": transmission_path,
         }
 
     @staticmethod
@@ -548,13 +563,18 @@ class SentimentEngine:
 
         if sym in TICKER_PROXY_MAP:
             terms = [t.lower() for t in TICKER_PROXY_MAP[sym]]
+            static_prompt = (
+                f"Stage 1 used the built-in static proxy map for {sym}. "
+                "No LLM keyword-generation prompt was sent for this symbol.\n\n"
+                f"Static proxy terms:\n- " + "\n- ".join(TICKER_PROXY_MAP[sym])
+            )
             _keyword_trace_cache[sym] = {
                 "symbol": sym,
                 "mode": "static_map",
                 "model": "",
                 "cache_hit": False,
-                "prompt": "",
-                "raw_response": "",
+                "prompt": static_prompt,
+                "raw_response": "No model response. Stage 1 used built-in proxy terms.",
                 "terms": terms,
                 "error": None,
             }
@@ -659,9 +679,38 @@ class SentimentEngine:
             f" | using {'keyword matches' if keyword_relevant else 'all articles (no keyword hits)'}"
         )
 
+        # Derive per-symbol exposure quality: what fraction of filtered articles
+        # directly matched *this* symbol's own proxy terms (vs being pulled in by
+        # another symbol's terms).  Passed to Stage 2 so specialists can calibrate
+        # their exposure_type and confidence when the match is weak.
+        exposure_hints_by_symbol: Dict[str, str] = {}
+        for sym, terms in proxy_terms_by_symbol.items():
+            if not terms:
+                exposure_hints_by_symbol[sym] = "BROAD"
+                continue
+            sym_expanded = expand_proxy_terms_for_matching(terms)
+            sym_matches = sum(
+                1 for post in filtered
+                if any(
+                    t in normalize_text_for_matching(
+                        f"{getattr(post, 'title', '') or ''} "
+                        f"{getattr(post, 'content', '') or ''}"
+                    )
+                    for t in sym_expanded
+                )
+            )
+            ratio = sym_matches / max(1, len(filtered))
+            if ratio >= 0.5:
+                exposure_hints_by_symbol[sym] = "DIRECT"
+            elif ratio >= 0.15:
+                exposure_hints_by_symbol[sym] = "INDIRECT"
+            else:
+                exposure_hints_by_symbol[sym] = "BROAD"
+
         return {
             "filtered_posts": filtered,
             "proxy_terms_by_symbol": proxy_terms_by_symbol,
+            "exposure_hints_by_symbol": exposure_hints_by_symbol,
             "keyword_generation_trace_by_symbol": {
                 sym: dict(_keyword_trace_cache.get(sym.upper(), {}))
                 for sym in symbols
@@ -787,15 +836,26 @@ class SentimentEngine:
                 "reasoning": (data.get("analyst_writeup") or ""),
                 "policy_indicators": data.get("substance_phrases") or [],
             }
+            _trading_type = str(data.get("trading_type") or "SWING").upper()
+            _exposure_type = computed.get("exposure_type", "DIRECT")
+            _holding_lookup = {"SCALP": 2, "VOLATILE_EVENT": 3, "SWING": 12, "POSITION": 72}
+            _urgency_map = {"SCALP": "HIGH", "VOLATILE_EVENT": "HIGH", "SWING": "MEDIUM", "POSITION": "LOW"}
+            _conviction_map = {"SCALP": "LOW", "VOLATILE_EVENT": "MEDIUM", "SWING": "MEDIUM", "POSITION": "HIGH"}
+            _urgency = _urgency_map.get(_trading_type, "MEDIUM")
+            _conviction = _conviction_map.get(_trading_type, "MEDIUM")
+            if _exposure_type == "UNRELATED":
+                _conviction = "LOW"
+            elif _exposure_type == "BROAD" and _conviction == "HIGH":
+                _conviction = "MEDIUM"
             signal = {
                 "signal_type": computed["signal_type"],
                 "confidence_score": computed["confidence"],
-                "urgency": str(data.get("urgency") or "LOW").upper(),
+                "urgency": _urgency,
                 "entry_symbol": symbol_for_scoring,
                 "reasoning": (data.get("analyst_writeup") or ""),
-                "conviction_level": str(data.get("conviction") or "MEDIUM").upper(),
-                "trading_type": str(data.get("trading_type") or "SWING").upper(),
-                "holding_period_hours": int(data.get("holding_period_hours") or 8),
+                "conviction_level": _conviction,
+                "trading_type": _trading_type,
+                "holding_period_hours": _holding_lookup.get(_trading_type, 12),
             }
             # Inject computed directional_score into data so downstream can read it
             data["_computed_directional_score"] = computed["directional_score"]
@@ -904,7 +964,20 @@ class SentimentEngine:
             parts.append(f"Policy view: {policy_reason}")
 
         fallback = "\n\n".join(part for part in parts if part)
-        return fallback or "The model did not provide a detailed writeup for this signal."
+        if fallback:
+            return fallback
+        try:
+            _bluster_val = abs(float(bluster.get("bluster_score", 0.0)))
+            _policy_val = float(policy.get("policy_score", 0.0))
+        except (TypeError, ValueError):
+            _bluster_val = _policy_val = 0.0
+        if _bluster_val < 0.05 and _policy_val < 0.05 and str(signal.get("signal_type", "HOLD")).upper() == "HOLD":
+            return (
+                "No direct transmission path identified for this symbol in the current news cycle. "
+                "The articles reflect macro or broad market themes but do not have a specific causal "
+                "mechanism that scores above the signal threshold for this instrument. Holding."
+            )
+        return "The model did not provide a detailed writeup for this signal."
 
     @staticmethod
     def _resolve_directional_score(

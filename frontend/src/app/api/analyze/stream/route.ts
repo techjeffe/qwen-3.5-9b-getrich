@@ -1,8 +1,10 @@
 import { NextRequest } from "next/server";
 
+import { getBackendApiUrl } from "@/lib/backend-api";
+
 export async function POST(request: NextRequest) {
     const body = await request.json();
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+    const apiUrl = getBackendApiUrl();
 
     const backendResponse = await fetch(`${apiUrl}/api/v1/analyze/stream`, {
         method: "POST",

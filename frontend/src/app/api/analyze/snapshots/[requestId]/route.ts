@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
 
 export async function GET(
     _request: Request,
@@ -8,7 +8,7 @@ export async function GET(
 ) {
     try {
         const { requestId } = await params;
-        const response = await fetch(`${API_URL}/api/v1/analysis-snapshots/${encodeURIComponent(requestId)}`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/analysis-snapshots/${encodeURIComponent(requestId)}`, {
             cache: "no-store",
         });
         if (!response.ok) {

@@ -2181,15 +2181,15 @@ function TradeExecutionModal({
 
 // Maps leveraged/inverse execution tickers back to the underlying we have live prices for
 const UNDERLYING_PRICE_MAP: Record<string, string> = {
-    TQQQ: "QQQ", SQQQ: "QQQ",
-    SPXL: "SPY", SPXS: "SPY",
+    QLD: "QQQ", QID: "QQQ", TQQQ: "QQQ", SQQQ: "QQQ",
+    SSO: "SPY", SDS: "SPY", SPXL: "SPY", SPXS: "SPY",
     UCO: "USO", SCO: "USO",
     BITU: "BITO", SBIT: "BITO",
 };
 
 const EXECUTION_SYMBOLS_BY_UNDERLYING: Record<string, string[]> = {
-    QQQ: ["QQQ", "TQQQ", "SQQQ"],
-    SPY: ["SPY", "SPXL", "SPXS"],
+    QQQ: ["QQQ", "QLD", "QID", "TQQQ", "SQQQ"],
+    SPY: ["SPY", "SSO", "SDS", "SPXL", "SPXS"],
     USO: ["USO", "UCO", "SCO"],
     BITO: ["BITO", "BITU", "SBIT"],
 };

@@ -10,13 +10,13 @@ from typing import Any, Dict
 INSTRUMENT_SPECS: Dict[str, Dict[str, Any]] = {
     "QQQ": {
         "max_leverage": 3,
-        "bull": {1: "QQQ", 3: "TQQQ"},
-        "bear": {1: "QQQ", 3: "SQQQ"},
+        "bull": {1: "QQQ", 2: "QLD", 3: "TQQQ"},
+        "bear": {1: "QQQ", 2: "QID", 3: "SQQQ"},
     },
     "SPY": {
         "max_leverage": 3,
-        "bull": {1: "SPY", 3: "SPXL"},
-        "bear": {1: "SPY", 3: "SPXS"},
+        "bull": {1: "SPY", 2: "SSO", 3: "SPXL"},
+        "bear": {1: "SPY", 2: "SDS", 3: "SPXS"},
     },
     "USO": {
         "max_leverage": 2,

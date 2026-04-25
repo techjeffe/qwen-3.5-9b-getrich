@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from database.engine import SessionLocal
 from database.models import ScrapedArticle
-from services.app_config import build_enabled_rss_feed_map, get_or_create_app_config
+from services.app_config import build_enabled_rss_feed_labels, build_enabled_rss_feed_map, get_or_create_app_config
 from services.data_ingestion.parser import NewsArticle, RSSFeedParser
 from services.sentiment.prompts import expand_proxy_terms_for_matching, normalize_text_for_matching
 
@@ -277,7 +277,10 @@ async def run_ingestion_cycle(db: Optional[Session] = None) -> Dict[str, Any]:
     try:
         config = get_or_create_app_config(session)
         tracked_symbols = [str(symbol).upper().strip() for symbol in (config.tracked_symbols or []) if str(symbol).strip()]
-        parser = RSSFeedParser(feeds=build_enabled_rss_feed_map(config))
+        parser = RSSFeedParser(
+            feeds=build_enabled_rss_feed_map(config),
+            feed_labels=build_enabled_rss_feed_labels(config),
+        )
         articles = await asyncio.to_thread(parser.parse_feeds)
 
         kept_articles = [article for article in articles if article.link and _matches_stage0_filter(article, tracked_symbols)]

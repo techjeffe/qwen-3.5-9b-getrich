@@ -56,10 +56,16 @@ class RSSFeedParser:
         "market", "stocks", "economy", "recession",
     ]
     
-    def __init__(self, timeout: int = 10, feeds: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        timeout: int = 10,
+        feeds: Optional[Dict[str, str]] = None,
+        feed_labels: Optional[Dict[str, str]] = None,
+    ):
         self.timeout = timeout
         self.session = requests.Session()
         self.feeds = dict(feeds or self.GEOPOLITICAL_FEEDS)
+        self.feed_labels = {str(key): str(value).strip() for key, value in (feed_labels or {}).items() if str(value).strip()}
         
     def parse_feeds(
         self,
@@ -169,7 +175,7 @@ class RSSFeedParser:
         """Get human-readable source name from URL."""
         for name, url in self.feeds.items():
             if url == feed_url:
-                return name.replace("_", " ").title()
+                return self.feed_labels.get(name) or name.replace("_", " ").title()
         host = (urlparse(feed_url).netloc or "unknown").replace("www.", "")
         return host.split(":")[0].title()
     

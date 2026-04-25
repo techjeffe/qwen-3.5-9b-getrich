@@ -53,6 +53,7 @@ from services.sentiment.prompts import (
 )
 from services.backtesting.optimization import RollingWindowOptimizer
 from services.app_config import (
+    build_enabled_rss_feed_labels,
     build_enabled_rss_feed_map,
     get_or_create_app_config,
     mark_analysis_started,
@@ -1192,13 +1193,14 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             }
 
             feed_map = build_enabled_rss_feed_map(config)
-            parser = RSSFeedParser(feeds=feed_map)
+            feed_labels = build_enabled_rss_feed_labels(config)
+            parser = RSSFeedParser(feeds=feed_map, feed_labels=feed_labels)
             num_feeds = max(1, len(parser.feeds))
             per_feed_cap = resolve_rss_articles_per_feed(config)
             max_total_posts = max(effective_request.max_posts, per_feed_cap * num_feeds)
 
             for feed_name in parser.feeds:
-                label = feed_name.replace("_", " ").title()
+                label = feed_labels.get(feed_name) or feed_name.replace("_", " ").title()
                 yield emit(f"Fetching {label}…")
                 try:
                     articles = await asyncio.to_thread(
@@ -1757,11 +1759,13 @@ async def _analyze_sentiment(
     # ── Stage 1: entity extraction (optional) ────────────────────────────────
     stage1_result: Optional[Dict[str, Any]] = None
     keyword_generation_trace_by_symbol: Dict[str, Any] = {}
+    exposure_hints_by_symbol: Dict[str, str] = {}
     if extraction_model and reasoning_model:
         print(f"Two-stage pipeline: extraction={extraction_model} | reasoning={reasoning_model}")
         stage1_result = await engine.extract_relevant_articles(posts, symbols, extraction_model)
         analysis_posts = stage1_result["filtered_posts"]
         proxy_terms_by_symbol = stage1_result["proxy_terms_by_symbol"]
+        exposure_hints_by_symbol = stage1_result.get("exposure_hints_by_symbol", {})
         keyword_generation_trace_by_symbol = stage1_result.get("keyword_generation_trace_by_symbol", {}) or {}
     else:
         analysis_posts = posts
@@ -1771,19 +1775,25 @@ async def _analyze_sentiment(
     aggregated = _build_aggregated_news_context(analysis_posts)
     if not aggregated.strip():
         raise ValueError("No post content available for sentiment analysis")
+    price_context = {**price_context, "source_count": len(analysis_posts)}
 
     # ── Stage 2: per-symbol reasoning ────────────────────────────────────────
     effective_reasoning_model = reasoning_model or model_name
     analyses = await asyncio.gather(*[
         engine.analyze(
-            text=_build_symbol_specific_news_context(analysis_posts, symbol, aggregated),
+            text=_build_symbol_specific_news_context(
+                analysis_posts,
+                symbol,
+                aggregated,
+                proxy_terms_by_symbol.get(symbol, []),
+            ),
             text_source=f"aggregated_{symbol.lower()}",
             include_context=True,
             context_data=_build_symbol_specific_price_context(price_context, symbol),
             specialist_symbol=symbol,
             specialist_focus=_symbol_specialist_focus(symbol, prompt_overrides),
             model_override=effective_reasoning_model,
-            proxy_context=format_stage2_proxy_appendix(symbol, proxy_terms_by_symbol.get(symbol, [])),
+            proxy_context=format_stage2_proxy_appendix(symbol, proxy_terms_by_symbol.get(symbol, []), exposure_hints_by_symbol.get(symbol, "")),
             web_research_context=web_context_by_symbol.get(symbol, ""),
         )
         for symbol in symbols
@@ -1791,6 +1801,9 @@ async def _analyze_sentiment(
     results: Dict[str, Dict[str, Any]] = {}
 
     for symbol, sentiment in zip(symbols, analyses):
+        parsed_payload = getattr(sentiment, "parsed_payload", {}) or {}
+        bluster_phrases = list(parsed_payload.get("bluster_phrases") or [])
+        substance_phrases = list(parsed_payload.get("substance_phrases") or [])
         directional_score = _coerce_score(
             getattr(sentiment, "directional_score", None),
             _derive_directional_score(
@@ -1827,7 +1840,37 @@ async def _analyze_sentiment(
             'reasoning': (sentiment.analyst_writeup or sentiment.reasoning or '').strip(),
             'is_bluster': sentiment.is_bluster,
             'is_policy_change': sentiment.is_policy_change,
-            'impact_severity': sentiment.impact_severity
+            'impact_severity': sentiment.impact_severity,
+            'event_type': str(parsed_payload.get("event_type") or ""),
+            'confirmed': bool(parsed_payload.get("confirmed", False)),
+            'source_count': int(parsed_payload.get("source_count") or 0),
+            'exposure_type': str(
+                parsed_payload.get("exposure_type")
+                or getattr(sentiment, "parsed_payload", {}).get("exposure_type")
+                or ""
+            ).upper(),
+            'transmission_path': str(
+                parsed_payload.get("transmission_path")
+                or getattr(sentiment, "parsed_payload", {}).get("transmission_path")
+                or ""
+            ),
+            'bluster_phrases': bluster_phrases,
+            'substance_phrases': substance_phrases,
+        }
+
+    stage2_runs_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for symbol, sentiment in zip(symbols, analyses):
+        parsed_payload = getattr(sentiment, "parsed_payload", {}) or {}
+        stage2_runs_by_symbol[symbol] = {
+            "model": effective_reasoning_model or "",
+            "prompt": getattr(sentiment, "prompt_used", "") or "",
+            "raw_response": getattr(sentiment, "raw_model_response", "") or "",
+            "parsed_payload": parsed_payload,
+            "bluster_phrases": list(parsed_payload.get("bluster_phrases") or []),
+            "substance_phrases": list(parsed_payload.get("substance_phrases") or []),
+            "final_reasoning": results[symbol]["reasoning"],
+            "signal_type": results[symbol]["signal_type"],
+            "confidence": results[symbol]["confidence"],
         }
 
     trace = {
@@ -1843,18 +1886,7 @@ async def _analyze_sentiment(
             **_build_stage1_trace(posts, analysis_posts, proxy_terms_by_symbol),
             "keyword_generation_trace_by_symbol": keyword_generation_trace_by_symbol,
         },
-        "stage2_runs_by_symbol": {
-            symbol: {
-                "model": effective_reasoning_model or "",
-                "prompt": getattr(sentiment, "prompt_used", "") or "",
-                "raw_response": getattr(sentiment, "raw_model_response", "") or "",
-                "parsed_payload": getattr(sentiment, "parsed_payload", {}) or {},
-                "final_reasoning": results[symbol]["reasoning"],
-                "signal_type": results[symbol]["signal_type"],
-                "confidence": results[symbol]["confidence"],
-            }
-            for symbol, sentiment in zip(symbols, analyses)
-        },
+        "stage2_runs_by_symbol": stage2_runs_by_symbol,
     }
 
     return results, trace
@@ -2155,11 +2187,29 @@ def _build_dataset_snapshot(
     }
 
 
-def _build_symbol_specific_news_context(posts: List[Any], symbol: str, fallback: str) -> str:
+def _build_symbol_specific_news_context(
+    posts: List[Any],
+    symbol: str,
+    fallback: str,
+    proxy_terms: Optional[List[str]] = None,
+) -> str:
     """Prefer symbol-relevant articles so specialists do not all see the same noise."""
-    terms = expand_proxy_terms_for_matching(SYMBOL_RELEVANCE_TERMS.get(symbol.upper(), []))
+    raw_terms = list(proxy_terms or []) or SYMBOL_RELEVANCE_TERMS.get(symbol.upper(), [])
+    terms = expand_proxy_terms_for_matching(raw_terms)
     if not terms:
-        return fallback
+        brief_titles = [
+            str(getattr(post, "title", "") or "").strip()
+            for post in posts[:3]
+            if str(getattr(post, "title", "") or "").strip()
+        ]
+        spillover = "\n".join(f"- {title}" for title in brief_titles)
+        return (
+            f"No symbol-specific matches were found for {symbol}. "
+            f"Do NOT assume DIRECT exposure.\n"
+            f"Treat {symbol} as BROAD or UNRELATED unless the text explicitly names "
+            f"the company, asset, sector, or a clear transmission path.\n"
+            f"Shared macro headlines:\n{spillover}"
+        ).strip()
 
     relevant_posts: List[Any] = []
     for post in posts:
@@ -2175,7 +2225,22 @@ def _build_symbol_specific_news_context(posts: List[Any], symbol: str, fallback:
             relevant_posts.append(post)
 
     relevant_context = _build_aggregated_news_context(relevant_posts)
-    return relevant_context or fallback
+    if relevant_context:
+        return relevant_context
+
+    brief_titles = [
+        str(getattr(post, "title", "") or "").strip()
+        for post in posts[:3]
+        if str(getattr(post, "title", "") or "").strip()
+    ]
+    spillover = "\n".join(f"- {title}" for title in brief_titles)
+    return (
+        f"No article in this batch matched {symbol} proxy terms: "
+        f"{', '.join(raw_terms[:12]) or symbol}.\n"
+        f"Do NOT assume DIRECT exposure for {symbol}. "
+        f"Use BROAD or UNRELATED unless the text shows a specific causal chain.\n"
+        f"Shared macro headlines:\n{spillover}"
+    ).strip()
 
 
 def _build_symbol_specific_price_context(price_context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -2545,6 +2610,18 @@ def _max_atr_pct(symbols: List[str], price_context: Optional[Dict[str, Any]]) ->
     return max(atr_values) if atr_values else 0.0
 
 
+def _symbol_atr_pct(symbol: str, price_context: Optional[Dict[str, Any]]) -> float:
+    """Return ATR percent for a single symbol so leverage caps are applied per instrument."""
+    if not price_context:
+        return 0.0
+    indicators = price_context.get(f"technical_indicators_{str(symbol).lower()}") or {}
+    try:
+        atr_pct = float(indicators.get("atr_14_pct") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return atr_pct if atr_pct > 0 else 0.0
+
+
 def _signals_differ_materially(
     previous_signal: Optional[TradingSignal],
     current_signal: Optional[TradingSignal],
@@ -2568,6 +2645,50 @@ def _signals_differ_materially(
         ):
             return True
     return False
+
+
+def _recommendation_structure_changed_without_thesis_flip(
+    previous_signal: Optional[TradingSignal],
+    current_signal: Optional[TradingSignal],
+) -> bool:
+    """
+    Allow leverage/execution-ticker changes to pass through without the materiality gate.
+
+    The materiality gate is intended to suppress noisy thesis flips, not to pin a symbol at
+    an old execution instrument when the current risk/volatility regime now supports a
+    different leverage tier for the same directional view.
+    """
+    if previous_signal is None or current_signal is None:
+        return False
+
+    if str(previous_signal.signal_type or "HOLD").upper() != str(current_signal.signal_type or "HOLD").upper():
+        return False
+
+    prev_map = _recommendations_by_underlying(previous_signal)
+    cur_map = _recommendations_by_underlying(current_signal)
+    if set(prev_map.keys()) != set(cur_map.keys()):
+        return False
+
+    structure_changed = False
+    for symbol in prev_map:
+        prev = prev_map.get(symbol) or {}
+        cur = cur_map.get(symbol) or {}
+        prev_thesis = str(prev.get("thesis") or "").upper().strip()
+        cur_thesis = str(cur.get("thesis") or "").upper().strip()
+        if not prev_thesis:
+            prev_thesis = "LONG" if str(prev.get("action") or "").upper() == "BUY" else "SHORT"
+        if not cur_thesis:
+            cur_thesis = "LONG" if str(cur.get("action") or "").upper() == "BUY" else "SHORT"
+        if prev_thesis != cur_thesis:
+            return False
+
+        if (
+            str(prev.get("symbol") or "").upper() != str(cur.get("symbol") or "").upper()
+            or str(prev.get("leverage") or "") != str(cur.get("leverage") or "")
+        ):
+            structure_changed = True
+
+    return structure_changed
 
 
 def _count_symbol_articles(posts: List[Any], symbols: List[str]) -> Dict[str, int]:
@@ -2644,6 +2765,8 @@ def _material_change_gate(
     previous_signal = (previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None
     if not _signals_differ_materially(previous_signal, candidate_signal):
         return True
+    if _recommendation_structure_changed_without_thesis_flip(previous_signal, candidate_signal):
+        return True
 
     _mg = _L["materiality_gate"]
     _min_posts = min_posts_delta if min_posts_delta is not None else _mg["min_posts_delta"]
@@ -2711,7 +2834,6 @@ def _generate_trading_signal(
         )
 
     symbols = list(sentiment_results.keys())
-    _signal_atr_pct = _max_atr_pct(symbols, price_context)
     recommendations: List[Dict[str, str]] = []
     urgency_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
     overall_urgency = "LOW"
@@ -2749,7 +2871,12 @@ def _generate_trading_signal(
             urgency = specialist_urgency if specialist_signal == "HOLD" else "LOW"
             hold_recommendations += 1
 
-        leverage = _resolve_leverage(confidence, risk_profile, action=action, atr_pct=_signal_atr_pct)
+        leverage = _resolve_leverage(
+            confidence,
+            risk_profile,
+            action=action,
+            atr_pct=_symbol_atr_pct(sym, price_context),
+        )
         recommendation = None
         if action:
             recommendation = build_execution_recommendation(sym, action, leverage)

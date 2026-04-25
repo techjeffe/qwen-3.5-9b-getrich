@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
+
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
 
 function backendHeaders(init?: HeadersInit): Headers {
@@ -13,7 +14,7 @@ function backendHeaders(init?: HeadersInit): Headers {
 
 export async function GET() {
     try {
-        const response = await fetch(`${API_URL}/api/v1/analysis-debug/latest`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/analysis-debug/latest`, {
             cache: "no-store",
             headers: backendHeaders(),
         });

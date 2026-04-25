@@ -88,6 +88,7 @@ type EquityPoint = {
 
 type TradingData = {
     market: MarketStatus;
+    paper_trade_amount: number;
     summary: Summary;
     open_positions: OpenPosition[];
     closed_trades: ClosedTrade[];
@@ -310,7 +311,9 @@ export default function TradingPage() {
                         <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-400">
                             Paper Trading
                         </h1>
-                        <p className="text-slate-500 text-xs mt-0.5">$100 per signal &middot; auto-executed whenever the market is tradable</p>
+                        <p className="text-slate-500 text-xs mt-0.5">
+                            ${data?.paper_trade_amount?.toFixed(0) ?? "100"} per signal &middot; auto-executed whenever the market is tradable
+                        </p>
                     </div>
                     <div className="flex items-center gap-2">
                         {data?.market && <MarketBadge market={data.market} />}
@@ -516,5 +519,4 @@ export default function TradingPage() {
         </div>
     );
 }
-
 

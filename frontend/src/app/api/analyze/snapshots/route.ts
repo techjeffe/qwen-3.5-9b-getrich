@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { getBackendApiUrl } from "@/lib/backend-api";
 
 export async function GET(request: Request) {
     try {
         const url = new URL(request.url);
         const limit = url.searchParams.get("limit") || "10";
-        const response = await fetch(`${API_URL}/api/v1/analysis-snapshots?limit=${encodeURIComponent(limit)}`, {
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/analysis-snapshots?limit=${encodeURIComponent(limit)}`, {
             cache: "no-store",
         });
         if (!response.ok) {

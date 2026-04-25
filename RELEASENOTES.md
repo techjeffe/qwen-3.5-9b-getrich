@@ -1,9 +1,70 @@
 # Release Notes — April 24, 2026
 
-## Admin UI Reorganization
+## Mac/Turbopack and Config Hardening
 
-- **Trading Logic section moved** — now sits between Model Orchestration and Symbols so trading behavior controls are grouped with the pipeline config they affect, rather than buried after Remote Snapshot
-- **Extended-hours trading toggle moved into Trading Logic** — the "Allow pre-market and after-hours paper trading" checkbox now lives in the Trading Logic section alongside the other simulation controls; the description explains the liquidity/spread characteristics of each session
+This update also folded in the Mac-side PR fixes and merged them with the local sentiment/trading work.
+
+- **Frontend backend URL normalization** — all Next API proxy routes now resolve backend traffic through a shared helper that normalizes loopback URLs to `127.0.0.1:8000` instead of raw `localhost` fallbacks
+- **Turbopack root pinned** — `frontend/next.config.js` now sets `turbopack.root` to the frontend directory so workspace detection is stable across machines, especially on macOS
+- **Explicit dev scripts** — `frontend/package.json` now exposes both `dev:turbo` and `dev:webpack` so Webpack remains an easy fallback when Turbopack exposes local environment issues
+- **Legacy config import made defensive** — `backend/services/app_config.py` now tolerates missing legacy columns during import and clamps/coerces persisted values before normalizing them into the live config row
+- **Boolean parsing fixed** — persisted string booleans like `"false"` and `"0"` are now parsed correctly instead of becoming truthy through Python's default `bool("false")` behavior
+- **Static Stage 1 trace clarified** — built-in symbols such as `SPY`, `QQQ`, `BITO`, and `USO` now show an explicit “static proxy map” explanation in the secret/debug view instead of the misleading “No Stage 1 prompt recorded” message
+
+## Specialist Prompt Architecture Rewrite
+
+The per-symbol specialist prompts were redesigned from the ground up to improve signal quality and reduce token cost.
+
+- **Schema before news text** — the JSON schema and all field definitions now appear before the news text in every specialist prompt, so the model frames its reading with the full output contract first rather than discovering it after already processing the articles
+- **Lean single-symbol header** — replaced the large basket-analysis context prompt with a focused 15-line header containing only the active symbol's price, specialist focus, and proxy-term context
+- **Cross-symbol anchor removed** — all four symbol prices and basket-level signal rules were removed from the specialist path; each specialist now reasons about exactly one symbol with no cross-symbol contamination
+- **proxy_context inline injection** — Stage 1 proxy-term context is now injected at the correct position within the header instead of prepended before system instructions
+- **Exposure quality hint** — Stage 1 now computes a per-symbol exposure quality rating (DIRECT / INDIRECT / BROAD) from the keyword match ratio and injects it into the Stage 2 proxy context so specialists calibrate confidence on weakly-matched articles
+- **~250 tokens saved per specialist call** — across four symbols, approximately 1,000 tokens removed per run with no reduction in extraction fidelity
+
+## Signal Scoring Calibration
+
+Several compounding biases were driving systematic SHORT signals on routine unconfirmed news. All three root causes are now corrected.
+
+- **`unconfirmed_bluster_penalty`** lowered from 0.35 → 0.15: routine RSS articles (which are always technically "unconfirmed") no longer receive a structural negative penalty that pushed balanced articles toward the SHORT bluster path
+- **`unconfirmed_policy_multiplier`** raised from 0.48 → 0.65: geopolitical unconfirmed news now scores 0.38 (near the LONG threshold); monetary policy unconfirmed now scores 0.53 (above the threshold) so partial-confirmation Fed commentary can produce HOLD/LONG instead of auto-SHORT
+- **`bluster_short_threshold`** tightened from -0.35 → -0.60: requires substantially stronger bluster signal before an auto-SHORT triggers without policy backing
+- **SHORT directional score** changed from `max(abs(bluster), policy)` to a weighted blend (40% bluster magnitude, 60% policy score): prevents pure rhetoric with zero policy evidence from producing a full-magnitude SHORT
+- **`trade_policy` event type** added with base score 0.72: tariffs, trade war escalation, and import/export restrictions now have a dedicated bucket instead of splitting between `geopolitical` (0.58, too low) and `fiscal` (semantically wrong)
+
+## Prompt Quality Improvements
+
+- **Bluster phrase examples corrected** — examples now use genuinely rhetorical language ("promises to obliterate", "will change everything", "vows to completely destroy"); official hedge language from policy-makers ("warns that", "signals", "suggests") is explicitly excluded from bluster classification
+- **Substance phrase examples expanded** — added "announced policy", "released data showing", "officially imposed"; clarified that press conference statements of official policy commitment count as substance
+- **Neutral direction calibration** — `direction` field definition now instructs specialists to default to "neutral" unless the causal chain from headline to symbol price is explicit and direct; reduces spurious bearish classifications on loosely-related news
+- **Red team balance** — red team is now explicitly instructed to challenge SHORT signals as vigorously as LONG signals, arguing why a bearish thesis may be priced in, the timeline uncertain, or the symbol hedged
+- **Red team evidence thresholds visible** — minimum evidence counts required to override the blue team signal are now stated in the prompt so the model does not waste reasoning on overrides Python will silently discard (≥2 items for HOLD override; ≥3 for direction flip)
+- **`event_type` disambiguation** — specialist schema now includes explicit classification guidance distinguishing `trade_policy` (tariffs, sanctions tied to trade) from `geopolitical` (military action, territorial conflict) and `monetary_policy` (central bank decisions)
+
+## Prompt Schema Simplification
+
+Fields that Python can compute more reliably than the LLM are now computed in Python.
+
+- **`holding_period_hours` removed** from LLM schema; Python derives from `trading_type` via lookup table (SCALP→2h, VOLATILE_EVENT→3h, SWING→12h, POSITION→72h)
+- **`transmission_path` removed** — duplicate of `mechanism` inside `symbol_relevance`; Python now reads `mechanism` directly
+- **`urgency` and `conviction` removed** from schema; Python derives both from `trading_type` and `exposure_type` (e.g. POSITION+DIRECT → HIGH conviction; BROAD exposure caps at MEDIUM regardless of trade type)
+- **`source_count` injected as Python fact** — actual article count is now stated in the prompt header; LLM copies the number instead of guessing (previously almost always defaulted to 2)
+- **Redundant rule blocks removed** — symbol differentiation rules (150 tokens, fully covered by `exposure_type` definition) and phrase extraction rules (60 tokens, covered by field definitions) replaced with two concise bullets
+- **Dead code removed** — `SYMBOL_SPECIALIST_APPENDIX` deleted; `STAGE1_EXTRACTION_PROMPT` marked as legacy (main pipeline uses keyword matching, not LLM classification)
+- **`COMBINED_ANALYSIS_PROMPT` hardcoding fixed** — removed hardcoded USO/BITO/QQQ/SPY `symbol_impacts` block; fallback path no longer emits fake symbol analysis for custom-symbol runs
+
+## Paper Trading Logic
+
+- **Trail on window expiry** (`trail_on_window_expiry`, default true) — when a conviction holding window expires, the position now transitions to trailing stop mode instead of closing flat; lets profitable positions run while still protecting gains
+- **Re-entry cooldown** (`reentry_cooldown_minutes`, default 120) — blocks same-direction re-entry in the same symbol within the configured window after a close; prevents same-direction churn on choppy signals
+- **Entry threshold raised** (0.30 → 0.42) — higher minimum directional score required before a new paper trade opens; filters out the lowest-conviction noise signals
+
+## Admin UI
+
+- **Trading Logic section repositioned** — now sits between Model Orchestration and Symbols so trading behavior controls are grouped with the pipeline config they affect
+- **Extended-hours toggle moved into Trading Logic** — the "Allow pre-market and after-hours paper trading" checkbox now lives alongside the other simulation controls with session liquidity guidance
+- **Trail on window expiry toggle** added — checkbox with explanation of trailing stop mechanics and when to disable
+- **Re-entry cooldown field** added — configurable minutes with fallback to `logic_config.json` default
 
 ---
 
