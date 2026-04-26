@@ -28,3 +28,6 @@ venvbk/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Private planning docs — not for public repo
+ALPACA_TRADING_PLAN.md
