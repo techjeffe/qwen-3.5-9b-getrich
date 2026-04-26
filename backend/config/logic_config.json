@@ -79,6 +79,7 @@
     "confidence_max": 0.91,
     "bluster_short_threshold": -0.60,
     "policy_signal_threshold": 0.40,
+    "direction_confidence_min": 0.50,
     "bluster_detection_threshold": -0.20,
     "policy_change_threshold": 0.40,
     "directional_score_min_magnitude": 0.15,
