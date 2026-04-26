@@ -145,6 +145,31 @@ const EMPTY_CONFIG: AppConfig = {
     rss_articles_per_feed: 15,
 };
 
+const BASIC_MODE_DEFAULTS: Partial<AppConfig> = {
+    max_posts: 50,
+    lookback_days: 14,
+    data_ingestion_interval_seconds: 900,
+    snapshot_retention_limit: 12,
+    ollama_parallel_slots: 1,
+    red_team_enabled: true,
+    allow_extended_hours_trading: true,
+    hold_overnight: false,
+    trail_on_window_expiry: true,
+    reentry_cooldown_minutes: null,
+    paper_trade_amount: null,
+    entry_threshold: null,
+    stop_loss_pct: null,
+    take_profit_pct: null,
+    materiality_min_posts_delta: null,
+    materiality_min_sentiment_delta: null,
+    remote_snapshot_mode: "telegram",
+    remote_snapshot_interval_minutes: 360,
+    remote_snapshot_send_on_position_change: true,
+    remote_snapshot_include_closed_trades: false,
+    remote_snapshot_max_recommendations: 4,
+    rss_article_limits: { light: 5, normal: 15, detailed: 25 },
+};
+
 type UnexecutedTrade = {
     id: number;
     symbol: string;
@@ -244,6 +269,8 @@ export default function AdminPage() {
     const [resetStatus, setResetStatus] = useState<{ ok: boolean; message: string } | null>(null);
     const [isPulling, setIsPulling] = useState(false);
     const [pullStatus, setPullStatus] = useState<{ ok: boolean; message: string } | null>(null);
+    const [isAdvancedMode, setIsAdvancedMode] = useState(false);
+    const [showBasicModeModal, setShowBasicModeModal] = useState(false);
     const [priceHistoryStatus, setPriceHistoryStatus] = useState<{
         symbols: Record<string, { rows: number; earliest_date: string | null; latest_date: string | null; ready: boolean }>;
         total_rows: number;
@@ -346,6 +373,56 @@ export default function AdminPage() {
         },
     ];
 
+    const hasAdvancedCustomizations = useMemo(() => {
+        const d = BASIC_MODE_DEFAULTS;
+        return (
+            config.max_posts !== d.max_posts ||
+            config.lookback_days !== d.lookback_days ||
+            config.data_ingestion_interval_seconds !== d.data_ingestion_interval_seconds ||
+            config.snapshot_retention_limit !== d.snapshot_retention_limit ||
+            config.ollama_parallel_slots !== d.ollama_parallel_slots ||
+            config.red_team_enabled !== d.red_team_enabled ||
+            config.allow_extended_hours_trading !== d.allow_extended_hours_trading ||
+            config.hold_overnight !== d.hold_overnight ||
+            config.trail_on_window_expiry !== d.trail_on_window_expiry ||
+            config.reentry_cooldown_minutes !== d.reentry_cooldown_minutes ||
+            config.paper_trade_amount !== d.paper_trade_amount ||
+            config.entry_threshold !== d.entry_threshold ||
+            config.stop_loss_pct !== d.stop_loss_pct ||
+            config.take_profit_pct !== d.take_profit_pct ||
+            config.materiality_min_posts_delta !== d.materiality_min_posts_delta ||
+            config.materiality_min_sentiment_delta !== d.materiality_min_sentiment_delta ||
+            config.remote_snapshot_mode !== d.remote_snapshot_mode ||
+            config.remote_snapshot_interval_minutes !== d.remote_snapshot_interval_minutes ||
+            config.remote_snapshot_send_on_position_change !== d.remote_snapshot_send_on_position_change ||
+            config.remote_snapshot_include_closed_trades !== d.remote_snapshot_include_closed_trades ||
+            config.remote_snapshot_max_recommendations !== d.remote_snapshot_max_recommendations ||
+            (config.custom_rss_feeds?.length ?? 0) > 0 ||
+            Object.keys(config.symbol_prompt_overrides ?? {}).length > 0
+        );
+    }, [config]);
+
+    const advancedOnlySections = new Set(["trading-logic", "rss", "prompts", "executions", "price-history"]);
+    const visibleJumpOptions = isAdvancedMode
+        ? jumpOptions
+        : jumpOptions.filter((opt) => !advancedOnlySections.has(opt.value));
+
+    const handleSwitchToBasic = () => {
+        if (hasAdvancedCustomizations) {
+            setShowBasicModeModal(true);
+        } else {
+            setIsAdvancedMode(false);
+            localStorage.setItem("adminMode", "basic");
+        }
+    };
+
+    const confirmSwitchToBasic = () => {
+        setConfig((current) => ({ ...current, ...BASIC_MODE_DEFAULTS }));
+        setIsAdvancedMode(false);
+        localStorage.setItem("adminMode", "basic");
+        setShowBasicModeModal(false);
+    };
+
     const fetchUnexecuted = useCallback(async () => {
         const res = await fetch("/api/pnl", { cache: "no-store" });
         if (!res.ok) return;
@@ -401,6 +478,10 @@ export default function AdminPage() {
                 error: "Failed to load secret status",
             }));
         }
+    }, []);
+
+    useEffect(() => {
+        if (localStorage.getItem("adminMode") === "advanced") setIsAdvancedMode(true);
     }, []);
 
     useEffect(() => {
@@ -901,6 +982,43 @@ export default function AdminPage() {
                     </div>
                 </div>
             )}
+            {showBasicModeModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+                    <div className="w-full max-w-sm rounded-2xl border border-amber-800/60 bg-slate-900 p-6 space-y-4 shadow-2xl">
+                        <div className="flex items-start gap-3">
+                            <div className="mt-0.5 h-5 w-5 flex-shrink-0 rounded-full bg-amber-600/20 flex items-center justify-center">
+                                <span className="text-amber-400 text-xs font-bold">!</span>
+                            </div>
+                            <div>
+                                <h2 className="text-base font-semibold text-white">Reset to Basic mode?</h2>
+                                <p className="text-sm text-slate-400 mt-1">
+                                    Switching to Basic will reset all advanced settings to their defaults. This includes trading thresholds,
+                                    ingestion intervals, parallel slots, and snapshot delivery options.
+                                </p>
+                                <p className="text-sm text-slate-400 mt-2">
+                                    Custom RSS feeds and prompt overrides will be hidden but not deleted — switch back to Advanced to access them again.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="flex gap-3 justify-end pt-1">
+                            <button
+                                type="button"
+                                onClick={() => setShowBasicModeModal(false)}
+                                className="px-4 py-2 text-sm text-slate-400 hover:text-white"
+                            >
+                                Keep Advanced
+                            </button>
+                            <button
+                                type="button"
+                                onClick={confirmSwitchToBasic}
+                                className="rounded-lg bg-amber-700 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-600"
+                            >
+                                Reset &amp; Switch to Basic
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
             {showRemoteSnapshotSetupModal && (
                 <div className="fixed inset-0 z-50 overflow-y-auto bg-black/70 backdrop-blur-sm p-4">
                     <div className="flex min-h-full items-start justify-center py-4">
@@ -1097,13 +1215,31 @@ python run.py`}</code></pre>
                             Control models, data sources, execution behavior, and outbound reporting from one place.
                         </p>
                     </div>
-                    <button
-                        type="button"
-                        onClick={() => handleNavigate("/")}
-                        className="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:text-white"
-                    >
-                        Back
-                    </button>
+                    <div className="flex items-center gap-3">
+                        <div className="flex rounded-lg border border-slate-700 overflow-hidden text-xs font-medium">
+                            <button
+                                type="button"
+                                onClick={handleSwitchToBasic}
+                                className={`px-3 py-1.5 transition-colors ${!isAdvancedMode ? "bg-slate-700 text-white" : "text-slate-400 hover:text-white"}`}
+                            >
+                                Basic
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => { setIsAdvancedMode(true); localStorage.setItem("adminMode", "advanced"); }}
+                                className={`px-3 py-1.5 transition-colors ${isAdvancedMode ? "bg-slate-700 text-white" : "text-slate-400 hover:text-white"}`}
+                            >
+                                Advanced
+                            </button>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => handleNavigate("/")}
+                            className="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:text-white"
+                        >
+                            Back
+                        </button>
+                    </div>
                 </div>
 
                 <div className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)] lg:items-start">
@@ -1111,7 +1247,7 @@ python run.py`}</code></pre>
                         <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
                             <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500">Navigate</p>
                             <nav className="mt-4 space-y-1.5">
-                                {jumpOptions.map((option) => (
+                                {visibleJumpOptions.map((option) => (
                                     <button
                                         key={option.value}
                                         type="button"
@@ -1151,7 +1287,7 @@ python run.py`}</code></pre>
                                 className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
                             >
                                 <option value="">Choose a section…</option>
-                                {jumpOptions.map((option) => (
+                                {visibleJumpOptions.map((option) => (
                                     <option key={option.value} value={option.value}>{option.label}</option>
                                 ))}
                             </select>
@@ -1184,6 +1320,7 @@ python run.py`}</code></pre>
                         </div>
                     </div>
 
+                    {isAdvancedMode && (
                     <div>
                         <p className="text-xs text-slate-400 mb-3">Article volume — quick select</p>
                         <p className="text-[11px] text-slate-500 mb-2">
@@ -1217,7 +1354,9 @@ python run.py`}</code></pre>
                             />
                         </label>
                     </div>
+                    )}
 
+                    {isAdvancedMode && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
                             <label className="flex items-start gap-3 cursor-pointer">
@@ -1258,6 +1397,7 @@ python run.py`}</code></pre>
                             </label>
                         </div>
                     </div>
+                    )}
 
                     <div>
                         <p className="text-xs text-slate-400 mb-3">Risk profile &amp; leverage</p>
@@ -1455,8 +1595,7 @@ python run.py`}</code></pre>
                     )}
                 </section>
 
-                {/* Trading Logic */}
-                <section id="trading-logic" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-5">
+                {isAdvancedMode && (<section id="trading-logic" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-5">
                     <div>
                         <h2 className="text-sm font-semibold text-slate-200">Trading Logic</h2>
                         <p className="text-xs text-slate-500 mt-1">
@@ -1645,7 +1784,7 @@ python run.py`}</code></pre>
                             />
                         </label>
                     </div>
-                </section>
+                </section>)}
 
                 <section id="symbols" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <h2 className="text-sm font-semibold text-slate-200">Symbols</h2>
@@ -1729,7 +1868,7 @@ python run.py`}</code></pre>
                     </div>
                 </section>
 
-                <section id="rss" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
+                {isAdvancedMode && (<section id="rss" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <div className="flex items-center justify-between">
                         <h2 className="text-sm font-semibold text-slate-200">RSS Sources</h2>
                         <span className="text-xs text-slate-500 font-mono">
@@ -1828,9 +1967,9 @@ python run.py`}</code></pre>
                             />
                         </label>
                     </div>
-                </section>
+                </section>)}
 
-                <section id="prompts" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
+                {isAdvancedMode && (<section id="prompts" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <h2 className="text-sm font-semibold text-slate-200">Prompt Overrides</h2>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {config.tracked_symbols.map((symbol) => (
@@ -1846,9 +1985,9 @@ python run.py`}</code></pre>
                             </label>
                         ))}
                     </div>
-                </section>
+                </section>)}
 
-                <section id="executions" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
+                {isAdvancedMode && (<section id="executions" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-4">
                     <div>
                         <h2 className="text-sm font-semibold text-slate-200">Manage Executions</h2>
                         <p className="text-xs text-slate-500 mt-1">
@@ -1892,7 +2031,7 @@ python run.py`}</code></pre>
                             No execution records are available to manage right now.
                         </div>
                     )}
-                </section>
+                </section>)}
 
                 <section id="system" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
                     <h2 className="text-sm font-semibold text-slate-200">Scheduling & System</h2>
@@ -1917,6 +2056,7 @@ python run.py`}</code></pre>
                         />
                     </label>
 
+                    {isAdvancedMode && (
                     <label className="block">
                         <span className="text-xs text-slate-400">Data ingestion interval seconds (default: 900)</span>
                         <input
@@ -1928,7 +2068,9 @@ python run.py`}</code></pre>
                             className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2"
                         />
                     </label>
+                    )}
 
+                    {isAdvancedMode && (
                     <label className="block">
                         <span className="text-xs text-slate-400">Saved snapshot retention limit</span>
                         <input
@@ -1943,6 +2085,7 @@ python run.py`}</code></pre>
                             Keep only the most recent saved frozen analysis snapshots for Advanced Mode replay.
                         </p>
                     </label>
+                    )}
 
                     <label className="block">
                         <span className="text-xs text-slate-400">Display timezone</span>
@@ -2034,6 +2177,7 @@ python run.py`}</code></pre>
                         </div>
                     </div>
 
+                    {isAdvancedMode && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <label className="block">
                             <span className="text-xs text-slate-400">Delivery mode</span>
@@ -2072,7 +2216,9 @@ python run.py`}</code></pre>
                             />
                         </label>
                     </div>
+                    )}
 
+                    {isAdvancedMode && (
                     <label className="flex items-center gap-3 text-sm">
                         <input
                             type="checkbox"
@@ -2081,7 +2227,9 @@ python run.py`}</code></pre>
                         />
                         Send when a position changes (open / close / flip)
                     </label>
+                    )}
 
+                    {isAdvancedMode && (
                     <label className="flex items-center gap-3 text-sm">
                         <input
                             type="checkbox"
@@ -2090,7 +2238,9 @@ python run.py`}</code></pre>
                         />
                         Include recent closed trades on the image
                     </label>
+                    )}
 
+                    {isAdvancedMode && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
                             <p className="text-xs text-slate-500 uppercase tracking-[0.2em]">Last Snapshot Sent</p>
@@ -2101,6 +2251,7 @@ python run.py`}</code></pre>
                             <p className="mt-2 font-mono text-xs text-slate-300">{config.last_remote_snapshot_request_id || "None"}</p>
                         </div>
                     </div>
+                    )}
                 </section>
 
                 <div className="flex items-center justify-end gap-3">
@@ -2115,8 +2266,7 @@ python run.py`}</code></pre>
                     </button>
                 </div>
 
-                {/* Price History */}
-                <section id="price-history" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
+                {isAdvancedMode && (<section id="price-history" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
                     <div>
                         <h2 className="text-sm font-semibold text-slate-300">Price History</h2>
                         <p className="text-xs text-slate-500 mt-1">
@@ -2164,7 +2314,7 @@ python run.py`}</code></pre>
                         Pulls ~14 months of daily data per symbol with a 3s delay between each to avoid rate limits.
                         If interrupted, existing data is saved — re-run to fetch remaining symbols.
                     </p>
-                </section>
+                </section>)}
 
                 <section id="danger-zone" className="scroll-mt-24 rounded-2xl border border-red-900/50 bg-red-950/20 p-5 space-y-4">
                     <div>
