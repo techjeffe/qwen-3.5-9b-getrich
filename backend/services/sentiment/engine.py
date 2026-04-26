@@ -25,20 +25,22 @@ def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
     to the schema, so any reasonably-capable model produces compliant output.
     Mirrors the textual schema in SYMBOL_SPECIALIST_RESPONSE_PROMPT.
     """
+    # Trimmed for speed: each removed verbose field saved 100-300 tokens of
+    # generation time. Per-symbol output dropped from ~700 tokens → ~150,
+    # cutting Stage 2 wall time roughly 3-4×. Phrase arrays are replaced by
+    # integer counts (only counts feed scoring). The analyst writeup is now
+    # synthesized in Python from the structured fields below.
     return {
         "type": "object",
         "required": [
             "event_type",
             "confirmed",
-            "bluster_phrases",
-            "substance_phrases",
+            "bluster_count",
+            "substance_count",
             "exposure_type",
             "symbol_relevance",
             "source_count",
             "trading_type",
-            "analyst_writeup",
-            "headline_citations",
-            "supporting_points",
         ],
         "properties": {
             "event_type": {
@@ -56,8 +58,8 @@ def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
                 ],
             },
             "confirmed": {"type": "boolean"},
-            "bluster_phrases": {"type": "array", "items": {"type": "string"}},
-            "substance_phrases": {"type": "array", "items": {"type": "string"}},
+            "bluster_count": {"type": "integer"},
+            "substance_count": {"type": "integer"},
             "exposure_type": {
                 "type": "string",
                 "enum": ["DIRECT", "INDIRECT", "BROAD", "UNRELATED"],
@@ -85,9 +87,6 @@ def build_specialist_response_schema(symbol: str) -> Dict[str, Any]:
                 "type": "string",
                 "enum": ["SCALP", "SWING", "POSITION", "VOLATILE_EVENT"],
             },
-            "analyst_writeup": {"type": "string"},
-            "headline_citations": {"type": "array", "items": {"type": "string"}},
-            "supporting_points": {"type": "array", "items": {"type": "string"}},
         },
     }
 
@@ -182,7 +181,23 @@ class SentimentEngine:
     # requests queue up inside Ollama and each one's HTTP timeout starts ticking from
     # the moment it's sent, not when GPU work begins. Serializing here means every call
     # gets immediate GPU attention and its full timeout budget.
+    # Default 1 (safe for any single-GPU box). Admins with VRAM headroom can bump
+    # this via configure_parallelism(); keep in sync with OLLAMA_NUM_PARALLEL.
     _ollama_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
+    _ollama_parallel_slots: int = 1
+
+    @classmethod
+    def configure_parallelism(cls, slots: int) -> None:
+        """Resize the shared Ollama semaphore. Call between requests, never mid-flight.
+
+        New permits take effect on the next acquire. In-flight calls retain their
+        permit on the old semaphore — fine for the dev/single-user case where
+        analyses do not overlap.
+        """
+        slots = max(1, min(8, int(slots)))
+        if slots != cls._ollama_parallel_slots:
+            cls._ollama_semaphore = asyncio.Semaphore(slots)
+            cls._ollama_parallel_slots = slots
 
     # Caching
     _cache: Dict[str, SentimentAnalysisResponse] = {}
@@ -371,8 +386,16 @@ class SentimentEngine:
         """
         event_type = SentimentEngine._normalize_event_type(str(extraction.get("event_type") or ""))
         confirmed = bool(extraction.get("confirmed", False))
-        bluster_phrases = extraction.get("bluster_phrases") or []
-        substance_phrases = extraction.get("substance_phrases") or []
+        # Prefer integer counts (new trimmed schema); fall back to array length
+        # for snapshots saved under the old schema.
+        n_blu = extraction.get("bluster_count")
+        if n_blu is None:
+            n_blu = len(extraction.get("bluster_phrases") or [])
+        n_sub = extraction.get("substance_count")
+        if n_sub is None:
+            n_sub = len(extraction.get("substance_phrases") or [])
+        n_blu = max(0, int(n_blu))
+        n_sub = max(0, int(n_sub))
         source_count = max(1, min(10, int(extraction.get("source_count") or 2)))
 
         sym_rel = (extraction.get("symbol_relevance") or {}).get(symbol, {})
@@ -394,8 +417,6 @@ class SentimentEngine:
         _ss = _L["sentiment_scoring"]
 
         # ── Bluster score: −1 (pure rhetoric) → +1 (pure substance) ──────────
-        n_sub = len(substance_phrases)
-        n_blu = len(bluster_phrases)
         bluster_weight = float(_ss.get("bluster_phrase_weight", 1.25))
         substance_weight = float(_ss.get("substance_phrase_weight", 1.0))
         mixed_floor = float(_ss.get("mixed_signal_bluster_floor", -0.15))
@@ -1148,46 +1169,60 @@ class SentimentEngine:
         supporting_points: List[str],
         headline_citations: List[str],
     ) -> str:
-        """Prefer the model's full analyst writeup, with a structured fallback."""
+        """Synthesize an analyst writeup from structured fields.
+
+        With the trimmed schema (no `analyst_writeup` from the LLM) this is the
+        primary path. The mechanism string per symbol carries the actual
+        causal claim — we wrap it with event/exposure/direction/scores.
+        Older snapshots may still contain a model-written analyst_writeup; use
+        it directly when present.
+        """
         analyst_writeup = (data.get("analyst_writeup") or "").strip()
         if analyst_writeup:
             return analyst_writeup
 
-        parts: List[str] = []
-        signal_type = signal.get("signal_type", "HOLD")
-        signal_reason = (signal.get("reasoning") or "").strip()
-        overall = (data.get("overall_assessment") or "").strip()
-        bluster_reason = (bluster.get("reasoning") or "").strip()
-        policy_reason = (policy.get("reasoning") or "").strip()
+        symbol = ""
+        sym_rel_root = data.get("symbol_relevance") or {}
+        if isinstance(sym_rel_root, dict) and sym_rel_root:
+            symbol = next(iter(sym_rel_root.keys()), "")
+        sym_rel = sym_rel_root.get(symbol, {}) if symbol else {}
 
-        if overall:
-            parts.append(overall)
-        if signal_reason:
-            parts.append(f"Signal rationale: {signal_type} because {signal_reason}")
-        if headline_citations:
-            parts.append("Key items: " + "; ".join(headline_citations[:4]))
-        if supporting_points:
-            parts.append("Supporting evidence: " + "; ".join(supporting_points[:4]))
-        if bluster_reason:
-            parts.append(f"Bluster view: {bluster_reason}")
-        if policy_reason:
-            parts.append(f"Policy view: {policy_reason}")
-
-        fallback = "\n\n".join(part for part in parts if part)
-        if fallback:
-            return fallback
+        event_type = str(data.get("event_type") or "").replace("_", " ") or "event"
+        confirmed = bool(data.get("confirmed", False))
+        exposure_type = str(data.get("exposure_type") or "").upper() or "DIRECT"
+        direction = str(sym_rel.get("direction") or "neutral").lower()
+        mechanism = str(sym_rel.get("mechanism") or "").strip()
+        signal_type = str(signal.get("signal_type", "HOLD")).upper()
         try:
-            _bluster_val = abs(float(bluster.get("bluster_score", 0.0)))
-            _policy_val = float(policy.get("policy_score", 0.0))
+            policy_score = float(policy.get("policy_score", 0.0))
+            bluster_score = float(bluster.get("bluster_score", 0.0))
+            confidence = float(signal.get("confidence_score") or bluster.get("confidence", 0.5))
         except (TypeError, ValueError):
-            _bluster_val = _policy_val = 0.0
-        if _bluster_val < 0.05 and _policy_val < 0.05 and str(signal.get("signal_type", "HOLD")).upper() == "HOLD":
+            policy_score = bluster_score = 0.0
+            confidence = 0.5
+
+        confirmed_label = "confirmed" if confirmed else "unconfirmed"
+        direction_label = {
+            "bullish": "Bullish",
+            "bearish": "Bearish",
+            "neutral": "Neutral",
+        }.get(direction, "Neutral")
+
+        if exposure_type == "UNRELATED" or signal_type == "HOLD" and policy_score < 0.05:
             return (
-                "No direct transmission path identified for this symbol in the current news cycle. "
-                "The articles reflect macro or broad market themes but do not have a specific causal "
-                "mechanism that scores above the signal threshold for this instrument. Holding."
+                f"{exposure_type.title()} exposure to {symbol or 'this symbol'} — "
+                f"{event_type}, {confirmed_label}. No direct price mechanism in the current news. "
+                f"Signal: {signal_type}. policy={policy_score:.2f} bluster={bluster_score:+.2f} "
+                f"confidence={confidence:.0%}."
             )
-        return "The model did not provide a detailed writeup for this signal."
+
+        mechanism_clause = f" — {mechanism}" if mechanism and mechanism.lower() != "no direct price mechanism." else ""
+        return (
+            f"{exposure_type.title()} exposure to {symbol or 'this symbol'} · "
+            f"{event_type}, {confirmed_label} · {direction_label}{mechanism_clause} · "
+            f"Signal: {signal_type}. policy={policy_score:.2f} bluster={bluster_score:+.2f} "
+            f"confidence={confidence:.0%}."
+        )
 
     @staticmethod
     def _resolve_directional_score(

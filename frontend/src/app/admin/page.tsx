@@ -26,6 +26,8 @@ type AppConfig = {
     snapshot_retention_limit: number;
     extraction_model: string;
     reasoning_model: string;
+    ollama_parallel_slots: number;
+    red_team_enabled: boolean;
     risk_profile: string;
     web_research_enabled: boolean;
     allow_extended_hours_trading: boolean;
@@ -94,6 +96,8 @@ const EMPTY_CONFIG: AppConfig = {
     snapshot_retention_limit: 12,
     extraction_model: "",
     reasoning_model: "",
+    ollama_parallel_slots: 1,
+    red_team_enabled: true,
     risk_profile: "moderate",
     web_research_enabled: false,
     allow_extended_hours_trading: true,
@@ -1186,6 +1190,81 @@ python run.py`}</code></pre>
                                     <p className="mt-2 text-[10px] font-mono text-slate-600">{option.articles}</p>
                                 </button>
                             ))}
+                        </div>
+                    </div>
+
+                    <div>
+                        <p className="text-xs text-slate-400 mb-3">Article volume — quick select</p>
+                        <p className="text-[11px] text-slate-500 mb-2">
+                            Max posts ingested per analysis. Lower = faster Stage 2 (each post adds context tokens). Higher = broader signal coverage.
+                        </p>
+                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                            {[10, 25, 50, 100, 200].map((n) => (
+                                <button
+                                    key={n}
+                                    type="button"
+                                    onClick={() => setConfig((c) => ({ ...c, max_posts: n }))}
+                                    className={`rounded-lg border px-3 py-2 text-sm transition-colors ${
+                                        config.max_posts === n
+                                            ? "border-blue-400 bg-blue-500/10 text-blue-100 font-semibold"
+                                            : "border-slate-800 bg-slate-950/60 text-slate-300 hover:border-slate-700"
+                                    }`}
+                                >
+                                    {n}
+                                </button>
+                            ))}
+                        </div>
+                        <label className="mt-3 block">
+                            <span className="text-[11px] text-slate-500">Custom value</span>
+                            <input
+                                type="number"
+                                min={1}
+                                max={500}
+                                value={config.max_posts}
+                                onChange={(e) => setConfig((c) => ({ ...c, max_posts: Math.max(1, Math.min(500, parseInt(e.target.value) || 1)) }))}
+                                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                            <label className="flex items-start gap-3 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={config.red_team_enabled}
+                                    onChange={(e) => setConfig((c) => ({ ...c, red_team_enabled: e.target.checked }))}
+                                    className="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
+                                />
+                                <span className="block">
+                                    <span className="text-sm font-semibold text-slate-200">Red-team risk review</span>
+                                    <span className="block mt-1 text-xs text-slate-400 leading-relaxed">
+                                        Adversarial pass that re-reads the blue-team signal looking for bias, source skew, and overlooked risks.
+                                        Disabling saves one Ollama call per analysis (~30-60s on a slow box) at the cost of the bias countercheck.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+                        <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                            <label className="block">
+                                <span className="text-sm font-semibold text-slate-200">Parallel Ollama slots</span>
+                                <p className="mt-1 text-xs text-slate-400 leading-relaxed">
+                                    Number of Stage 2 specialist calls that may run concurrently. <span className="font-semibold text-slate-200">1</span> = serialized (safe default).
+                                </p>
+                                <input
+                                    type="number"
+                                    min={1}
+                                    max={8}
+                                    value={config.ollama_parallel_slots}
+                                    onChange={(e) => setConfig((c) => ({ ...c, ollama_parallel_slots: Math.max(1, Math.min(8, parseInt(e.target.value) || 1)) }))}
+                                    className="mt-3 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                                {config.ollama_parallel_slots > 1 && (
+                                    <p className="mt-2 text-[11px] text-amber-400 leading-relaxed">
+                                        ⚠ Requires GPU VRAM headroom AND <code className="font-mono text-amber-300">OLLAMA_NUM_PARALLEL={config.ollama_parallel_slots}</code> set on the Ollama side. Without both, Ollama will OOM or queue silently — undoing the speedup.
+                                    </p>
+                                )}
+                            </label>
                         </div>
                     </div>
 

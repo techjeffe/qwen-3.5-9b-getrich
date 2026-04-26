@@ -729,6 +729,14 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.extraction_model = str(payload.get("extraction_model") or "").strip()
     if "reasoning_model" in payload:
         config.reasoning_model = str(payload.get("reasoning_model") or "").strip()
+    if "ollama_parallel_slots" in payload:
+        try:
+            slots = int(payload.get("ollama_parallel_slots") or 1)
+        except (TypeError, ValueError):
+            slots = 1
+        config.ollama_parallel_slots = max(1, min(8, slots))
+    if "red_team_enabled" in payload:
+        config.red_team_enabled = bool(payload.get("red_team_enabled"))
     if "risk_profile" in payload:
         config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
     if "web_research_enabled" in payload:
@@ -970,6 +978,8 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "snapshot_retention_limit": snapshot_retention_limit,
         "extraction_model": str(getattr(config, "extraction_model", "") or ""),
         "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
+        "ollama_parallel_slots": int(getattr(config, "ollama_parallel_slots", 1) or 1),
+        "red_team_enabled": bool(getattr(config, "red_team_enabled", True)),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
         "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),

@@ -691,24 +691,29 @@ async def rerun_analysis_snapshot(
         quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
         if blue_team_signal.entry_symbol in quotes_by_symbol:
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
-        red_team_review, red_team_debug = await _run_red_team_review(
-            model_name=rerun_reasoning or effective_model,
-            symbols=symbols,
-            posts=posts,
-            sentiment_results=sentiment_results,
-            trading_signal=blue_team_signal,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            market_validation=market_validation,
-        )
-        trading_signal = _build_consensus_trading_signal(
-            blue_team_signal,
-            red_team_review,
-            quotes_by_symbol=quotes_by_symbol,
-            risk_profile=_snapshot_risk,
-        )
-        if red_team_debug:
-            red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+        if bool(getattr(get_or_create_app_config(db), "red_team_enabled", True)):
+            red_team_review, red_team_debug = await _run_red_team_review(
+                model_name=rerun_reasoning or effective_model,
+                symbols=symbols,
+                posts=posts,
+                sentiment_results=sentiment_results,
+                trading_signal=blue_team_signal,
+                price_context=price_context,
+                quotes_by_symbol=quotes_by_symbol,
+                market_validation=market_validation,
+            )
+            trading_signal = _build_consensus_trading_signal(
+                blue_team_signal,
+                red_team_review,
+                quotes_by_symbol=quotes_by_symbol,
+                risk_profile=_snapshot_risk,
+            )
+            if red_team_debug:
+                red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+        else:
+            red_team_review = None
+            red_team_debug = None
+            trading_signal = blue_team_signal
         quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
         if trading_signal.entry_symbol in quotes_by_symbol:
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
@@ -861,6 +866,9 @@ async def _run_analysis_pipeline(
     config = get_or_create_app_config(db)
     effective_request = _apply_request_defaults(request, config)
     prompt_overrides = config.symbol_prompt_overrides or {}
+    SentimentEngine.configure_parallelism(
+        int(getattr(config, "ollama_parallel_slots", 1) or 1)
+    )
 
     if not try_acquire_analysis_lock(db, request_id):
         raise AnalysisLockError("Another analysis run is already in progress")
@@ -993,24 +1001,29 @@ async def _run_analysis_pipeline(
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
 
         refresh_analysis_lock(db, request_id)
-        red_team_review, red_team_debug = await _run_red_team_review(
-            model_name=reasoning_model or active_model,
-            symbols=effective_request.symbols,
-            posts=posts,
-            sentiment_results=sentiment_results,
-            trading_signal=blue_team_signal,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            market_validation=market_validation,
-        )
-        trading_signal = _build_consensus_trading_signal(
-            blue_team_signal,
-            red_team_review,
-            quotes_by_symbol=quotes_by_symbol,
-            risk_profile=_risk_profile,
-        )
-        if red_team_debug:
-            red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+        if bool(getattr(config, "red_team_enabled", True)):
+            red_team_review, red_team_debug = await _run_red_team_review(
+                model_name=reasoning_model or active_model,
+                symbols=effective_request.symbols,
+                posts=posts,
+                sentiment_results=sentiment_results,
+                trading_signal=blue_team_signal,
+                price_context=price_context,
+                quotes_by_symbol=quotes_by_symbol,
+                market_validation=market_validation,
+            )
+            trading_signal = _build_consensus_trading_signal(
+                blue_team_signal,
+                red_team_review,
+                quotes_by_symbol=quotes_by_symbol,
+                risk_profile=_risk_profile,
+            )
+            if red_team_debug:
+                red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+        else:
+            red_team_review = None
+            red_team_debug = None
+            trading_signal = blue_team_signal
         quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
         if trading_signal.entry_symbol in quotes_by_symbol:
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
@@ -1165,6 +1178,10 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             config = get_or_create_app_config(db)
             effective_request = _apply_request_defaults(request, config)
             prompt_overrides = config.symbol_prompt_overrides or {}
+            # Apply admin-configured Ollama parallelism. Default 1 = serialized.
+            SentimentEngine.configure_parallelism(
+                int(getattr(config, "ollama_parallel_slots", 1) or 1)
+            )
             # ── Preflight: verify Ollama is reachable ────────────────────────
             try:
                 ollama_status = get_ollama_status()
@@ -1373,25 +1390,31 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 f"Entry: {blue_team_signal.entry_symbol}  |  "
                 f"Confidence: {blue_team_signal.confidence_score:.0%}"
             )
-            yield emit("Running red-team risk review...")
-            red_team_review, red_team_debug = await _run_red_team_review(
-                model_name=reasoning_model or active_model,
-                symbols=effective_request.symbols,
-                posts=posts,
-                sentiment_results=sentiment_results,
-                trading_signal=blue_team_signal,
-                price_context=price_context,
-                quotes_by_symbol=quotes_by_symbol,
-                market_validation=market_validation,
-            )
-            trading_signal = _build_consensus_trading_signal(
-                blue_team_signal,
-                red_team_review,
-                quotes_by_symbol=quotes_by_symbol,
-                risk_profile=_stream_risk,
-            )
-            if red_team_debug:
-                red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+            if bool(getattr(config, "red_team_enabled", True)):
+                yield emit("Running red-team risk review...")
+                red_team_review, red_team_debug = await _run_red_team_review(
+                    model_name=reasoning_model or active_model,
+                    symbols=effective_request.symbols,
+                    posts=posts,
+                    sentiment_results=sentiment_results,
+                    trading_signal=blue_team_signal,
+                    price_context=price_context,
+                    quotes_by_symbol=quotes_by_symbol,
+                    market_validation=market_validation,
+                )
+                trading_signal = _build_consensus_trading_signal(
+                    blue_team_signal,
+                    red_team_review,
+                    quotes_by_symbol=quotes_by_symbol,
+                    risk_profile=_stream_risk,
+                )
+                if red_team_debug:
+                    red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
+            else:
+                yield emit("Red-team review disabled in config — skipping.")
+                red_team_review = None
+                red_team_debug = None
+                trading_signal = blue_team_signal
             quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
             if trading_signal.entry_symbol in quotes_by_symbol:
                 trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")

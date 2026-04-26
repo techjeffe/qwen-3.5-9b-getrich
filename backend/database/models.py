@@ -335,6 +335,13 @@ class AppConfig(Base):
     snapshot_retention_limit = Column(Integer, nullable=False, default=12)
     extraction_model = Column(String(128), nullable=False, default="")
     reasoning_model = Column(String(128), nullable=False, default="")
+    # Parallel Ollama slots for Stage 2 specialist calls. 1 = serialized (safe
+    # for any single-GPU box). >1 only when you have GPU VRAM headroom AND have
+    # set OLLAMA_NUM_PARALLEL on the Ollama side to match.
+    ollama_parallel_slots = Column(Integer, nullable=False, default=1)
+    # Toggle the red-team adversarial review pass. Off saves ~one Ollama call
+    # per analysis at the cost of losing the bias/risk countercheck.
+    red_team_enabled = Column(Boolean, nullable=False, default=True)
     risk_profile = Column(String(20), nullable=False, default="moderate")
     web_research_enabled = Column(Boolean, nullable=False, default=False)
     allow_extended_hours_trading = Column(Boolean, nullable=False, default=True)

@@ -658,8 +658,8 @@ Return ONLY this JSON — nothing else:
 {{
   "event_type": "geopolitical" | "regulatory" | "monetary_policy" | "trade_policy" | "fiscal" | "earnings" | "macro_data" | "sector_news" | "noise",
   "confirmed": boolean,
-  "bluster_phrases": [string],
-  "substance_phrases": [string],
+  "bluster_count": integer,
+  "substance_count": integer,
   "exposure_type": "DIRECT" | "INDIRECT" | "BROAD" | "UNRELATED",
   "symbol_relevance": {{
     "{symbol}": {{
@@ -669,17 +669,14 @@ Return ONLY this JSON — nothing else:
     }}
   }},
   "source_count": integer,
-  "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT",
-  "analyst_writeup": string,
-  "headline_citations": [string],
-  "supporting_points": [string]
+  "trading_type": "SCALP" | "SWING" | "POSITION" | "VOLATILE_EVENT"
 }}
 
 Definitions:
 - event_type: use "trade_policy" for tariffs, import/export restrictions, trade agreements, trade war escalation, sanctions tied to trade. Use "geopolitical" only for military action, territorial conflict, or political instability without a direct trade/commodity mechanism. Use "monetary_policy" for central bank rate decisions, QE/QT, or forward guidance.
 - confirmed: true only if this is a completed, official action (signed, enacted, imposed, executed). Threats, warnings, negotiations, and speculation are false.
-- bluster_phrases: purely rhetorical or speculative phrases found in the text — language that exaggerates, predicts, or emotes without official commitment, such as "promises to obliterate", "vows to completely destroy", "will change everything", "could be massive", "believes markets will explode", "destined to". Standard hedge language from authorized officials ("warns that", "signals", "suggests") is NOT bluster. These MUST be exact substrings taken from the provided text, not paraphrases or guessed examples. If no such phrase appears verbatim, return [].
-- substance_phrases: concrete action/fact phrases found in the text such as "enacted sanctions", "signed executive order", "raised rates 25bps", "confirmed production cut", "announced policy", "released data showing", "officially imposed". Press conference statements of official policy commitment count as substance. These MUST be exact substrings taken from the provided text, not paraphrases or guessed examples. If no such phrase appears verbatim, return [].
+- bluster_count: number of purely rhetorical or speculative phrases in the text — language that exaggerates, predicts, or emotes without official commitment, such as "promises to obliterate", "vows to completely destroy", "could be massive". Standard hedge language from authorized officials ("warns that", "signals", "suggests") does NOT count. Count only phrases that appear verbatim in the text. Cap at 6 (do not bother counting beyond 6).
+- substance_count: number of concrete action/fact phrases in the text such as "enacted sanctions", "signed executive order", "raised rates 25bps", "confirmed production cut". Press conference statements of official policy commitment count. Count only phrases that appear verbatim in the text. Cap at 6.
 - exposure_type:
   DIRECT = the news directly targets the asset, its core commodity, its regulation, or its primary earnings driver
   INDIRECT = the asset is meaningfully affected through a sector or second-order channel
@@ -689,10 +686,8 @@ Definitions:
 - relevant: true only if this news has a plausible direct price mechanism for {symbol}. Unrelated-sector news with no transmission path should be false.
 - direction: "bullish" if the news has a specific, direct positive price mechanism for {symbol} (e.g. supply cut → price rise, rate cut → multiple expansion); "bearish" if it has a specific, direct negative mechanism; "neutral" if the connection is vague, macro-level only, the impact direction is unclear, or the news is not directly relevant to {symbol}. Default to "neutral" — only choose "bullish" or "bearish" when the causal chain from the headline to {symbol}'s price is explicit and direct.
 - mechanism: one sentence on WHY this moves {symbol}'s price. If not relevant write "No direct price mechanism."
-- analyst_writeup: 75-120 words in plain English explaining what is happening and its specific impact on {symbol}. Be concise.
 
 Extraction rules:
-- Exact verbatim substrings only — short quoted fragments beat paraphrases. Return [] if no exact phrase is present in the text.
 - Score {symbol} specifically. Use the "Exposure type guidance" in the Specialist focus above to determine what counts as DIRECT for this symbol — broad market indexes (SPY, QQQ) treat macro policy as DIRECT; commodity and thematic ETFs (USO, BITO) require news about their specific underlying.
 """
 
