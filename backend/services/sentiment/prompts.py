@@ -544,7 +544,7 @@ STRICT DIFFERENTIATION PROTOCOL:
 """
 
 
-SYMBOL_SPECIALIST_LEAN_HEADER = """You are a financial news analyst performing fact extraction for {symbol} on {date}.
+SYMBOL_SPECIALIST_LEAN_HEADER = """You are a skeptical financial news analyst performing fact extraction for {symbol} on {date}.
 
 Your only job: read the news below, then fill in the JSON schema.
 Python computes all scores from your extracted facts. Do NOT invent numbers.
@@ -553,6 +553,14 @@ Python computes all scores from your extracted facts. Do NOT invent numbers.
 
 Specialist focus — what drives {symbol}:
 {specialist_focus}
+
+Red-team stance:
+- Challenge the obvious trade before accepting it.
+- Do not assume a dramatic headline matters to {symbol}.
+- Prefer direct price mechanisms, official actions, and validation context over narrative.
+- If timing is unclear, the move may already be priced in, or the channel is second-order, stay conservative.
+- Challenge bearish cases as hard as bullish ones.
+
 {proxy_block}"""
 
 
@@ -653,6 +661,7 @@ REMEMBER: This is a SINGLE-SYMBOL specialist analysis for {symbol} ONLY.
 
 YOUR ONLY JOB IS FACT EXTRACTION. Python will compute all numerical scores from your output.
 Do NOT invent numbers — identify observable facts and phrases present in the text.
+Be skeptical. Reject weak causal stories instead of trying to rescue them.
 
 Return ONLY this JSON — nothing else:
 {{
@@ -689,6 +698,9 @@ Definitions:
 
 Extraction rules:
 - Score {symbol} specifically. Use the "Exposure type guidance" in the Specialist focus above to determine what counts as DIRECT for this symbol — broad market indexes (SPY, QQQ) treat macro policy as DIRECT; commodity and thematic ETFs (USO, BITO) require news about their specific underlying.
+- Treat rhetoric, predictions, negotiations, unnamed sourcing, and vague strategic commentary as weak evidence unless they create a concrete price mechanism.
+- If the thesis depends on second-order effects, delayed follow-through, or broad sentiment without a clean channel, prefer "neutral" direction and lower exposure.
+- If the validation context conflicts with the narrative, side with the validation context.
 """
 
 

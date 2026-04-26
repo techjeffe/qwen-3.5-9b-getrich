@@ -18,6 +18,7 @@ from schemas.analysis import (
     AnalysisRequest,
     AnalysisResponse,
     SentimentScore,
+    StageMetric,
     TradingSignal,
     RedTeamReview,
     RedTeamDebug,
@@ -77,6 +78,24 @@ from services.web_research import fetch_recent_symbol_web_context
 router = APIRouter()
 
 ProgressCallback = Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]
+
+
+def _stage_metric(
+    *,
+    status: str,
+    model_name: str = "",
+    duration_ms: float = 0.0,
+    item_count: Optional[int] = None,
+    **details: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": status,
+        "model_name": model_name,
+        "duration_ms": round(float(duration_ms or 0.0), 2),
+        "item_count": item_count,
+        "details": details or {},
+    }
+    return payload
 
 
 class AnalysisLockError(RuntimeError):
@@ -577,8 +596,13 @@ def _load_saved_analysis_response(analysis: AnalysisResult) -> AnalysisResponse:
         trading_signal=trading_signal,
         blue_team_signal=blue_team_signal,
         market_validation=market_validation,
+        ingestion_trace=IngestionTraceDebug.model_validate(snapshot.get("ingestion_trace") or {}) if snapshot.get("ingestion_trace") else None,
         red_team_review=RedTeamReview.model_validate(red_team_payload) if red_team_payload else None,
         red_team_debug=RedTeamDebug.model_validate(red_team_debug_payload) if red_team_debug_payload else None,
+        stage_metrics={
+            key: StageMetric.model_validate(value)
+            for key, value in (metadata.get("stage_metrics") or {}).items()
+        },
         model_inputs=ModelInputDebug.model_validate(model_inputs_payload) if model_inputs_payload else None,
         backtest_results=backtest_results,
         processing_time_ms=float(metadata.get("processing_time_ms", 0.0) or 0.0),
@@ -640,6 +664,17 @@ async def rerun_analysis_snapshot(
         raise HTTPException(status_code=400, detail="Saved snapshot is missing article data")
 
     mark_analysis_started(db, rerun_request_id)
+    stage_metrics: Dict[str, Dict[str, Any]] = {
+        "ingest": _stage_metric(
+            status="completed",
+            duration_ms=0.0,
+            item_count=len(posts),
+            trigger_source="snapshot_rerun",
+            selected_count=len(posts),
+            usable_count=len(posts),
+            source_request_id=request_id,
+        )
+    }
 
     try:
         previous_state = _latest_previous_analysis_state(db)
@@ -654,6 +689,7 @@ async def rerun_analysis_snapshot(
             reasoning_model=rerun_reasoning,
             web_context_by_symbol=web_context_by_symbol,
         )
+        stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
         # Use the risk_profile stored in the snapshot so reruns reproduce the original leverage logic.
         # Fall back to current config only for old snapshots that predate risk_profile storage.
         _snapshot_risk = str(snapshot.get("risk_profile") or "")
@@ -692,6 +728,7 @@ async def rerun_analysis_snapshot(
         if blue_team_signal.entry_symbol in quotes_by_symbol:
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
         if bool(getattr(get_or_create_app_config(db), "red_team_enabled", True)):
+            red_team_started = time.time()
             red_team_review, red_team_debug = await _run_red_team_review(
                 model_name=rerun_reasoning or effective_model,
                 symbols=symbols,
@@ -708,12 +745,27 @@ async def rerun_analysis_snapshot(
                 quotes_by_symbol=quotes_by_symbol,
                 risk_profile=_snapshot_risk,
             )
+            red_team_duration_ms = (time.time() - red_team_started) * 1000
+            stage_metrics["red_team"] = _stage_metric(
+                status="completed",
+                model_name=rerun_reasoning or effective_model,
+                duration_ms=red_team_duration_ms,
+                item_count=len(symbols),
+                reviewed_symbols=len(symbols),
+            )
             if red_team_debug:
                 red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
         else:
             red_team_review = None
             red_team_debug = None
             trading_signal = blue_team_signal
+            stage_metrics["red_team"] = _stage_metric(
+                status="skipped",
+                model_name=rerun_reasoning or effective_model,
+                duration_ms=0.0,
+                item_count=len(symbols),
+                reason="disabled in config",
+            )
         quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
         if trading_signal.entry_symbol in quotes_by_symbol:
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
@@ -751,6 +803,7 @@ async def rerun_analysis_snapshot(
             market_validation=market_validation,
             red_team_review=red_team_review,
             red_team_debug=red_team_debug,
+            stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
             model_inputs=ModelInputDebug.model_validate(restored_model_inputs),
             backtest_results=backtest_results,
             processing_time_ms=processing_time_ms,
@@ -877,6 +930,7 @@ async def _run_analysis_pipeline(
         mark_analysis_started(db, request_id)
         await _emit_progress(progress_callback, "log", {"message": f"Ollama reachable - using {active_model}"})
 
+        ingest_started = time.time()
         posts, ingestion_trace = await _ingest_data(
             effective_request,
             config,
@@ -884,6 +938,17 @@ async def _run_analysis_pipeline(
             article_ids=article_ids,
             trigger_source=trigger_source,
         )
+        ingest_duration_ms = (time.time() - ingest_started) * 1000
+        stage_metrics: Dict[str, Dict[str, Any]] = {
+            "ingest": _stage_metric(
+                status="completed",
+                duration_ms=ingest_duration_ms,
+                item_count=len(posts),
+                trigger_source=trigger_source,
+                selected_count=int(ingestion_trace.get("queue", {}).get("selected_count") or 0),
+                usable_count=int(ingestion_trace.get("queue", {}).get("usable_count") or len(posts)),
+            )
+        }
         skipped_empty_ids = list(ingestion_trace.get("queue", {}).get("skipped_empty_article_ids") or [])
         if skipped_empty_ids:
             _mark_scraped_articles_processed(db, skipped_empty_ids)
@@ -946,6 +1011,7 @@ async def _run_analysis_pipeline(
             reasoning_model=reasoning_model,
             web_context_by_symbol=web_context_by_symbol,
         )
+        stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
 
         for symbol, sentiment in sentiment_results.items():
             await _emit_progress(
@@ -1002,6 +1068,7 @@ async def _run_analysis_pipeline(
 
         refresh_analysis_lock(db, request_id)
         if bool(getattr(config, "red_team_enabled", True)):
+            red_team_started = time.time()
             red_team_review, red_team_debug = await _run_red_team_review(
                 model_name=reasoning_model or active_model,
                 symbols=effective_request.symbols,
@@ -1018,12 +1085,27 @@ async def _run_analysis_pipeline(
                 quotes_by_symbol=quotes_by_symbol,
                 risk_profile=_risk_profile,
             )
+            red_team_duration_ms = (time.time() - red_team_started) * 1000
+            stage_metrics["red_team"] = _stage_metric(
+                status="completed",
+                model_name=reasoning_model or active_model,
+                duration_ms=red_team_duration_ms,
+                item_count=len(effective_request.symbols),
+                reviewed_symbols=len(effective_request.symbols),
+            )
             if red_team_debug:
                 red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
         else:
             red_team_review = None
             red_team_debug = None
             trading_signal = blue_team_signal
+            stage_metrics["red_team"] = _stage_metric(
+                status="skipped",
+                model_name=reasoning_model or active_model,
+                duration_ms=0.0,
+                item_count=len(effective_request.symbols),
+                reason="disabled in config",
+            )
         quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
         if trading_signal.entry_symbol in quotes_by_symbol:
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
@@ -1051,6 +1133,7 @@ async def _run_analysis_pipeline(
             market_validation=market_validation,
             red_team_review=red_team_review,
             red_team_debug=red_team_debug,
+            stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
             model_inputs=_build_model_input_debug(
                 posts,
                 price_context,
@@ -1202,6 +1285,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             # ── Step 1: Data Ingestion (live, feed-by-feed) ──────────────────
             mark_analysis_started(db, request_id)
             posts: List[Any] = []
+            stage_metrics: Dict[str, Dict[str, Any]] = {}
             ingestion_trace: Dict[str, Any] = {
                 "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
                 "rss": {"status": "ok", "feeds": [], "total_count": 0, "error": None},
@@ -1215,6 +1299,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             num_feeds = max(1, len(parser.feeds))
             per_feed_cap = resolve_rss_articles_per_feed(config)
             max_total_posts = max(effective_request.max_posts, per_feed_cap * num_feeds)
+            ingest_started = time.time()
 
             for feed_name in parser.feeds:
                 label = feed_labels.get(feed_name) or feed_name.replace("_", " ").title()
@@ -1257,6 +1342,14 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             ingestion_trace["rss"]["per_feed_cap"] = per_feed_cap
             ingestion_trace["rss"]["total_count"] = len(posts)
             ingestion_trace["total_items"] = len(posts)
+            stage_metrics["ingest"] = _stage_metric(
+                status="completed",
+                duration_ms=(time.time() - ingest_started) * 1000,
+                item_count=len(posts),
+                trigger_source="stream",
+                feed_count=len(parser.feeds),
+                per_feed_cap=per_feed_cap,
+            )
             yield emit(f"Ingestion complete — {len(posts)} items")
             mark_stage_complete("ingestion")
 
@@ -1337,6 +1430,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 if not done:
                     yield ": stage2-heartbeat\n\n"
             sentiment_results, sentiment_trace = sentiment_task.result()
+            stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
             for sym, s in sentiment_results.items():
                 bluster = s.get('bluster_score', 0)
                 policy = s.get('policy_score', 0)
@@ -1392,6 +1486,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             )
             if bool(getattr(config, "red_team_enabled", True)):
                 yield emit("Running red-team risk review...")
+                red_team_started = time.time()
                 red_team_review, red_team_debug = await _run_red_team_review(
                     model_name=reasoning_model or active_model,
                     symbols=effective_request.symbols,
@@ -1408,6 +1503,13 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                     quotes_by_symbol=quotes_by_symbol,
                     risk_profile=_stream_risk,
                 )
+                stage_metrics["red_team"] = _stage_metric(
+                    status="completed",
+                    model_name=reasoning_model or active_model,
+                    duration_ms=(time.time() - red_team_started) * 1000,
+                    item_count=len(effective_request.symbols),
+                    reviewed_symbols=len(effective_request.symbols),
+                )
                 if red_team_debug:
                     red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
             else:
@@ -1415,6 +1517,13 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 red_team_review = None
                 red_team_debug = None
                 trading_signal = blue_team_signal
+                stage_metrics["red_team"] = _stage_metric(
+                    status="skipped",
+                    model_name=reasoning_model or active_model,
+                    duration_ms=0.0,
+                    item_count=len(effective_request.symbols),
+                    reason="disabled in config",
+                )
             quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
             if trading_signal.entry_symbol in quotes_by_symbol:
                 trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
@@ -1453,6 +1562,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                 market_validation=market_validation,
                 red_team_review=red_team_review,
                 red_team_debug=red_team_debug,
+                stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
                 model_inputs=_build_model_input_debug(
                     posts,
                     price_context,
@@ -1793,17 +1903,37 @@ async def _analyze_sentiment(
     stage1_result: Optional[Dict[str, Any]] = None
     keyword_generation_trace_by_symbol: Dict[str, Any] = {}
     exposure_hints_by_symbol: Dict[str, str] = {}
+    stage_metrics: Dict[str, Dict[str, Any]] = {}
     if extraction_model and reasoning_model:
         print(f"Two-stage pipeline: extraction={extraction_model} | reasoning={reasoning_model}")
+        stage1_started = time.time()
         stage1_result = await engine.extract_relevant_articles(posts, symbols, extraction_model)
+        stage1_duration_ms = (time.time() - stage1_started) * 1000
         analysis_posts = stage1_result["filtered_posts"]
         proxy_terms_by_symbol = stage1_result["proxy_terms_by_symbol"]
         exposure_hints_by_symbol = stage1_result.get("exposure_hints_by_symbol", {})
         keyword_generation_trace_by_symbol = stage1_result.get("keyword_generation_trace_by_symbol", {}) or {}
+        stage_metrics["stage1"] = _stage_metric(
+            status="completed",
+            model_name=extraction_model,
+            duration_ms=stage1_duration_ms,
+            item_count=len(analysis_posts),
+            input_articles=len(posts),
+            matched_articles=len(analysis_posts),
+            analyzed_symbols=len(symbols),
+        )
     else:
         analysis_posts = posts
         proxy_terms_by_symbol = {s: [] for s in symbols}
         keyword_generation_trace_by_symbol = {}
+        stage_metrics["stage1"] = _stage_metric(
+            status="skipped",
+            model_name=extraction_model or "",
+            duration_ms=0.0,
+            item_count=len(posts),
+            reason="single-stage pipeline",
+            input_articles=len(posts),
+        )
 
     aggregated = _build_aggregated_news_context(analysis_posts)
     if not aggregated.strip():
@@ -1812,6 +1942,7 @@ async def _analyze_sentiment(
 
     # ── Stage 2: per-symbol reasoning ────────────────────────────────────────
     effective_reasoning_model = reasoning_model or model_name
+    stage2_started = time.time()
     analyses = await asyncio.gather(*[
         engine.analyze(
             text=_build_symbol_specific_news_context(
@@ -1831,6 +1962,7 @@ async def _analyze_sentiment(
         )
         for symbol in symbols
     ])
+    stage2_duration_ms = (time.time() - stage2_started) * 1000
     results: Dict[str, Dict[str, Any]] = {}
 
     for symbol, sentiment in zip(symbols, analyses):
@@ -1912,6 +2044,17 @@ async def _analyze_sentiment(
             "analysis_model": model_name or "",
             "extraction_model": extraction_model or "",
             "reasoning_model": effective_reasoning_model or "",
+        },
+        "stage_metrics": {
+            **stage_metrics,
+            "stage2": _stage_metric(
+                status="completed",
+                model_name=effective_reasoning_model or "",
+                duration_ms=stage2_duration_ms,
+                item_count=len(symbols),
+                input_articles=len(analysis_posts),
+                analyzed_symbols=len(symbols),
+            ),
         },
         "aggregated_news_length": len(aggregated),
         "analysis_article_count": len(analysis_posts),
@@ -2216,6 +2359,7 @@ def _build_dataset_snapshot(
         "prompt_overrides": prompt_overrides or {},
         "include_backtest": response.backtest_results is not None,
         "lookback_days": response.backtest_results.lookback_days if response.backtest_results else 14,
+        "ingestion_trace": response.ingestion_trace.model_dump(mode="json") if response.ingestion_trace else {},
         "secret_trace": secret_trace or {},
     }
 
@@ -3467,6 +3611,10 @@ def _save_analysis_result(
                 "processing_time_ms": response.processing_time_ms,
                 "model_name": model_name,
                 "risk_profile": risk_profile,
+                "stage_metrics": {
+                    key: value.model_dump(mode="json")
+                    for key, value in (response.stage_metrics or {}).items()
+                },
                 "blue_team_signal": response.blue_team_signal.model_dump(mode="json") if response.blue_team_signal else None,
                 "red_team_review": response.red_team_review.model_dump(mode="json") if response.red_team_review else None,
                 "red_team_debug": response.red_team_debug.model_dump(mode="json") if response.red_team_debug else None,

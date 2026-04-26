@@ -216,6 +216,65 @@ function compactReasoning(reasoning?: string | null) {
     return firstSentence.length > 220 ? `${firstSentence.slice(0, 217)}...` : firstSentence;
 }
 
+const STAGE_COMPARE_ORDER: Array<{ key: string; label: string }> = [
+    { key: "ingest", label: "Ingest" },
+    { key: "stage1", label: "Stage 1" },
+    { key: "stage2", label: "Stage 2" },
+    { key: "red_team", label: "Red Team" },
+];
+
+function StageMetricsComparison({
+    baseline,
+    comparison,
+}: {
+    baseline?: AnalysisResult | null;
+    comparison?: AnalysisResult | null;
+}) {
+    const baselineMetrics = baseline?.stage_metrics || {};
+    const comparisonMetrics = comparison?.stage_metrics || {};
+    const hasMetrics = STAGE_COMPARE_ORDER.some(({ key }) => baselineMetrics[key] || comparisonMetrics[key]);
+    if (!hasMetrics) return null;
+
+    return (
+        <div className="rounded-lg border border-slate-700/50 bg-slate-950/40 overflow-hidden mb-4">
+            <div className="grid grid-cols-3 gap-3 px-3 py-2 border-b border-slate-700/50 bg-slate-900/30 text-[10px] uppercase tracking-wider text-slate-500">
+                <span>Stage</span>
+                <span>Baseline</span>
+                <span>Comparison</span>
+            </div>
+            {STAGE_COMPARE_ORDER.map(({ key, label }) => {
+                const left = baselineMetrics[key];
+                const right = comparisonMetrics[key];
+                return (
+                    <div key={key} className="grid grid-cols-3 gap-3 px-3 py-2.5 border-b border-slate-800/60 last:border-0">
+                        <p className="text-xs font-semibold text-slate-200">{label}</p>
+                        <div>
+                            {left ? (
+                                <>
+                                    <p className="text-xs text-slate-200">{(left.duration_ms / 1000).toFixed(2)}s</p>
+                                    <p className="text-[10px] text-slate-500 font-mono break-all">{left.model_name || left.status}</p>
+                                </>
+                            ) : (
+                                <p className="text-[10px] text-slate-600 italic">—</p>
+                            )}
+                        </div>
+                        <div>
+                            {right ? (
+                                <>
+                                    <p className="text-xs text-slate-200">{(right.duration_ms / 1000).toFixed(2)}s</p>
+                                    <p className="text-[10px] text-slate-500 font-mono break-all">{right.model_name || right.status}</p>
+                                </>
+                            ) : (
+                                <p className="text-[10px] text-slate-600 italic">—</p>
+                            )}
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
+
 function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
 }
@@ -456,6 +515,13 @@ type AnalysisResult = {
     ingestion_trace?: IngestionTrace | null;
     red_team_review?: RedTeamReview | null;
     red_team_debug?: RedTeamDebug | null;
+    stage_metrics?: Record<string, {
+        status: "completed" | "skipped";
+        model_name: string;
+        duration_ms: number;
+        item_count?: number | null;
+        details?: Record<string, any>;
+    }>;
     processing_time_ms: number;
 };
 type SnapshotRecommendation = {
@@ -515,6 +581,7 @@ const DEFAULT_APP_CONFIG: AppConfig = {
 };
 
 const LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY = "lastViewedAnalysisRequestId";
+const GOLDEN_DATASET_REQUEST_ID_KEY = "goldenDatasetRequestId";
 const ANALYSIS_STAGES: AnalysisStage[] = [
     { key: "preflight", label: "Checking model", weight: 0.08, matches: ["Ollama reachable"] },
     { key: "ingestion", label: "Collecting live feeds", weight: 0.24, matches: ["Fetching ", "articles", "Ingestion complete"] },
@@ -1234,6 +1301,7 @@ function ComparisonResultsCard({
     return (
         <GlassCard>
             <p className="text-[10px] text-slate-500 uppercase tracking-[0.24em] mb-2">{title}</p>
+            <StageMetricsComparison baseline={baselineResult} comparison={comparisonResult} />
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
                 <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3">
                     <p className="text-[10px] uppercase tracking-wider text-slate-500">Baseline signal</p>
@@ -1355,11 +1423,17 @@ function ModelComparePanel({
     result,
     snapshots,
     availableModels,
+    compareBaselineResult,
     compareResult,
+    goldenDatasetRequestId,
+    goldenBaselineResult,
+    benchmarkResults,
     savedBaselineResult,
     savedComparisonResult,
     onRerunSnapshot,
     onCompareSavedRuns,
+    onSelectGoldenDataset,
+    onClearBenchmarks,
     rerunLoading,
     rerunError,
     savedCompareLoading,
@@ -1368,17 +1442,23 @@ function ModelComparePanel({
     result: AnalysisResult | null;
     snapshots: AnalysisSnapshotItem[];
     availableModels: string[];
+    compareBaselineResult: AnalysisResult | null;
     compareResult: AnalysisResult | null;
+    goldenDatasetRequestId: string;
+    goldenBaselineResult: AnalysisResult | null;
+    benchmarkResults: AnalysisResult[];
     savedBaselineResult: AnalysisResult | null;
     savedComparisonResult: AnalysisResult | null;
     onRerunSnapshot: (requestId: string, modelName: string, extractionModel?: string, reasoningModel?: string) => Promise<void>;
     onCompareSavedRuns: (baselineRequestId: string, comparisonRequestId: string) => Promise<void>;
+    onSelectGoldenDataset: (requestId: string) => void;
+    onClearBenchmarks: () => void;
     rerunLoading: boolean;
     rerunError: string | null;
     savedCompareLoading: boolean;
     savedCompareError: string | null;
 }) {
-    const [selectedSnapshotId, setSelectedSnapshotId] = useState(result?.request_id || snapshots[0]?.request_id || "");
+    const [selectedSnapshotId, setSelectedSnapshotId] = useState(goldenDatasetRequestId || result?.request_id || snapshots[0]?.request_id || "");
     const [selectedExtractionModel, setSelectedExtractionModel] = useState("");
     const [selectedReasoningModel, setSelectedReasoningModel] = useState("");
     const [savedBaselineId, setSavedBaselineId] = useState(result?.request_id || snapshots[0]?.request_id || "");
@@ -1386,8 +1466,11 @@ function ModelComparePanel({
     const { timeZone } = useTimezone();
 
     useEffect(() => {
-        if (result?.request_id) setSelectedSnapshotId(result.request_id);
-    }, [result?.request_id]);
+        if (!goldenDatasetRequestId && result?.request_id) setSelectedSnapshotId(result.request_id);
+    }, [goldenDatasetRequestId, result?.request_id]);
+    useEffect(() => {
+        if (goldenDatasetRequestId) setSelectedSnapshotId(goldenDatasetRequestId);
+    }, [goldenDatasetRequestId]);
     useEffect(() => {
         if (!selectedSnapshotId && snapshots.length > 0) setSelectedSnapshotId(snapshots[0].request_id);
     }, [snapshots, selectedSnapshotId]);
@@ -1404,6 +1487,7 @@ function ModelComparePanel({
     const selectedSnapshot = snapshots.find((s) => s.request_id === selectedSnapshotId);
     const selectedSavedBaseline = snapshots.find((s) => s.request_id === savedBaselineId);
     const selectedSavedComparison = snapshots.find((s) => s.request_id === savedComparisonId);
+    const isGoldenDataset = !!selectedSnapshot && selectedSnapshot.request_id === goldenDatasetRequestId;
     const baselineModelLabel = selectedSnapshot
         ? (selectedSnapshot.extraction_model && selectedSnapshot.reasoning_model
             ? `${selectedSnapshot.extraction_model} → ${selectedSnapshot.reasoning_model}`
@@ -1535,6 +1619,15 @@ function ModelComparePanel({
                                 Rerun original
                             </button>
                         )}
+                        {selectedSnapshot && (
+                            <button
+                                type="button"
+                                onClick={() => onSelectGoldenDataset(selectedSnapshot.request_id)}
+                                className={`rounded-lg border px-4 py-2 text-xs min-h-[42px] whitespace-nowrap ${isGoldenDataset ? "border-amber-400 text-amber-200 bg-amber-500/10" : "border-slate-600 text-slate-300 hover:text-white hover:border-slate-400"}`}
+                            >
+                                {isGoldenDataset ? "Golden dataset" : "Set as golden dataset"}
+                            </button>
+                        )}
                     </div>
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
                         <label className="block">
@@ -1571,6 +1664,9 @@ function ModelComparePanel({
                                 {selectedSnapshot.risk_profile && (
                                     <span className="ml-1.5 text-[10px] font-mono text-slate-600">· {selectedSnapshot.risk_profile}</span>
                                 )}
+                                {isGoldenDataset && (
+                                    <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">· golden dataset</span>
+                                )}
                             </p>
                         )}
                         <button
@@ -1591,6 +1687,50 @@ function ModelComparePanel({
                 {rerunError && <p className="text-sm text-red-300 mt-3">{rerunError}</p>}
             </GlassCard>
 
+            {benchmarkResults.length > 0 && (
+                <GlassCard>
+                    <div className="flex items-center justify-between gap-3 mb-4">
+                        <div>
+                            <p className="text-[10px] text-emerald-300 uppercase tracking-[0.24em]">Benchmark</p>
+                            <h2 className="text-lg font-semibold text-white mt-1">Golden Dataset Benchmarks</h2>
+                            <p className="text-sm text-slate-400 mt-1">
+                                Repeated reruns against the same frozen dataset, with timing and final recommendations preserved.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={onClearBenchmarks}
+                            className="rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-300 hover:text-white hover:border-slate-400"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                    <div className="space-y-3">
+                        {benchmarkResults.map((benchmark) => (
+                            <div key={benchmark.request_id} className="rounded-lg border border-slate-700/50 bg-slate-950/40 p-3">
+                                <div className="flex flex-wrap items-center justify-between gap-3">
+                                    <div>
+                                        <p className="text-xs font-semibold text-white">{benchmark.trading_signal?.signal_type || "HOLD"}</p>
+                                        <p className="text-[10px] text-slate-500 font-mono break-all">{benchmark.request_id}</p>
+                                    </div>
+                                    <p className="text-sm text-slate-300">{(benchmark.processing_time_ms / 1000).toFixed(2)}s</p>
+                                </div>
+                                <StageMetricsComparison baseline={goldenBaselineResult} comparison={benchmark} />
+                                <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {((benchmark.trading_signal?.recommendations || []) as Recommendation[]).map((rec) => (
+                                        <div key={`${benchmark.request_id}-${rec.underlying_symbol || rec.symbol}`} className="rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2">
+                                            <p className="text-xs font-mono text-slate-200">
+                                                {rec.underlying_symbol || rec.symbol}: {rec.action} {rec.symbol} {rec.leverage}
+                                            </p>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </GlassCard>
+            )}
+
             <ComparisonResultsCard
                 title="Saved Run Results"
                 baselineResult={savedBaselineResult}
@@ -1600,27 +1740,29 @@ function ModelComparePanel({
             />
 
             {compareResult && (() => {
-                const curRecs: Recommendation[] = result?.trading_signal?.recommendations ?? [];
+                const baselineForCompare = compareBaselineResult || result;
+                const curRecs: Recommendation[] = baselineForCompare?.trading_signal?.recommendations ?? [];
                 const cmpRecs: Recommendation[] = compareResult.trading_signal?.recommendations ?? [];
-                const curSentiment = result?.sentiment_scores ?? {};
+                const curSentiment = baselineForCompare?.sentiment_scores ?? {};
                 const cmpSentiment = compareResult.sentiment_scores ?? {};
                 const curMap: Record<string, Recommendation> = {};
                 const cmpMap: Record<string, Recommendation> = {};
                 for (const r of curRecs) curMap[r.underlying_symbol || r.symbol] = r;
                 for (const r of cmpRecs) cmpMap[r.underlying_symbol || r.symbol] = r;
                 const allUnderlying = Array.from(new Set([...Object.keys(curMap), ...Object.keys(cmpMap)]));
-                const curSignal = result?.trading_signal?.signal_type || "n/a";
+                const curSignal = baselineForCompare?.trading_signal?.signal_type || "n/a";
                 const cmpSignal = compareResult.trading_signal?.signal_type || "n/a";
                 const signalMatch = curSignal === cmpSignal;
                 return (
                     <GlassCard>
                         <p className="text-[10px] text-slate-500 uppercase tracking-[0.24em] mb-4">Results</p>
+                        <StageMetricsComparison baseline={baselineForCompare} comparison={compareResult} />
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
                             <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3">
                                 <p className="text-[10px] uppercase tracking-wider text-slate-500">Baseline signal</p>
                                 <p className={`text-sm font-bold mt-1 ${signalColor(curSignal)}`}>{curSignal}</p>
                                 <p className="text-[10px] text-slate-500 mt-1 font-mono break-all">{baselineModelLabel}</p>
-                                <p className="text-[10px] text-slate-600 mt-1">{result ? `${(result.processing_time_ms / 1000).toFixed(2)}s` : "—"}</p>
+                                <p className="text-[10px] text-slate-600 mt-1">{baselineForCompare ? `${(baselineForCompare.processing_time_ms / 1000).toFixed(2)}s` : "—"}</p>
                             </div>
                             <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3">
                                 <p className="text-[10px] uppercase tracking-wider text-slate-500">Comparison signal</p>
@@ -2474,9 +2616,13 @@ export default function Home() {
     const [activeTab, setActiveTab] = useState<"current" | "history" | "compare" | "debug">("current");
     const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
     const [analysisSnapshots, setAnalysisSnapshots] = useState<AnalysisSnapshotItem[]>([]);
+    const [goldenDatasetRequestId, setGoldenDatasetRequestId] = useState("");
+    const [goldenBaselineResult, setGoldenBaselineResult] = useState<AnalysisResult | null>(null);
     const [comparisonResult, setComparisonResult] = useState<AnalysisResult | null>(null);
+    const [comparisonBaselineResult, setComparisonBaselineResult] = useState<AnalysisResult | null>(null);
     const [comparisonLoading, setComparisonLoading] = useState(false);
     const [comparisonError, setComparisonError] = useState<string | null>(null);
+    const [benchmarkResults, setBenchmarkResults] = useState<AnalysisResult[]>([]);
     const [savedComparisonBaseline, setSavedComparisonBaseline] = useState<AnalysisResult | null>(null);
     const [savedComparisonResult, setSavedComparisonResult] = useState<AnalysisResult | null>(null);
     const [savedComparisonLoading, setSavedComparisonLoading] = useState(false);
@@ -2648,6 +2794,12 @@ export default function Home() {
         } catch { }
     }, []);
 
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+        const saved = localStorage.getItem(GOLDEN_DATASET_REQUEST_ID_KEY) || "";
+        if (saved) setGoldenDatasetRequestId(saved);
+    }, []);
+
     const fetchSnapshotDetail = useCallback(async (requestId: string) => {
         const response = await fetch(`/api/analyze/snapshots/${encodeURIComponent(requestId)}`, { cache: "no-store" });
         const payload = await response.json();
@@ -2716,7 +2868,10 @@ export default function Home() {
         setComparisonLoading(true);
         setComparisonError(null);
         try {
-            const response = await fetch("/api/analyze/rerun", {
+            const baselinePromise = result?.request_id === requestId && result
+                ? Promise.resolve(result)
+                : fetchSnapshotDetail(requestId);
+            const responsePromise = fetch("/api/analyze/rerun", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -2726,11 +2881,20 @@ export default function Home() {
                     ...(reasoningModel ? { reasoning_model: reasoningModel } : {}),
                 }),
             });
+            const [baselinePayload, response] = await Promise.all([baselinePromise, responsePromise]);
             const payload = await response.json();
             if (!response.ok) {
                 throw new Error(payload?.detail?.message || payload?.error || "Failed to rerun snapshot");
             }
+            setComparisonBaselineResult(baselinePayload);
             setComparisonResult(payload);
+            if (requestId === goldenDatasetRequestId) {
+                setGoldenBaselineResult(baselinePayload);
+                setBenchmarkResults((current) => {
+                    const next = [payload as AnalysisResult, ...current.filter((item) => item.request_id !== payload.request_id)];
+                    return next.slice(0, 8);
+                });
+            }
             void fetchPnl();
             void fetchAnalysisSnapshots();
         } catch (err: any) {
@@ -2738,7 +2902,7 @@ export default function Home() {
         } finally {
             setComparisonLoading(false);
         }
-    }, [fetchAnalysisSnapshots, fetchPnl]);
+    }, [fetchAnalysisSnapshots, fetchPnl, fetchSnapshotDetail, goldenDatasetRequestId, result]);
 
     const handleCompareSavedRuns = useCallback(async (baselineRequestId: string, comparisonRequestId: string) => {
         if (!baselineRequestId || !comparisonRequestId || baselineRequestId === comparisonRequestId) return;
@@ -2757,6 +2921,29 @@ export default function Home() {
             setSavedComparisonLoading(false);
         }
     }, [fetchSnapshotDetail]);
+
+    const handleSelectGoldenDataset = useCallback(async (requestId: string) => {
+        setGoldenDatasetRequestId(requestId);
+        if (typeof window !== "undefined") {
+            localStorage.setItem(GOLDEN_DATASET_REQUEST_ID_KEY, requestId);
+        }
+        setBenchmarkResults([]);
+        if (result?.request_id === requestId && result) {
+            setGoldenBaselineResult(result);
+            return;
+        }
+        try {
+            const payload = await fetchSnapshotDetail(requestId);
+            setGoldenBaselineResult(payload);
+        } catch {
+            setGoldenBaselineResult(null);
+        }
+    }, [fetchSnapshotDetail, result]);
+
+    const handleClearBenchmarks = useCallback(() => {
+        setBenchmarkResults([]);
+        setGoldenBaselineResult(null);
+    }, []);
 
     useEffect(() => {
         const timerStart = streamStartedAt ?? analysisStartedAt;
@@ -3211,11 +3398,17 @@ export default function Home() {
                                         result={result ?? null}
                                         snapshots={analysisSnapshots}
                                         availableModels={ollamaStatus?.available_models ?? []}
+                                        compareBaselineResult={comparisonBaselineResult}
                                         compareResult={comparisonResult}
+                                        goldenDatasetRequestId={goldenDatasetRequestId}
+                                        goldenBaselineResult={goldenBaselineResult}
+                                        benchmarkResults={benchmarkResults}
                                         savedBaselineResult={savedComparisonBaseline}
                                         savedComparisonResult={savedComparisonResult}
                                         onRerunSnapshot={handleRerunSnapshot}
                                         onCompareSavedRuns={handleCompareSavedRuns}
+                                        onSelectGoldenDataset={handleSelectGoldenDataset}
+                                        onClearBenchmarks={handleClearBenchmarks}
                                         rerunLoading={comparisonLoading}
                                         rerunError={comparisonError}
                                         savedCompareLoading={savedComparisonLoading}

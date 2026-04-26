@@ -370,6 +370,16 @@ class IngestionTraceDebug(BaseModel):
     rss: Dict[str, Any] = Field(default_factory=dict)
 
 
+class StageMetric(BaseModel):
+    """Per-stage runtime and model metadata for compare/benchmark views."""
+
+    status: Literal["completed", "skipped"] = Field(default="completed")
+    model_name: str = Field(default="")
+    duration_ms: float = Field(default=0.0)
+    item_count: Optional[int] = Field(default=None)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class AnalysisResponse(BaseModel):
     """
     Response schema for analysis endpoint.
@@ -435,6 +445,11 @@ class AnalysisResponse(BaseModel):
     red_team_debug: Optional[RedTeamDebug] = Field(
         default=None,
         description="Detailed red-team prompt, raw response, parsed payload, and blue-vs-consensus diffs"
+    )
+
+    stage_metrics: Dict[str, StageMetric] = Field(
+        default_factory=dict,
+        description="Per-stage timing and model metadata for ingest, stage 1, stage 2, and red team"
     )
     
     # Backtest results (optional)
