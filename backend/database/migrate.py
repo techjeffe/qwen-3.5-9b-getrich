@@ -227,6 +227,63 @@ def migrate():
                 conn.execute(text("CREATE INDEX ix_scraped_articles_discovered_at ON scraped_articles (discovered_at)"))
                 conn.commit()
                 print("scraped_articles table created.")
+
+            # ── app_config: Alpaca live trading columns ────────────────────
+            existing_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(app_config)")).fetchall()]
+            for column_name, column_type, default_value in [
+                ("alpaca_live_trading_enabled",   "BOOLEAN", "0"),
+                ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
+                ("alpaca_limit_slippage_pct",     "REAL", "0.002"),
+            ]:
+                if column_name not in existing_cols:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}")
+                    conn.commit()
+            for column_name, column_type in [
+                ("alpaca_max_position_usd",       "REAL"),
+                ("alpaca_max_total_exposure_usd", "REAL"),
+                ("alpaca_daily_loss_limit_usd",   "REAL"),
+                ("alpaca_max_consecutive_losses", "INTEGER"),
+            ]:
+                if column_name not in existing_cols:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+
+            # ── alpaca_orders table ────────────────────────────────────────
+            if "alpaca_orders" not in tables:
+                print("Creating alpaca_orders table...")
+                conn.execute(text("""
+                    CREATE TABLE alpaca_orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        paper_trade_id INTEGER REFERENCES paper_trades(id),
+                        alpaca_order_id VARCHAR(64),
+                        client_order_id VARCHAR(128) UNIQUE,
+                        symbol VARCHAR(20) NOT NULL,
+                        side VARCHAR(10) NOT NULL,
+                        notional REAL,
+                        qty REAL,
+                        order_type VARCHAR(20) NOT NULL DEFAULT 'market',
+                        time_in_force VARCHAR(10) NOT NULL DEFAULT 'day',
+                        limit_price REAL,
+                        extended_hours BOOLEAN NOT NULL DEFAULT 0,
+                        status VARCHAR(30),
+                        filled_qty REAL,
+                        filled_avg_price REAL,
+                        submitted_at DATETIME,
+                        filled_at DATETIME,
+                        trading_mode VARCHAR(10) NOT NULL DEFAULT 'paper',
+                        raw_response JSON,
+                        error_message TEXT,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_paper_trade_id ON alpaca_orders (paper_trade_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_alpaca_order_id ON alpaca_orders (alpaca_order_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_created_at ON alpaca_orders (created_at)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_trading_mode ON alpaca_orders (trading_mode)"))
+                conn.commit()
+                print("alpaca_orders table created.")
         else:
             # ── app_config columns ──────────────────────────────────────────
             for column_name, column_type, default_value in [
@@ -409,6 +466,73 @@ def migrate():
                     print(f"Adding {column_name} to paper_trades...")
                     conn.execute(text(f"ALTER TABLE paper_trades ADD COLUMN {column_name} {column_type}"))
                     conn.commit()
+
+            # ── app_config: Alpaca live trading columns ────────────────────
+            for column_name, column_type, default_value in [
+                ("alpaca_live_trading_enabled",   "BOOLEAN", "FALSE"),
+                ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
+                ("alpaca_limit_slippage_pct",     "FLOAT", "0.002"),
+            ]:
+                result = conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
+                    {"col": column_name},
+                ).fetchone()
+                if not result:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}"))
+                    conn.commit()
+            for column_name, column_type in [
+                ("alpaca_max_position_usd",       "FLOAT"),
+                ("alpaca_max_total_exposure_usd", "FLOAT"),
+                ("alpaca_daily_loss_limit_usd",   "FLOAT"),
+                ("alpaca_max_consecutive_losses", "INTEGER"),
+            ]:
+                result = conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),
+                    {"col": column_name},
+                ).fetchone()
+                if not result:
+                    print(f"Adding {column_name} to app_config...")
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type}"))
+                    conn.commit()
+
+            # ── alpaca_orders table ────────────────────────────────────────
+            result = conn.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_name='alpaca_orders'")
+            ).fetchone()
+            if not result:
+                print("Creating alpaca_orders table...")
+                conn.execute(text("""
+                    CREATE TABLE alpaca_orders (
+                        id SERIAL PRIMARY KEY,
+                        paper_trade_id INTEGER REFERENCES paper_trades(id),
+                        alpaca_order_id VARCHAR(64),
+                        client_order_id VARCHAR(128) UNIQUE,
+                        symbol VARCHAR(20) NOT NULL,
+                        side VARCHAR(10) NOT NULL,
+                        notional FLOAT,
+                        qty FLOAT,
+                        order_type VARCHAR(20) NOT NULL DEFAULT 'market',
+                        time_in_force VARCHAR(10) NOT NULL DEFAULT 'day',
+                        limit_price FLOAT,
+                        extended_hours BOOLEAN NOT NULL DEFAULT FALSE,
+                        status VARCHAR(30),
+                        filled_qty FLOAT,
+                        filled_avg_price FLOAT,
+                        submitted_at TIMESTAMPTZ,
+                        filled_at TIMESTAMPTZ,
+                        trading_mode VARCHAR(10) NOT NULL DEFAULT 'paper',
+                        raw_response JSON,
+                        error_message TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_paper_trade_id ON alpaca_orders (paper_trade_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_alpaca_order_id ON alpaca_orders (alpaca_order_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_created_at ON alpaca_orders (created_at)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alpaca_orders_trading_mode ON alpaca_orders (trading_mode)"))
+                conn.commit()
+                print("alpaca_orders table created.")
 
             # ── trade_closes table ──────────────────────────────────────────
             result = conn.execute(

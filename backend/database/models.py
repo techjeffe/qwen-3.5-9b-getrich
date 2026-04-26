@@ -365,6 +365,15 @@ class AppConfig(Base):
     trail_on_window_expiry = Column(Boolean, nullable=False, default=True)
     reentry_cooldown_minutes = Column(Integer, nullable=True, default=None)
 
+    # ── Alpaca live trading ───────────────────────────────────────────────────
+    alpaca_live_trading_enabled   = Column(Boolean,     nullable=False, default=False)
+    alpaca_max_position_usd       = Column(Float,       nullable=True,  default=None)
+    alpaca_max_total_exposure_usd = Column(Float,       nullable=True,  default=None)
+    alpaca_order_type             = Column(String(20),  nullable=False, default="market")
+    alpaca_limit_slippage_pct     = Column(Float,       nullable=False, default=0.002)
+    alpaca_daily_loss_limit_usd   = Column(Float,       nullable=True,  default=None)
+    alpaca_max_consecutive_losses = Column(Integer,     nullable=True,  default=3)
+
     last_analysis_started_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_completed_at = Column(DateTime(timezone=True), nullable=True)
     last_analysis_request_id = Column(String(36), nullable=True)
@@ -383,6 +392,37 @@ class AppConfig(Base):
         Index("ix_app_config_last_analysis_started_at", "last_analysis_started_at"),
         Index("ix_app_config_analysis_lock_expires_at", "analysis_lock_expires_at"),
     )
+
+
+class AlpacaOrder(Base):
+    """
+    Record of every order attempt sent (or attempted) to the Alpaca brokerage API.
+    Written for both successes and failures; paper_trade_id links back to the
+    originating paper trade so the two can be compared side-by-side.
+    """
+    __tablename__ = "alpaca_orders"
+
+    id                = Column(Integer,  primary_key=True)
+    paper_trade_id    = Column(Integer,  ForeignKey("paper_trades.id"), nullable=True, index=True)
+    alpaca_order_id   = Column(String(64),  nullable=True,  index=True)
+    client_order_id   = Column(String(128), nullable=True,  unique=True)
+    symbol            = Column(String(20),  nullable=False)
+    side              = Column(String(10),  nullable=False)   # buy | sell
+    notional          = Column(Float,       nullable=True)
+    qty               = Column(Float,       nullable=True)
+    order_type        = Column(String(20),  nullable=False, default="market")
+    time_in_force     = Column(String(10),  nullable=False, default="day")
+    limit_price       = Column(Float,       nullable=True)
+    extended_hours    = Column(Boolean,     nullable=False, default=False)
+    status            = Column(String(30),  nullable=True)   # filled | cancelled | rejected | error
+    filled_qty        = Column(Float,       nullable=True)
+    filled_avg_price  = Column(Float,       nullable=True)
+    submitted_at      = Column(DateTime(timezone=True), nullable=True)
+    filled_at         = Column(DateTime(timezone=True), nullable=True)
+    trading_mode      = Column(String(10),  nullable=False, default="paper")   # paper | live
+    raw_response      = Column(JSON,        nullable=True)
+    error_message     = Column(Text,        nullable=True)
+    created_at        = Column(DateTime(timezone=True), nullable=False, default=func.now())
 
 
 # Create all tables
