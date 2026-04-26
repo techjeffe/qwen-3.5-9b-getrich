@@ -12,6 +12,10 @@ SECRET_SERVICE_NAME = "qwen-3.5-9b-getrich"
 TELEGRAM_BOT_TOKEN_KEY = "telegram_bot_token"
 TELEGRAM_CHAT_ID_KEY = "telegram_chat_id"
 
+ALPACA_API_KEY_KEY    = "alpaca_api_key"
+ALPACA_SECRET_KEY_KEY = "alpaca_secret_key"
+ALPACA_MODE_KEY       = "alpaca_trading_mode"   # "paper" | "live"
+
 
 def _get_keyring_module():
     try:
@@ -103,4 +107,66 @@ def get_telegram_credentials() -> Dict[str, str]:
     return {
         "bot_token": token,
         "chat_id": chat_id,
+    }
+
+
+# ── Alpaca ────────────────────────────────────────────────────────────────────
+
+def get_alpaca_secret_status() -> Dict[str, Any]:
+    try:
+        api_key    = _read_secret(ALPACA_API_KEY_KEY)
+        secret_key = _read_secret(ALPACA_SECRET_KEY_KEY)
+        mode       = _read_secret(ALPACA_MODE_KEY) or "paper"
+        return {
+            "available":        True,
+            "configured":       bool(api_key and secret_key),
+            "has_api_key":      bool(api_key),
+            "has_secret_key":   bool(secret_key),
+            "api_key_masked":   _mask_secret(api_key),
+            "secret_key_masked":_mask_secret(secret_key),
+            "trading_mode":     mode,
+            "error":            "",
+        }
+    except Exception as exc:
+        return {
+            "available":        False,
+            "configured":       False,
+            "has_api_key":      False,
+            "has_secret_key":   False,
+            "api_key_masked":   "",
+            "secret_key_masked":"",
+            "trading_mode":     "paper",
+            "error":            str(exc),
+        }
+
+
+def save_alpaca_secrets(api_key: str, secret_key: str, mode: str = "paper") -> Dict[str, Any]:
+    key    = str(api_key    or "").strip()
+    secret = str(secret_key or "").strip()
+    m      = str(mode       or "paper").strip().lower()
+    if not key:
+        raise ValueError("api_key is required")
+    if not secret:
+        raise ValueError("secret_key is required")
+    if m not in ("paper", "live"):
+        raise ValueError("mode must be 'paper' or 'live'")
+
+    _write_secret(ALPACA_API_KEY_KEY,    key)
+    _write_secret(ALPACA_SECRET_KEY_KEY, secret)
+    _write_secret(ALPACA_MODE_KEY,       m)
+    return get_alpaca_secret_status()
+
+
+def clear_alpaca_secrets() -> Dict[str, Any]:
+    _delete_secret(ALPACA_API_KEY_KEY)
+    _delete_secret(ALPACA_SECRET_KEY_KEY)
+    _delete_secret(ALPACA_MODE_KEY)
+    return get_alpaca_secret_status()
+
+
+def get_alpaca_credentials() -> Dict[str, str]:
+    return {
+        "api_key":    _read_secret(ALPACA_API_KEY_KEY),
+        "secret_key": _read_secret(ALPACA_SECRET_KEY_KEY),
+        "mode":       _read_secret(ALPACA_MODE_KEY) or "paper",
     }
