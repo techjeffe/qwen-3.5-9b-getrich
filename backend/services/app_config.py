@@ -20,7 +20,7 @@ from config.logic_loader import LOGIC as _L
 
 DEFAULT_TRACKED_SYMBOLS = ["USO", "BITO", "QQQ", "SPY"]
 DEFAULT_RSS_ARTICLE_DETAIL_MODE = "normal"
-DEFAULT_RSS_ARTICLE_LIMITS = {"light": 5, "normal": 15, "detailed": 25}
+DEFAULT_RSS_ARTICLE_LIMITS = {"light": 5, "normal": 10, "detailed": 20}
 DEFAULT_WEB_RESEARCH_ITEMS = {"light": 3, "normal": 4, "detailed": 6}
 DEFAULT_WEB_RESEARCH_RECENCY_DAYS = {"light": 14, "normal": 30, "detailed": 45}
 LEGACY_DISABLED_RSS_FEED_URLS = {

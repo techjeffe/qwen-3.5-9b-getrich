@@ -330,7 +330,7 @@ class AppConfig(Base):
     custom_rss_feeds = Column(JSON, nullable=False, default=[])
     custom_rss_feed_labels = Column(JSON, nullable=False, default={})
     rss_article_detail_mode = Column(String(20), nullable=False, default="normal")
-    rss_article_limits = Column(JSON, nullable=False, default={"light": 5, "normal": 15, "detailed": 25})
+    rss_article_limits = Column(JSON, nullable=False, default={"light": 5, "normal": 10, "detailed": 20})
     data_ingestion_interval_seconds = Column(Integer, nullable=False, default=900)
     snapshot_retention_limit = Column(Integer, nullable=False, default=12)
     extraction_model = Column(String(128), nullable=False, default="")
