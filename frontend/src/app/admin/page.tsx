@@ -141,7 +141,7 @@ const EMPTY_CONFIG: AppConfig = {
     supported_rss_feeds: [],
     max_custom_rss_feeds: 3,
     rss_article_detail_mode: "normal",
-    rss_article_limits: { light: 5, normal: 15, detailed: 25 },
+    rss_article_limits: { light: 5, normal: 10, detailed: 20 },
     rss_articles_per_feed: 15,
 };
 
@@ -167,7 +167,7 @@ const BASIC_MODE_DEFAULTS: Partial<AppConfig> = {
     remote_snapshot_send_on_position_change: true,
     remote_snapshot_include_closed_trades: false,
     remote_snapshot_max_recommendations: 4,
-    rss_article_limits: { light: 5, normal: 15, detailed: 25 },
+    rss_article_limits: { light: 5, normal: 10, detailed: 20 },
 };
 
 type UnexecutedTrade = {
@@ -1874,6 +1874,30 @@ python run.py`}</code></pre>
                         <span className="text-xs text-slate-500 font-mono">
                             {config.rss_article_limits[config.rss_article_detail_mode]} articles/feed · {depthOptions.find(o => o.key === config.rss_article_detail_mode)?.label}
                         </span>
+                    </div>
+
+                    <div>
+                        <p className="text-xs text-slate-400 mb-3">Articles per feed — by depth</p>
+                        <p className="text-[11px] text-slate-500 mb-3">
+                            How many articles to fetch from each feed at each depth level. Total ingested = articles/feed × active feeds.
+                            The active depth ({depthOptions.find(o => o.key === config.rss_article_detail_mode)?.label}) is highlighted.
+                        </p>
+                        <div className="grid grid-cols-3 gap-3">
+                            {(["light", "normal", "detailed"] as const).map((depth) => (
+                                <label key={depth} className={`block rounded-xl border p-3 ${config.rss_article_detail_mode === depth ? "border-blue-700/60 bg-blue-950/20" : "border-slate-800 bg-slate-950/40"}`}>
+                                    <span className={`block text-xs font-medium capitalize mb-2 ${config.rss_article_detail_mode === depth ? "text-blue-300" : "text-slate-400"}`}>{depth}</span>
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        max={50}
+                                        value={config.rss_article_limits[depth]}
+                                        onChange={(e) => updateArticleLimit(depth, e.target.value)}
+                                        className="w-full rounded-lg border border-slate-700 bg-slate-800 px-2 py-1.5 text-sm text-white outline-none focus:border-blue-400"
+                                    />
+                                    <span className="block mt-1.5 text-[10px] text-slate-600">per feed, 1–50</span>
+                                </label>
+                            ))}
+                        </div>
                     </div>
 
                     <div className="space-y-3">
