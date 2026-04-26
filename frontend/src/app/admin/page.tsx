@@ -271,28 +271,24 @@ export default function AdminPage() {
         label: string;
         tagline: string;
         pipeline: string;
-        articles: string;
     }> = [
         {
             key: "light",
             label: "Light",
             tagline: "Fast single-model run",
             pipeline: "One model handles both entity mapping and reasoning — fastest turnaround.",
-            articles: "5 articles per feed",
         },
         {
             key: "normal",
             label: "Normal",
             tagline: "Balanced, configurable",
             pipeline: "Optionally split entity mapping and reasoning across two models. Falls back to single-model if only one is configured.",
-            articles: "15 articles per feed",
         },
         {
             key: "detailed",
             label: "Detailed",
             tagline: "Full two-model pipeline",
             pipeline: "Always runs Stage 1 entity mapping then Stage 2 reasoning. Requires both models to be set.",
-            articles: "25 articles per feed",
         },
     ];
     const jumpOptions = [
@@ -1134,9 +1130,6 @@ python run.py`}</code></pre>
                             <p className="mt-3 font-semibold text-slate-200">
                                 {depthOptions.find((option) => option.key === config.rss_article_detail_mode)?.label ?? "Normal"} depth
                             </p>
-                            <p className="mt-1 text-slate-500">
-                                {depthOptions.find((option) => option.key === config.rss_article_detail_mode)?.articles}
-                            </p>
                             <p className="mt-3 text-slate-500">Risk profile</p>
                             <p className="mt-1 font-semibold text-slate-200 capitalize">{config.risk_profile || "moderate"}</p>
                             <p className="mt-3 text-slate-500">Tracked symbols</p>
@@ -1166,7 +1159,6 @@ python run.py`}</code></pre>
                         <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-xs text-slate-400 min-w-[160px]">
                             <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Active depth</p>
                             <p className="mt-1.5 font-semibold text-slate-200">{depthOptions.find(o => o.key === config.rss_article_detail_mode)?.label ?? "Normal"}</p>
-                            <p className="mt-0.5 text-slate-500">{depthOptions.find(o => o.key === config.rss_article_detail_mode)?.articles}</p>
                         </div>
                     </div>
 
@@ -1187,7 +1179,6 @@ python run.py`}</code></pre>
                                     <p className="text-sm font-semibold">{option.label}</p>
                                     <p className="mt-0.5 text-[11px] text-slate-400 font-medium">{option.tagline}</p>
                                     <p className="mt-1.5 text-[11px] text-slate-500">{option.pipeline}</p>
-                                    <p className="mt-2 text-[10px] font-mono text-slate-600">{option.articles}</p>
                                 </button>
                             ))}
                         </div>
@@ -1198,8 +1189,8 @@ python run.py`}</code></pre>
                         <p className="text-[11px] text-slate-500 mb-2">
                             Max posts ingested per analysis. Lower = faster Stage 2 (each post adds context tokens). Higher = broader signal coverage.
                         </p>
-                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                            {[10, 25, 50, 100, 200].map((n) => (
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {[5, 10, 15, 20].map((n) => (
                                 <button
                                     key={n}
                                     type="button"
@@ -1219,9 +1210,9 @@ python run.py`}</code></pre>
                             <input
                                 type="number"
                                 min={1}
-                                max={500}
+                                max={50}
                                 value={config.max_posts}
-                                onChange={(e) => setConfig((c) => ({ ...c, max_posts: Math.max(1, Math.min(500, parseInt(e.target.value) || 1)) }))}
+                                onChange={(e) => setConfig((c) => ({ ...c, max_posts: Math.max(1, Math.min(50, parseInt(e.target.value) || 1)) }))}
                                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
                             />
                         </label>
