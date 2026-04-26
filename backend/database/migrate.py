@@ -232,6 +232,7 @@ def migrate():
             existing_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(app_config)")).fetchall()]
             for column_name, column_type, default_value in [
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "0"),
+                ("alpaca_allow_short_selling",    "BOOLEAN", "0"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
                 ("alpaca_limit_slippage_pct",     "REAL", "0.002"),
             ]:
@@ -470,6 +471,7 @@ def migrate():
             # ── app_config: Alpaca live trading columns ────────────────────
             for column_name, column_type, default_value in [
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "FALSE"),
+                ("alpaca_allow_short_selling",    "BOOLEAN", "FALSE"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
                 ("alpaca_limit_slippage_pct",     "FLOAT", "0.002"),
             ]:

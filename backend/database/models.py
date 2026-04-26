@@ -367,6 +367,7 @@ class AppConfig(Base):
 
     # ── Alpaca live trading ───────────────────────────────────────────────────
     alpaca_live_trading_enabled   = Column(Boolean,     nullable=False, default=False)
+    alpaca_allow_short_selling    = Column(Boolean,     nullable=False, default=False)
     alpaca_max_position_usd       = Column(Float,       nullable=True,  default=None)
     alpaca_max_total_exposure_usd = Column(Float,       nullable=True,  default=None)
     alpaca_order_type             = Column(String(20),  nullable=False, default="market")

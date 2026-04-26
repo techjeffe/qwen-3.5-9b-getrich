@@ -796,6 +796,23 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.trail_on_window_expiry = bool(payload.get("trail_on_window_expiry"))
     if "reentry_cooldown_minutes" in payload:
         config.reentry_cooldown_minutes = _normalize_trading_logic_int(payload.get("reentry_cooldown_minutes"), 0, 10080)
+    if "alpaca_live_trading_enabled" in payload:
+        config.alpaca_live_trading_enabled = _coerce_bool(payload.get("alpaca_live_trading_enabled"), False)
+    if "alpaca_allow_short_selling" in payload:
+        config.alpaca_allow_short_selling = _coerce_bool(payload.get("alpaca_allow_short_selling"), False)
+    if "alpaca_max_position_usd" in payload:
+        config.alpaca_max_position_usd = _normalize_trading_logic_float(payload.get("alpaca_max_position_usd"), 1.0, 1_000_000.0)
+    if "alpaca_max_total_exposure_usd" in payload:
+        config.alpaca_max_total_exposure_usd = _normalize_trading_logic_float(payload.get("alpaca_max_total_exposure_usd"), 1.0, 10_000_000.0)
+    if "alpaca_order_type" in payload:
+        v = str(payload.get("alpaca_order_type") or "market").strip().lower()
+        config.alpaca_order_type = v if v in {"market", "limit"} else "market"
+    if "alpaca_limit_slippage_pct" in payload:
+        config.alpaca_limit_slippage_pct = _normalize_trading_logic_float(payload.get("alpaca_limit_slippage_pct"), 0.0001, 0.05) or 0.002
+    if "alpaca_daily_loss_limit_usd" in payload:
+        config.alpaca_daily_loss_limit_usd = _normalize_trading_logic_float(payload.get("alpaca_daily_loss_limit_usd"), 1.0, 1_000_000.0)
+    if "alpaca_max_consecutive_losses" in payload:
+        config.alpaca_max_consecutive_losses = _normalize_trading_logic_int(payload.get("alpaca_max_consecutive_losses"), 1, 50)
 
     db.add(config)
     db.commit()
@@ -999,6 +1016,15 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "hold_overnight": bool(getattr(config, "hold_overnight", False)),
         "trail_on_window_expiry": bool(getattr(config, "trail_on_window_expiry", True)),
         "reentry_cooldown_minutes": getattr(config, "reentry_cooldown_minutes", None),
+        # Alpaca live trading settings
+        "alpaca_live_trading_enabled":   bool(getattr(config, "alpaca_live_trading_enabled",   False)),
+        "alpaca_allow_short_selling":    bool(getattr(config, "alpaca_allow_short_selling",    False)),
+        "alpaca_max_position_usd":       getattr(config, "alpaca_max_position_usd",            None),
+        "alpaca_max_total_exposure_usd": getattr(config, "alpaca_max_total_exposure_usd",      None),
+        "alpaca_order_type":             str(getattr(config,  "alpaca_order_type",             "market") or "market"),
+        "alpaca_limit_slippage_pct":     float(getattr(config, "alpaca_limit_slippage_pct",    0.002) or 0.002),
+        "alpaca_daily_loss_limit_usd":   getattr(config, "alpaca_daily_loss_limit_usd",        None),
+        "alpaca_max_consecutive_losses": getattr(config, "alpaca_max_consecutive_losses",      3),
         # JSON defaults (read-only, for display)
         "logic_defaults": {
             "paper_trade_amount": _L["paper_trade_amount"],
