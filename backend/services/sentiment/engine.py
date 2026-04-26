@@ -456,12 +456,14 @@ class SentimentEngine:
         _min_mag = _ss["directional_score_min_magnitude"]
         # bluster_short_threshold is intentionally more negative than the old -0.35
         # to require stronger bluster before auto-triggering SHORT without policy backing
-        if bluster_score < _ss["bluster_short_threshold"] and policy_score < _ss["policy_signal_threshold"]:
+        if (bluster_score < _ss["bluster_short_threshold"]
+                and policy_score < _ss["policy_signal_threshold"]
+                and direction != "bearish"):
             signal_type = "SHORT"
         elif policy_score >= _ss["policy_signal_threshold"] and relevant:
-            if direction == "bullish":
+            if direction == "bullish" and confidence >= _ss["direction_confidence_min"]:
                 signal_type = "LONG"
-            elif direction == "bearish":
+            elif direction == "bearish" and confidence >= _ss["direction_confidence_min"]:
                 signal_type = "SHORT"
             else:
                 signal_type = "HOLD"
