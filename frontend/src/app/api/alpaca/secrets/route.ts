@@ -30,9 +30,12 @@ export async function POST(request: NextRequest) {
     }
 }
 
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
     try {
-        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/secrets`, {
+        const { searchParams } = new URL(request.url);
+        const mode = searchParams.get("mode") || "";
+        const qs = mode ? `?mode=${encodeURIComponent(mode)}` : "";
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/secrets${qs}`, {
             method: "DELETE",
             headers: backendHeaders(),
         });

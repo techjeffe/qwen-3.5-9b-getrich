@@ -91,10 +91,8 @@ type AppConfig = {
 type AlpacaStatus = {
     secrets: {
         configured: boolean;
-        has_api_key: boolean;
-        has_secret_key: boolean;
-        api_key_masked: string;
-        mode: string;
+        paper: { configured: boolean; api_key_masked: string };
+        live:  { configured: boolean; api_key_masked: string };
         error: string;
     };
     live_trading_enabled: boolean;
@@ -971,17 +969,18 @@ export default function AdminPage() {
         }
     };
 
-    const clearAlpacaSecrets = async () => {
+    const clearAlpacaSecrets = async (mode?: "paper" | "live") => {
         setIsSavingAlpacaSecrets(true);
         setAlpacaSecretStatus("");
         try {
-            const response = await fetch("/api/alpaca/secrets", { method: "DELETE" });
+            const qs = mode ? `?mode=${mode}` : "";
+            const response = await fetch(`/api/alpaca/secrets${qs}`, { method: "DELETE" });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
                 setAlpacaSecretStatus(payload?.error || "Failed to clear secrets");
                 return;
             }
-            setAlpacaSecretStatus("Keys cleared from OS keychain");
+            setAlpacaSecretStatus(mode ? `${mode} keys cleared` : "All keys cleared from OS keychain");
             await fetchAlpacaStatus();
         } catch {
             setAlpacaSecretStatus("Failed to clear secrets");
@@ -990,19 +989,20 @@ export default function AdminPage() {
         }
     };
 
-    const testAlpacaConnection = async () => {
+    const testAlpacaConnection = async (mode?: "paper" | "live") => {
         setIsTestingAlpacaConnection(true);
         setAlpacaTestResult(null);
         try {
-            const response = await fetch("/api/alpaca/test-connection", { method: "POST" });
+            const qs = mode ? `?mode=${mode}` : "";
+            const response = await fetch(`/api/alpaca/test-connection${qs}`, { method: "POST" });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
                 setAlpacaTestResult({ ok: false, message: payload?.error || "Connection failed" });
                 return;
             }
-            const mode = payload?.mode === "live" ? "live" : "paper";
+            const testedMode = payload?.mode === "live" ? "live" : "paper";
             const equity = payload?.account?.equity ? ` — equity $${Number(payload.account.equity).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "";
-            setAlpacaTestResult({ ok: true, message: `Connected (${mode}${equity})` });
+            setAlpacaTestResult({ ok: true, message: `Connected (${testedMode}${equity})` });
             await fetchAlpacaStatus();
         } catch {
             setAlpacaTestResult({ ok: false, message: "Network error" });
@@ -2511,26 +2511,56 @@ python run.py`}</code></pre>
                         </p>
                     </div>
 
-                    {/* API credentials row */}
-                    <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm">
-                        <div>
-                            <p className="text-slate-200">API credentials</p>
-                            <p className="mt-1 text-xs text-slate-500">
-                                {alpacaStatus?.secrets?.configured
-                                    ? `${alpacaStatus.secrets.mode === "live" ? "Live" : "Paper"} mode — key ${alpacaStatus.secrets.api_key_masked || "…"}`
-                                    : "Not configured"}
-                            </p>
-                        </div>
-                        <span className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${
-                            alpacaStatus?.secrets?.configured ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-800 text-slate-400"
-                        }`}>
-                            {alpacaStatus?.secrets?.configured ? "Configured" : "Not set"}
-                        </span>
+                    {/* Credential status — one row per mode */}
+                    <div className="space-y-2">
+                        {(["paper", "live"] as const).map((slot) => {
+                            const info = alpacaStatus?.secrets?.[slot];
+                            const ok = !!info?.configured;
+                            return (
+                                <div key={slot} className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm">
+                                    <div>
+                                        <p className="text-slate-200 capitalize">{slot} credentials</p>
+                                        <p className="mt-0.5 text-xs text-slate-500">
+                                            {ok
+                                                ? `${slot === "live" ? "api.alpaca.markets" : "paper-api.alpaca.markets"} — key ${info.api_key_masked || "…"}`
+                                                : slot === "live" ? "Not set — required to route real orders" : "Not set — used for paper/sandbox testing"}
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        {ok && (
+                                            <>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => testAlpacaConnection(slot)}
+                                                    disabled={isTestingAlpacaConnection}
+                                                    className="rounded-lg border border-slate-700 px-3 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                                                >
+                                                    Test
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => clearAlpacaSecrets(slot)}
+                                                    disabled={isSavingAlpacaSecrets}
+                                                    className="rounded-lg border border-slate-700 px-3 py-1 text-xs font-medium text-slate-400 hover:bg-slate-800 disabled:opacity-50"
+                                                >
+                                                    Clear
+                                                </button>
+                                            </>
+                                        )}
+                                        <span className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${
+                                            ok ? (slot === "live" ? "bg-rose-600/15 text-rose-300" : "bg-emerald-500/15 text-emerald-300") : "bg-slate-800 text-slate-400"
+                                        }`}>
+                                            {ok ? "Configured" : "Not set"}
+                                        </span>
+                                    </div>
+                                </div>
+                            );
+                        })}
                     </div>
 
                     {/* Key entry form */}
                     <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
-                        <p className="text-xs text-slate-400 font-medium">Enter Alpaca API keys</p>
+                        <p className="text-xs text-slate-400 font-medium">Add / replace API keys</p>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                             <label className="block">
                                 <span className="text-xs text-slate-500">API Key ID</span>
@@ -2557,7 +2587,7 @@ python run.py`}</code></pre>
                         </div>
                         <div className="flex items-center gap-3 flex-wrap">
                             <label className="flex items-center gap-2 text-sm text-slate-300">
-                                <span className="text-xs text-slate-500">Mode:</span>
+                                <span className="text-xs text-slate-500">Save to slot:</span>
                                 <select
                                     value={alpacaSecretForm.trading_mode}
                                     onChange={(e) => setAlpacaSecretForm((f) => ({ ...f, trading_mode: e.target.value as "paper" | "live" }))}
@@ -2575,38 +2605,16 @@ python run.py`}</code></pre>
                             >
                                 {isSavingAlpacaSecrets ? "Saving…" : "Save Keys"}
                             </button>
-                            {alpacaStatus?.secrets?.configured && (
-                                <button
-                                    type="button"
-                                    onClick={clearAlpacaSecrets}
-                                    disabled={isSavingAlpacaSecrets}
-                                    className="rounded-lg border border-slate-700 px-4 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-800 disabled:opacity-50"
-                                >
-                                    Clear Keys
-                                </button>
-                            )}
                         </div>
                         {alpacaSecretStatus && (
                             <p className={`text-xs ${alpacaSecretStatus.toLowerCase().includes("fail") || alpacaSecretStatus.toLowerCase().includes("error") ? "text-amber-300" : "text-emerald-300"}`}>
                                 {alpacaSecretStatus}
                             </p>
                         )}
-                    </div>
-
-                    {/* Test connection */}
-                    <div className="flex items-center gap-4 flex-wrap">
-                        <button
-                            type="button"
-                            onClick={testAlpacaConnection}
-                            disabled={isTestingAlpacaConnection || !alpacaStatus?.secrets?.configured}
-                            className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {isTestingAlpacaConnection ? "Testing…" : "Test Connection"}
-                        </button>
                         {alpacaTestResult && (
-                            <span className={`text-xs ${alpacaTestResult.ok ? "text-emerald-300" : "text-amber-300"}`}>
+                            <p className={`text-xs ${alpacaTestResult.ok ? "text-emerald-300" : "text-amber-300"}`}>
                                 {alpacaTestResult.message}
-                            </span>
+                            </p>
                         )}
                     </div>
 
@@ -2759,15 +2767,15 @@ python run.py`}</code></pre>
                             <button
                                 type="button"
                                 onClick={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
-                                disabled={!alpacaStatus?.secrets?.configured}
+                                disabled={!alpacaStatus?.secrets?.live?.configured}
                                 className="flex-shrink-0 rounded-lg border border-rose-700 px-4 py-2 text-sm font-semibold text-rose-300 hover:bg-rose-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
                             >
                                 Enable Live
                             </button>
                         )}
                     </div>
-                    {!alpacaStatus?.secrets?.configured && !config.alpaca_live_trading_enabled && (
-                        <p className="text-xs text-amber-400/80">Save API keys above before enabling live trading.</p>
+                    {!alpacaStatus?.secrets?.live?.configured && !config.alpaca_live_trading_enabled && (
+                        <p className="text-xs text-amber-400/80">Save live API keys above before enabling live trading.</p>
                     )}
                 </section>
 

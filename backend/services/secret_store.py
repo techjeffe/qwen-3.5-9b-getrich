@@ -12,6 +12,13 @@ SECRET_SERVICE_NAME = "qwen-3.5-9b-getrich"
 TELEGRAM_BOT_TOKEN_KEY = "telegram_bot_token"
 TELEGRAM_CHAT_ID_KEY = "telegram_chat_id"
 
+# Per-mode keys (new — paper and live are independent Alpaca accounts)
+ALPACA_PAPER_API_KEY_KEY    = "alpaca_paper_api_key"
+ALPACA_PAPER_SECRET_KEY_KEY = "alpaca_paper_secret_key"
+ALPACA_LIVE_API_KEY_KEY     = "alpaca_live_api_key"
+ALPACA_LIVE_SECRET_KEY_KEY  = "alpaca_live_secret_key"
+
+# Legacy single-slot keys kept only for backward-compat reads
 ALPACA_API_KEY_KEY    = "alpaca_api_key"
 ALPACA_SECRET_KEY_KEY = "alpaca_secret_key"
 ALPACA_MODE_KEY       = "alpaca_trading_mode"   # "paper" | "live"
@@ -112,31 +119,55 @@ def get_telegram_credentials() -> Dict[str, str]:
 
 # ── Alpaca ────────────────────────────────────────────────────────────────────
 
+def get_alpaca_credentials_for_mode(mode: str) -> Dict[str, str]:
+    """Return (api_key, secret_key) for a specific mode, with legacy fallback."""
+    if mode == "live":
+        api_key    = _read_secret(ALPACA_LIVE_API_KEY_KEY)
+        secret_key = _read_secret(ALPACA_LIVE_SECRET_KEY_KEY)
+        if not api_key:
+            # Backward compat: old single-slot key stored with mode=live
+            old_mode = _read_secret(ALPACA_MODE_KEY) or "paper"
+            if old_mode == "live":
+                api_key    = _read_secret(ALPACA_API_KEY_KEY)
+                secret_key = _read_secret(ALPACA_SECRET_KEY_KEY)
+    else:
+        api_key    = _read_secret(ALPACA_PAPER_API_KEY_KEY)
+        secret_key = _read_secret(ALPACA_PAPER_SECRET_KEY_KEY)
+        if not api_key:
+            # Backward compat: old single-slot key stored with mode=paper (or unset)
+            old_mode = _read_secret(ALPACA_MODE_KEY) or "paper"
+            if old_mode == "paper":
+                api_key    = _read_secret(ALPACA_API_KEY_KEY)
+                secret_key = _read_secret(ALPACA_SECRET_KEY_KEY)
+    return {"api_key": api_key or "", "secret_key": secret_key or "", "mode": mode}
+
+
 def get_alpaca_secret_status() -> Dict[str, Any]:
     try:
-        api_key    = _read_secret(ALPACA_API_KEY_KEY)
-        secret_key = _read_secret(ALPACA_SECRET_KEY_KEY)
-        mode       = _read_secret(ALPACA_MODE_KEY) or "paper"
+        paper = get_alpaca_credentials_for_mode("paper")
+        live  = get_alpaca_credentials_for_mode("live")
+        paper_ok = bool(paper["api_key"] and paper["secret_key"])
+        live_ok  = bool(live["api_key"]  and live["secret_key"])
         return {
-            "available":        True,
-            "configured":       bool(api_key and secret_key),
-            "has_api_key":      bool(api_key),
-            "has_secret_key":   bool(secret_key),
-            "api_key_masked":   _mask_secret(api_key),
-            "secret_key_masked":_mask_secret(secret_key),
-            "trading_mode":     mode,
-            "error":            "",
+            "available":  True,
+            "configured": paper_ok or live_ok,
+            "paper": {
+                "configured":     paper_ok,
+                "api_key_masked": _mask_secret(paper["api_key"]),
+            },
+            "live": {
+                "configured":     live_ok,
+                "api_key_masked": _mask_secret(live["api_key"]),
+            },
+            "error": "",
         }
     except Exception as exc:
         return {
-            "available":        False,
-            "configured":       False,
-            "has_api_key":      False,
-            "has_secret_key":   False,
-            "api_key_masked":   "",
-            "secret_key_masked":"",
-            "trading_mode":     "paper",
-            "error":            str(exc),
+            "available":  False,
+            "configured": False,
+            "paper": {"configured": False, "api_key_masked": ""},
+            "live":  {"configured": False, "api_key_masked": ""},
+            "error": str(exc),
         }
 
 
@@ -151,22 +182,34 @@ def save_alpaca_secrets(api_key: str, secret_key: str, mode: str = "paper") -> D
     if m not in ("paper", "live"):
         raise ValueError("mode must be 'paper' or 'live'")
 
-    _write_secret(ALPACA_API_KEY_KEY,    key)
-    _write_secret(ALPACA_SECRET_KEY_KEY, secret)
-    _write_secret(ALPACA_MODE_KEY,       m)
+    if m == "paper":
+        _write_secret(ALPACA_PAPER_API_KEY_KEY,    key)
+        _write_secret(ALPACA_PAPER_SECRET_KEY_KEY, secret)
+    else:
+        _write_secret(ALPACA_LIVE_API_KEY_KEY,    key)
+        _write_secret(ALPACA_LIVE_SECRET_KEY_KEY, secret)
     return get_alpaca_secret_status()
 
 
-def clear_alpaca_secrets() -> Dict[str, Any]:
-    _delete_secret(ALPACA_API_KEY_KEY)
-    _delete_secret(ALPACA_SECRET_KEY_KEY)
-    _delete_secret(ALPACA_MODE_KEY)
+def clear_alpaca_secrets(mode: Optional[str] = None) -> Dict[str, Any]:
+    """Clear credentials for a specific mode, or both if mode is None."""
+    if mode in (None, "paper"):
+        _delete_secret(ALPACA_PAPER_API_KEY_KEY)
+        _delete_secret(ALPACA_PAPER_SECRET_KEY_KEY)
+    if mode in (None, "live"):
+        _delete_secret(ALPACA_LIVE_API_KEY_KEY)
+        _delete_secret(ALPACA_LIVE_SECRET_KEY_KEY)
+    if mode is None:
+        # Also wipe legacy single-slot keys on full clear
+        _delete_secret(ALPACA_API_KEY_KEY)
+        _delete_secret(ALPACA_SECRET_KEY_KEY)
+        _delete_secret(ALPACA_MODE_KEY)
     return get_alpaca_secret_status()
 
 
 def get_alpaca_credentials() -> Dict[str, str]:
-    return {
-        "api_key":    _read_secret(ALPACA_API_KEY_KEY),
-        "secret_key": _read_secret(ALPACA_SECRET_KEY_KEY),
-        "mode":       _read_secret(ALPACA_MODE_KEY) or "paper",
-    }
+    """Return active credentials: live if configured, else paper (legacy compat)."""
+    live = get_alpaca_credentials_for_mode("live")
+    if live["api_key"] and live["secret_key"]:
+        return live
+    return get_alpaca_credentials_for_mode("paper")

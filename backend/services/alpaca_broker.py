@@ -167,11 +167,15 @@ class AlpacaBroker:
 
 # ── Keychain helpers ──────────────────────────────────────────────────────────
 
-def get_broker_from_keychain() -> Optional[AlpacaBroker]:
-    """Load credentials from OS keychain and return a ready broker, or None."""
+def get_broker_from_keychain(mode: Optional[str] = None) -> Optional[AlpacaBroker]:
+    """
+    Load credentials from OS keychain.
+    mode='paper' | 'live' selects a specific credential set.
+    If None, uses live credentials when configured, else paper.
+    """
     try:
-        from services.secret_store import get_alpaca_credentials
-        creds = get_alpaca_credentials()
+        from services.secret_store import get_alpaca_credentials, get_alpaca_credentials_for_mode
+        creds = get_alpaca_credentials_for_mode(mode) if mode else get_alpaca_credentials()
         if not creds.get("api_key") or not creds.get("secret_key"):
             return None
         return AlpacaBroker(
@@ -185,9 +189,8 @@ def get_broker_from_keychain() -> Optional[AlpacaBroker]:
 
 def is_alpaca_configured() -> bool:
     try:
-        from services.secret_store import get_alpaca_credentials
-        creds = get_alpaca_credentials()
-        return bool(creds.get("api_key") and creds.get("secret_key"))
+        from services.secret_store import get_alpaca_secret_status
+        return bool(get_alpaca_secret_status().get("configured"))
     except Exception:
         return False
 
@@ -303,7 +306,7 @@ def _disable_live_trading(db, config, reason: str) -> None:
         print(f"[alpaca] failed to auto-disable live trading: {exc}")
     # Best-effort cancel all open orders so no in-flight exposure remains
     try:
-        broker = get_broker_from_keychain()
+        broker = get_broker_from_keychain(mode="live")
         if broker:
             cancelled = broker.cancel_all_orders()
             if cancelled:
@@ -403,7 +406,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     if not getattr(config, "alpaca_live_trading_enabled", False):
         return
 
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode="live")
     if broker is None:
         return
 
@@ -540,7 +543,7 @@ def poll_unfilled_orders(db) -> int:
     """
     from database.models import AlpacaOrder
 
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode="live")
     if broker is None:
         return 0
 
@@ -601,7 +604,7 @@ def reconcile_on_startup(db) -> None:
     """
     from database.models import AlpacaOrder
 
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode="live")
     if broker is None:
         return
 
