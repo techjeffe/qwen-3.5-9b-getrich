@@ -2,7 +2,7 @@
 
 Geopolitical sentiment pipeline that uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
 
-Live brokerage execution via Alpaca is now supported alongside the paper simulation. When Alpaca keys are configured and live trading is enabled from Admin, every paper trade open/close is mirrored to Alpaca in real time with configurable guardrails (position caps, daily loss limits, consecutive-loss circuit breaker, extended-hours handling). All order attempts are written to an audit log regardless of outcome.
+Live brokerage execution via Alpaca is now supported alongside the paper simulation. Let me be very clear - this is Alpha--- functionality. Do not trade with real money using this. When Alpaca keys are configured and live trading is enabled from Admin, every paper trade open/close is mirrored to Alpaca in real time with configurable guardrails (position caps, daily loss limits, consecutive-loss circuit breaker, extended-hours handling). All order attempts are written to an audit log regardless of outcome.
 
 This app is untested in the real world, not financial advice, and for amusement purposes only.
 
