@@ -252,6 +252,22 @@ def _is_extended_hours_now(config=None) -> bool:
 
 # ── Circuit breakers ──────────────────────────────────────────────────────────
 
+def _get_alpaca_live_open_exposure() -> Optional[float]:
+    """Return total open position market value from the live Alpaca account.
+
+    Returns None if the broker is unreachable so the caller can fall back.
+    """
+    try:
+        broker = get_broker_from_keychain(mode="live")
+        if broker is None:
+            return None
+        positions = broker.get_positions()
+        return sum(abs(float(p.get("market_value") or 0)) for p in positions)
+    except Exception as exc:
+        print(f"[alpaca] could not fetch live positions for exposure check: {exc}")
+        return None
+
+
 def _check_circuit_breakers(db, config) -> None:
     """
     Raise CircuitBreakerError and auto-disable live trading if a limit is breached.
@@ -261,10 +277,20 @@ def _check_circuit_breakers(db, config) -> None:
 
     max_exposure = getattr(config, "alpaca_max_total_exposure_usd", None)
     if max_exposure and max_exposure > 0:
-        open_exposure = sum(
-            float(t.amount or 0)
-            for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
-        )
+        if getattr(config, "alpaca_execution_mode", None) == "live":
+            open_exposure = _get_alpaca_live_open_exposure()
+            if open_exposure is None:
+                # Live fetch failed; fall back to paper ledger to stay safe
+                print("[alpaca] exposure check: live position fetch failed, falling back to paper ledger")
+                open_exposure = sum(
+                    float(t.amount or 0)
+                    for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
+                )
+        else:
+            open_exposure = sum(
+                float(t.amount or 0)
+                for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
+            )
         if open_exposure >= max_exposure:
             _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
             raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
