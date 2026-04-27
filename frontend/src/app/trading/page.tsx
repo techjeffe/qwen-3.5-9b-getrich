@@ -118,6 +118,7 @@ type AlpacaAccount = {
     last_equity?: string | number;
     cash?: string | number;
     buying_power?: string | number;
+    unrealized_pl?: string | number;
 };
 
 type AlpacaStatus = {
@@ -504,8 +505,9 @@ export default function TradingPage() {
     // ── Live summary stats computed from Alpaca account + order fills ─────────
     const liveAccount = alpacaAccounts.live;
     const liveEquity = liveAccount?.equity != null ? Number(liveAccount.equity) : null;
-    const liveLastEquity = liveAccount?.last_equity != null ? Number(liveAccount.last_equity) : null;
-    const liveDayPnl = liveEquity != null && liveLastEquity != null ? liveEquity - liveLastEquity : null;
+    // unrealized_pl comes directly from Alpaca and excludes cash deposits — use it
+    // instead of equity-last_equity which would incorrectly include funding movements.
+    const liveUnrealizedPnl = liveAccount?.unrealized_pl != null ? Number(liveAccount.unrealized_pl) : null;
 
     const liveFilled = alpacaOrders.filter(
         (o) => o.trading_mode === "live" && o.status === "filled" && o.paper_trade_id != null,
@@ -516,19 +518,47 @@ export default function TradingPage() {
         if (!liveByTrade.has(key)) liveByTrade.set(key, []);
         liveByTrade.get(key)!.push(o);
     }
-    let liveWins = 0, liveLosses = 0, liveRealized = 0, liveOpenCount = 0;
+
+    type LiveOpenRow  = { symbol: string; side: string; fillPrice: number; qty: number; openedAt: string | null };
+    type LiveClosedRow = { symbol: string; buyPrice: number; sellPrice: number; qty: number; pnl: number; closedAt: string | null };
+    const liveOpenRows: LiveOpenRow[] = [];
+    const liveClosedRows: LiveClosedRow[] = [];
+    let liveWins = 0, liveLosses = 0, liveRealized = 0;
+
     for (const orders of liveByTrade.values()) {
-        const buys = orders.filter((o) => o.side === "buy");
+        const buys  = orders.filter((o) => o.side === "buy");
         const sells = orders.filter((o) => o.side === "sell");
-        if (!buys.length || !sells.length) { liveOpenCount++; continue; }
-        const buy = buys.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
+        const sym   = orders[0]?.symbol ?? "?";
+
+        if (!buys.length || !sells.length) {
+            // Only one side filled — position is still open
+            const openOrder = (buys.length ? buys : sells).reduce((a, b) =>
+                (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b,
+            );
+            if (openOrder.filled_avg_price && openOrder.filled_qty) {
+                liveOpenRows.push({
+                    symbol: sym,
+                    side: openOrder.side,
+                    fillPrice: openOrder.filled_avg_price,
+                    qty: openOrder.filled_qty,
+                    openedAt: openOrder.filled_at,
+                });
+            }
+            continue;
+        }
+
+        const buy  = buys.reduce((a, b)  => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
         const sell = sells.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
         if (!buy.filled_avg_price || !sell.filled_avg_price) continue;
         const qty = Math.min(buy.filled_qty ?? 0, sell.filled_qty ?? 0);
         const pnl = (sell.filled_avg_price - buy.filled_avg_price) * qty;
         liveRealized += pnl;
         if (pnl > 0) liveWins++; else liveLosses++;
+        const closedAt = [buy.filled_at, sell.filled_at].filter(Boolean).sort().pop() ?? null;
+        liveClosedRows.push({ symbol: sym, buyPrice: buy.filled_avg_price, sellPrice: sell.filled_avg_price, qty, pnl, closedAt });
     }
+    liveClosedRows.sort((a, b) => (b.closedAt ?? "") > (a.closedAt ?? "") ? 1 : -1);
+
     const liveTotalTrades = liveWins + liveLosses;
     const liveWinRate = liveTotalTrades > 0 ? (liveWins / liveTotalTrades) * 100 : null;
 
@@ -650,15 +680,14 @@ export default function TradingPage() {
                         {/* ── Live summary (front and center when live is preferred) ── */}
                         {preferredTrack === "alpaca_live" && alpacaLiveEnabled && (
                             <>
+                                {/* Stat grids */}
                                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl border border-rose-500/30 bg-rose-950/10 p-3">
+                                    <StatCard label="Equity" value={liveEquity != null ? fmtMoney(liveEquity) : "—"} />
                                     <StatCard
-                                        label="Equity"
-                                        value={liveEquity != null ? fmtMoney(liveEquity) : "—"}
-                                    />
-                                    <StatCard
-                                        label="Day P&L"
-                                        value={liveDayPnl != null ? fmtDollar(liveDayPnl) : "—"}
-                                        color={liveDayPnl != null ? pnlColor(liveDayPnl) : undefined}
+                                        label="Unrealized P&L"
+                                        value={liveUnrealizedPnl != null ? fmtDollar(liveUnrealizedPnl) : "—"}
+                                        sub="open positions"
+                                        color={liveUnrealizedPnl != null ? pnlColor(liveUnrealizedPnl) : undefined}
                                     />
                                     <StatCard
                                         label="Realized P&L"
@@ -676,8 +705,94 @@ export default function TradingPage() {
                                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl border border-rose-500/30 bg-rose-950/10 p-3">
                                     <StatCard label="Cash" value={liveAccount?.cash != null ? fmtMoney(liveAccount.cash) : "—"} />
                                     <StatCard label="Buying Power" value={liveAccount?.buying_power != null ? fmtMoney(liveAccount.buying_power) : "—"} />
-                                    <StatCard label="Open Positions" value={String(liveOpenCount)} />
+                                    <StatCard label="Open Positions" value={String(liveOpenRows.length)} />
                                     <StatCard label="Total Trades" value={String(liveTotalTrades)} />
+                                </div>
+
+                                {/* Live open positions */}
+                                <div className="rounded-xl border border-rose-500/20 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                    <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
+                                        <Activity size={14} className="text-rose-400" />
+                                        <p className="text-sm font-semibold text-white">Live Open Positions</p>
+                                        <span className="ml-auto text-[10px] text-slate-500">{liveOpenRows.length} position{liveOpenRows.length !== 1 ? "s" : ""}</span>
+                                    </div>
+                                    {liveOpenRows.length > 0 ? (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-xs">
+                                                <thead>
+                                                    <tr className="border-b border-white/6 text-[10px] uppercase tracking-wider text-slate-500">
+                                                        <th className="px-4 py-2.5 text-left">Symbol</th>
+                                                        <th className="px-4 py-2.5 text-left">Side</th>
+                                                        <th className="px-4 py-2.5 text-right">Qty</th>
+                                                        <th className="px-4 py-2.5 text-right">Fill Price</th>
+                                                        <th className="px-4 py-2.5 text-left">Opened</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {liveOpenRows.map((row, i) => (
+                                                        <tr key={i} className="border-b border-white/4 hover:bg-white/4 transition-colors">
+                                                            <td className="px-4 py-3 font-semibold text-white">{row.symbol}</td>
+                                                            <td className="px-4 py-3">
+                                                                <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${row.side === "buy" ? "bg-emerald-500/15 text-emerald-300" : "bg-red-500/15 text-red-300"}`}>{row.side}</span>
+                                                            </td>
+                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">{row.qty.toFixed(4)}</td>
+                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">${row.fillPrice.toFixed(2)}</td>
+                                                            <td className="px-4 py-3 text-slate-400">{fmtDate(row.openedAt)}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    ) : (
+                                        <div className="px-5 py-6 flex items-center gap-3 text-slate-500 text-sm">
+                                            <Minus size={16} /> No open live positions
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Live closed trades */}
+                                <div className="rounded-xl border border-rose-500/20 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                    <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
+                                        <DollarSign size={14} className="text-slate-400" />
+                                        <p className="text-sm font-semibold text-white">Live Closed Trades</p>
+                                        <span className="ml-auto text-[10px] text-slate-500">{liveClosedRows.length} trade{liveClosedRows.length !== 1 ? "s" : ""}</span>
+                                    </div>
+                                    {liveClosedRows.length > 0 ? (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-xs">
+                                                <thead>
+                                                    <tr className="border-b border-white/6 text-[10px] uppercase tracking-wider text-slate-500">
+                                                        <th className="px-4 py-2.5 text-left">Symbol</th>
+                                                        <th className="px-4 py-2.5 text-right">Buy Price</th>
+                                                        <th className="px-4 py-2.5 text-right">Sell Price</th>
+                                                        <th className="px-4 py-2.5 text-right">Qty</th>
+                                                        <th className="px-4 py-2.5 text-right">Realized P&L</th>
+                                                        <th className="px-4 py-2.5 text-left">Closed</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {liveClosedRows.map((row, i) => (
+                                                        <tr key={i} className="border-b border-white/4 hover:bg-white/4 transition-colors">
+                                                            <td className="px-4 py-3 font-semibold text-white">{row.symbol}</td>
+                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">${row.buyPrice.toFixed(2)}</td>
+                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">${row.sellPrice.toFixed(2)}</td>
+                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">{row.qty.toFixed(4)}</td>
+                                                            <td className="px-4 py-3 text-right">
+                                                                <span className={`inline-block rounded px-1.5 py-0.5 border text-[10px] font-semibold ${pnlBg(row.pnl)}`}>
+                                                                    {fmtDollar(row.pnl)}
+                                                                </span>
+                                                            </td>
+                                                            <td className="px-4 py-3 text-slate-400">{fmtDate(row.closedAt)}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    ) : (
+                                        <div className="px-5 py-6 flex items-center gap-3 text-slate-500 text-sm">
+                                            <Minus size={16} /> No closed live trades yet
+                                        </div>
+                                    )}
                                 </div>
                             </>
                         )}
