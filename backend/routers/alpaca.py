@@ -128,26 +128,37 @@ async def test_alpaca_connection(
 
 @router.get("/account")
 async def get_alpaca_account(
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> Dict[str, Any]:
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode=mode)
     if broker is None:
-        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+        slot = f" for {mode}" if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca API keys not configured{slot}")
     try:
-        return broker.get_account()
+        account = broker.get_account()
+        if isinstance(account, dict):
+            account["trading_mode"] = broker.mode
+        return account
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
 @router.get("/positions")
 async def get_alpaca_positions(
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> List[Dict[str, Any]]:
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode=mode)
     if broker is None:
-        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+        slot = f" for {mode}" if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca API keys not configured{slot}")
     try:
-        return broker.get_positions()
+        positions = broker.get_positions()
+        for position in positions:
+            if isinstance(position, dict):
+                position["trading_mode"] = broker.mode
+        return positions
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -157,18 +168,17 @@ async def get_alpaca_positions(
 @router.get("/orders")
 async def get_alpaca_orders(
     limit: int = 50,
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
     db: Session = Depends(get_db),
 ) -> List[Dict[str, Any]]:
     """Return recent AlpacaOrder rows from our DB (newest first)."""
     from database.models import AlpacaOrder
 
-    rows = (
-        db.query(AlpacaOrder)
-        .order_by(AlpacaOrder.created_at.desc())
-        .limit(min(limit, 200))
-        .all()
-    )
+    query = db.query(AlpacaOrder)
+    if mode:
+        query = query.filter(AlpacaOrder.trading_mode == mode)
+    rows = query.order_by(AlpacaOrder.created_at.desc()).limit(min(limit, 200)).all()
     return [
         {
             "id":               o.id,
@@ -268,14 +278,19 @@ async def get_portfolio_history(
     period: str = "1M",
     timeframe: str = "1D",
     extended_hours: bool = False,
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> Dict[str, Any]:
     """Return Alpaca account equity curve for the given period/timeframe."""
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode=mode)
     if broker is None:
-        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+        slot = f" for {mode}" if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca API keys not configured{slot}")
     try:
-        return broker.get_portfolio_history(period=period, timeframe=timeframe, extended_hours=extended_hours)
+        history = broker.get_portfolio_history(period=period, timeframe=timeframe, extended_hours=extended_hours)
+        if isinstance(history, dict):
+            history["trading_mode"] = broker.mode
+        return history
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -286,13 +301,19 @@ async def get_portfolio_history(
 async def get_account_activities(
     activity_type: Optional[str] = None,
     limit: int = 100,
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> List[Dict[str, Any]]:
     """Return Alpaca account activities (fills, fees, dividends, etc.)."""
-    broker = get_broker_from_keychain()
+    broker = get_broker_from_keychain(mode=mode)
     if broker is None:
-        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+        slot = f" for {mode}" if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca API keys not configured{slot}")
     try:
-        return broker.get_account_activities(activity_type=activity_type, limit=min(limit, 500))
+        activities = broker.get_account_activities(activity_type=activity_type, limit=min(limit, 500))
+        for activity in activities:
+            if isinstance(activity, dict):
+                activity["trading_mode"] = broker.mode
+        return activities
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))

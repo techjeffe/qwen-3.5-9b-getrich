@@ -16,7 +16,10 @@ export async function GET(request: NextRequest) {
     try {
         const { searchParams } = new URL(request.url);
         const limit = searchParams.get("limit") || "50";
-        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/orders?limit=${limit}`, {
+        const mode = searchParams.get("mode") || "";
+        const qs = new URLSearchParams({ limit });
+        if (mode) qs.set("mode", mode);
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/orders?${qs.toString()}`, {
             cache: "no-store",
             headers: backendHeaders(),
         });

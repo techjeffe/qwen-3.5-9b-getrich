@@ -17,8 +17,11 @@ export async function GET(request: NextRequest) {
         const { searchParams } = new URL(request.url);
         const activityType = searchParams.get("activity_type") || "";
         const limit = searchParams.get("limit") || "100";
-        let url = `${getBackendApiUrl()}/api/v1/alpaca/activities?limit=${limit}`;
-        if (activityType) url += `&activity_type=${encodeURIComponent(activityType)}`;
+        const mode = searchParams.get("mode") || "";
+        const qs = new URLSearchParams({ limit });
+        if (activityType) qs.set("activity_type", activityType);
+        if (mode) qs.set("mode", mode);
+        const url = `${getBackendApiUrl()}/api/v1/alpaca/activities?${qs.toString()}`;
         const response = await fetch(url, {
             cache: "no-store",
             headers: backendHeaders(),
