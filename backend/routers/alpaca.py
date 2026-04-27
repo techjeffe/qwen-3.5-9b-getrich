@@ -4,7 +4,7 @@ All routes require the admin token (if ADMIN_API_TOKEN is set).
 """
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from services.secret_store import (
     clear_alpaca_secrets,
     get_alpaca_secret_status,
     save_alpaca_secrets,
+    get_alpaca_credentials_for_mode,
 )
 
 router = APIRouter(prefix="/alpaca", tags=["Alpaca"])
@@ -50,9 +51,16 @@ async def get_alpaca_status(
     config = get_or_create_app_config(db)
 
     account_info: Optional[Dict[str, Any]] = None
-    if secret_status.get("configured"):
+    if secret_status.get("live", {}).get("configured"):
         try:
-            broker = get_broker_from_keychain()
+            broker = get_broker_from_keychain(mode="live")
+            if broker:
+                account_info = broker.get_account()
+        except Exception as exc:
+            account_info = {"error": str(exc)}
+    elif secret_status.get("paper", {}).get("configured"):
+        try:
+            broker = get_broker_from_keychain(mode="paper")
             if broker:
                 account_info = broker.get_account()
         except Exception as exc:
@@ -89,10 +97,11 @@ async def save_alpaca_keys(
 
 @router.delete("/secrets")
 async def clear_alpaca_keys(
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> Dict[str, Any]:
-    """Remove Alpaca API keys from the OS keychain."""
-    result = clear_alpaca_secrets()
+    """Remove Alpaca API keys from the OS keychain. Pass ?mode=paper or ?mode=live to clear only one slot."""
+    result = clear_alpaca_secrets(mode=mode)
     return {"ok": True, "status": result}
 
 
@@ -100,12 +109,14 @@ async def clear_alpaca_keys(
 
 @router.post("/test-connection")
 async def test_alpaca_connection(
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
     _admin: None = Depends(require_admin_token),
 ) -> Dict[str, Any]:
-    """Validate stored keys by calling GET /v2/account on Alpaca."""
-    broker = get_broker_from_keychain()
+    """Validate stored keys by calling GET /v2/account on Alpaca. Pass ?mode=paper|live to test a specific slot."""
+    broker = get_broker_from_keychain(mode=mode)
     if broker is None:
-        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+        slot = f"{mode} " if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca {slot}API keys not configured")
     try:
         account = broker.get_account()
         return {"ok": True, "mode": broker.mode, "account": account}
