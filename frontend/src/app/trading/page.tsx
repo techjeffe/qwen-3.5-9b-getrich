@@ -86,6 +86,26 @@ type EquityPoint = {
     underlying: string;
 };
 
+type AlpacaOrder = {
+    id: number;
+    paper_trade_id: number | null;
+    alpaca_order_id: string | null;
+    symbol: string;
+    side: string;
+    notional: number | null;
+    qty: number | null;
+    order_type: string;
+    limit_price: number | null;
+    status: string | null;
+    filled_qty: number | null;
+    filled_avg_price: number | null;
+    trading_mode: string;
+    error_message: string | null;
+    submitted_at: string | null;
+    filled_at: string | null;
+    created_at: string | null;
+};
+
 type TradingData = {
     market: MarketStatus;
     paper_trade_amount: number;
@@ -269,6 +289,8 @@ export default function TradingPage() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [resetting, setResetting] = useState(false);
+    const [alpacaLiveEnabled, setAlpacaLiveEnabled] = useState(false);
+    const [alpacaOrders, setAlpacaOrders] = useState<AlpacaOrder[]>([]);
 
     const load = useCallback(async () => {
         try {
@@ -284,7 +306,23 @@ export default function TradingPage() {
         }
     }, []);
 
-    useEffect(() => { load(); }, [load]);
+    const loadAlpaca = useCallback(async () => {
+        try {
+            const [statusRes, ordersRes] = await Promise.all([
+                fetch("/api/alpaca/status", { cache: "no-store" }),
+                fetch("/api/alpaca/orders?limit=50", { cache: "no-store" }),
+            ]);
+            if (statusRes.ok) {
+                const s = await statusRes.json();
+                setAlpacaLiveEnabled(!!s?.live_trading_enabled);
+            }
+            if (ordersRes.ok) {
+                setAlpacaOrders(await ordersRes.json());
+            }
+        } catch { /* silent — Alpaca may not be configured */ }
+    }, []);
+
+    useEffect(() => { load(); loadAlpaca(); }, [load, loadAlpaca]);
 
     const handleReset = async () => {
         if (!confirm("Reset all paper trading history? This cannot be undone.")) return;
@@ -307,13 +345,21 @@ export default function TradingPage() {
             {/* Header */}
             <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
                 <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between gap-4">
-                    <div>
-                        <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-400">
-                            Paper Trading
-                        </h1>
-                        <p className="text-slate-500 text-xs mt-0.5">
-                            ${data?.paper_trade_amount?.toFixed(0) ?? "100"} per signal &middot; auto-executed whenever the market is tradable
-                        </p>
+                    <div className="flex items-center gap-3 flex-wrap">
+                        <div>
+                            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-400">
+                                {alpacaLiveEnabled ? "Live Trading" : "Paper Trading"}
+                            </h1>
+                            <p className="text-slate-500 text-xs mt-0.5">
+                                ${data?.paper_trade_amount?.toFixed(0) ?? "100"} per signal &middot; auto-executed whenever the market is tradable
+                            </p>
+                        </div>
+                        {alpacaLiveEnabled && (
+                            <span className="inline-flex items-center gap-1.5 rounded-full border border-rose-600/60 bg-rose-600/15 px-3 py-1 text-xs font-bold text-rose-300 tracking-wide">
+                                <span className="w-1.5 h-1.5 rounded-full bg-rose-400 animate-pulse shrink-0" />
+                                LIVE
+                            </span>
+                        )}
                     </div>
                     <div className="flex items-center gap-2">
                         {data?.market && <MarketBadge market={data.market} />}
@@ -514,6 +560,87 @@ export default function TradingPage() {
                             </div>
                         )}
                     </>
+                )}
+
+                {/* Alpaca order log */}
+                {alpacaOrders.length > 0 && (
+                    <div className="rounded-xl border border-slate-700/60 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
+                        <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
+                            <span className={`w-2 h-2 rounded-full shrink-0 ${alpacaLiveEnabled ? "bg-rose-400 animate-pulse" : "bg-slate-500"}`} />
+                            <p className="text-sm font-semibold text-white">Alpaca Order Log</p>
+                            <span className={`ml-1 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium ${alpacaLiveEnabled ? "bg-rose-600/20 text-rose-300" : "bg-slate-700 text-slate-400"}`}>
+                                {alpacaLiveEnabled ? "LIVE" : "PAPER"}
+                            </span>
+                            <span className="ml-auto text-[10px] text-slate-500">{alpacaOrders.length} orders</span>
+                        </div>
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-xs">
+                                <thead>
+                                    <tr className="border-b border-white/6 text-[10px] uppercase tracking-wider text-slate-500">
+                                        <th className="px-4 py-2.5 text-left">Symbol</th>
+                                        <th className="px-4 py-2.5 text-left">Side</th>
+                                        <th className="px-4 py-2.5 text-right">Notional / Qty</th>
+                                        <th className="px-4 py-2.5 text-left">Type</th>
+                                        <th className="px-4 py-2.5 text-left">Status</th>
+                                        <th className="px-4 py-2.5 text-right">Fill Price</th>
+                                        <th className="px-4 py-2.5 text-left">Mode</th>
+                                        <th className="px-4 py-2.5 text-left">Submitted</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {alpacaOrders.map((order) => {
+                                        const isFilled = order.status === "filled";
+                                        const isError = !!order.error_message;
+                                        const statusColor = isFilled
+                                            ? "text-emerald-300"
+                                            : isError
+                                            ? "text-red-400"
+                                            : "text-slate-400";
+                                        return (
+                                            <tr key={order.id} className="border-b border-white/4 hover:bg-white/4 transition-colors">
+                                                <td className="px-4 py-3 font-semibold text-white">{order.symbol}</td>
+                                                <td className="px-4 py-3">
+                                                    <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${
+                                                        order.side === "buy"
+                                                            ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                                                            : "bg-red-500/10 text-red-300 border-red-500/20"
+                                                    }`}>
+                                                        {order.side.toUpperCase()}
+                                                    </span>
+                                                </td>
+                                                <td className="px-4 py-3 text-right font-mono text-slate-300">
+                                                    {order.notional != null ? `$${order.notional.toFixed(2)}` : order.qty != null ? `${order.qty} sh` : "—"}
+                                                </td>
+                                                <td className="px-4 py-3 text-slate-400 capitalize">{order.order_type}</td>
+                                                <td className={`px-4 py-3 ${statusColor}`}>
+                                                    {isError ? (
+                                                        <span title={order.error_message ?? ""} className="cursor-help">
+                                                            error
+                                                        </span>
+                                                    ) : (
+                                                        order.status ?? "—"
+                                                    )}
+                                                </td>
+                                                <td className="px-4 py-3 text-right font-mono text-slate-300">
+                                                    {order.filled_avg_price != null ? `$${order.filled_avg_price.toFixed(2)}` : "—"}
+                                                </td>
+                                                <td className="px-4 py-3">
+                                                    <span className={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wider ${
+                                                        order.trading_mode === "live"
+                                                            ? "bg-rose-600/20 text-rose-300"
+                                                            : "bg-slate-700 text-slate-400"
+                                                    }`}>
+                                                        {order.trading_mode}
+                                                    </span>
+                                                </td>
+                                                <td className="px-4 py-3 text-slate-500">{fmtDate(order.submitted_at)}</td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 )}
             </main>
         </div>

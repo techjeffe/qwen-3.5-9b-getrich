@@ -78,6 +78,34 @@ type AppConfig = {
     };
     rss_articles_per_feed: number;
     notices?: string[];
+    alpaca_live_trading_enabled: boolean;
+    alpaca_allow_short_selling: boolean;
+    alpaca_max_position_usd: number | null;
+    alpaca_max_total_exposure_usd: number | null;
+    alpaca_order_type: string;
+    alpaca_limit_slippage_pct: number;
+    alpaca_daily_loss_limit_usd: number | null;
+    alpaca_max_consecutive_losses: number | null;
+};
+
+type AlpacaStatus = {
+    secrets: {
+        configured: boolean;
+        has_api_key: boolean;
+        has_secret_key: boolean;
+        api_key_masked: string;
+        mode: string;
+        error: string;
+    };
+    live_trading_enabled: boolean;
+    allow_short_selling: boolean;
+    max_position_usd: number | null;
+    max_total_exposure_usd: number | null;
+    order_type: string;
+    limit_slippage_pct: number;
+    daily_loss_limit_usd: number | null;
+    max_consecutive_losses: number | null;
+    account: Record<string, unknown> | null;
 };
 
 const EMPTY_CONFIG: AppConfig = {
@@ -143,6 +171,14 @@ const EMPTY_CONFIG: AppConfig = {
     rss_article_detail_mode: "normal",
     rss_article_limits: { light: 5, normal: 10, detailed: 20 },
     rss_articles_per_feed: 15,
+    alpaca_live_trading_enabled: false,
+    alpaca_allow_short_selling: false,
+    alpaca_max_position_usd: null,
+    alpaca_max_total_exposure_usd: null,
+    alpaca_order_type: "market",
+    alpaca_limit_slippage_pct: 0.002,
+    alpaca_daily_loss_limit_usd: null,
+    alpaca_max_consecutive_losses: 3,
 };
 
 const BASIC_MODE_DEFAULTS: Partial<AppConfig> = {
@@ -278,6 +314,16 @@ export default function AdminPage() {
     } | null>(null);
     const { timeZone, storedRaw, setTimeZone } = useTimezone();
 
+    const [alpacaStatus, setAlpacaStatus] = useState<AlpacaStatus | null>(null);
+    const [alpacaSecretForm, setAlpacaSecretForm] = useState<{ api_key: string; secret_key: string; trading_mode: "paper" | "live" }>({ api_key: "", secret_key: "", trading_mode: "paper" });
+    const [alpacaSecretStatus, setAlpacaSecretStatus] = useState<string>("");
+    const [isSavingAlpacaSecrets, setIsSavingAlpacaSecrets] = useState(false);
+    const [isTestingAlpacaConnection, setIsTestingAlpacaConnection] = useState(false);
+    const [alpacaTestResult, setAlpacaTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+    const [showLiveConfirmModal, setShowLiveConfirmModal] = useState(false);
+    const [liveConfirmText, setLiveConfirmText] = useState("");
+    const [isEnablingLive, setIsEnablingLive] = useState(false);
+
     const isDirty = useMemo(
         () => JSON.stringify(config) !== JSON.stringify(savedConfig),
         [config, savedConfig]
@@ -329,6 +375,7 @@ export default function AdminPage() {
         { value: "system", label: "System", description: "Scheduling, timezone, and run status." },
         { value: "remote-snapshot", label: "Remote Snapshot", description: "Outbound delivery, Telegram setup, and manual sends." },
         { value: "price-history", label: "Price History", description: "Indicator data readiness and pulls." },
+        { value: "alpaca-live-trading", label: "Live Trading", description: "Alpaca brokerage connection and real-money guardrails." },
         { value: "danger-zone", label: "Danger Zone", description: "Destructive reset actions." },
     ];
     const riskOptions: Array<{
@@ -480,6 +527,13 @@ export default function AdminPage() {
         }
     }, []);
 
+    const fetchAlpacaStatus = useCallback(async () => {
+        try {
+            const res = await fetch("/api/alpaca/status", { cache: "no-store" });
+            if (res.ok) setAlpacaStatus(await res.json());
+        } catch { /* silent */ }
+    }, []);
+
     useEffect(() => {
         if (localStorage.getItem("adminMode") === "advanced") setIsAdvancedMode(true);
     }, []);
@@ -497,7 +551,8 @@ export default function AdminPage() {
         void fetchUnexecuted();
         void fetchPriceHistoryStatus();
         void fetchRemoteSnapshotSecrets();
-    }, [fetchUnexecuted, fetchPriceHistoryStatus, fetchRemoteSnapshotSecrets]);
+        void fetchAlpacaStatus();
+    }, [fetchUnexecuted, fetchPriceHistoryStatus, fetchRemoteSnapshotSecrets, fetchAlpacaStatus]);
 
     useEffect(() => {
         if (!isDirty) return;
@@ -884,6 +939,109 @@ export default function AdminPage() {
         }
     };
 
+    const saveAlpacaSecrets = async () => {
+        setIsSavingAlpacaSecrets(true);
+        setAlpacaSecretStatus("");
+        try {
+            const response = await fetch("/api/alpaca/secrets", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(alpacaSecretForm),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setAlpacaSecretStatus(payload?.error || "Failed to save secrets");
+                return;
+            }
+            setAlpacaSecretForm({ api_key: "", secret_key: "", trading_mode: "paper" });
+            setAlpacaSecretStatus("Keys saved to OS keychain");
+            await fetchAlpacaStatus();
+        } catch {
+            setAlpacaSecretStatus("Failed to save secrets");
+        } finally {
+            setIsSavingAlpacaSecrets(false);
+        }
+    };
+
+    const clearAlpacaSecrets = async () => {
+        setIsSavingAlpacaSecrets(true);
+        setAlpacaSecretStatus("");
+        try {
+            const response = await fetch("/api/alpaca/secrets", { method: "DELETE" });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setAlpacaSecretStatus(payload?.error || "Failed to clear secrets");
+                return;
+            }
+            setAlpacaSecretStatus("Keys cleared from OS keychain");
+            await fetchAlpacaStatus();
+        } catch {
+            setAlpacaSecretStatus("Failed to clear secrets");
+        } finally {
+            setIsSavingAlpacaSecrets(false);
+        }
+    };
+
+    const testAlpacaConnection = async () => {
+        setIsTestingAlpacaConnection(true);
+        setAlpacaTestResult(null);
+        try {
+            const response = await fetch("/api/alpaca/test-connection", { method: "POST" });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setAlpacaTestResult({ ok: false, message: payload?.error || "Connection failed" });
+                return;
+            }
+            const mode = payload?.mode === "live" ? "live" : "paper";
+            const equity = payload?.account?.equity ? ` — equity $${Number(payload.account.equity).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "";
+            setAlpacaTestResult({ ok: true, message: `Connected (${mode}${equity})` });
+            await fetchAlpacaStatus();
+        } catch {
+            setAlpacaTestResult({ ok: false, message: "Network error" });
+        } finally {
+            setIsTestingAlpacaConnection(false);
+        }
+    };
+
+    const enableAlpacaLiveTrading = async () => {
+        setIsEnablingLive(true);
+        try {
+            const response = await fetch("/api/alpaca/settings", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ alpaca_live_trading_enabled: true }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setAlpacaSecretStatus(payload?.error || "Failed to enable live trading");
+                return;
+            }
+            setConfig((current) => ({ ...current, alpaca_live_trading_enabled: true }));
+            setSavedConfig((current) => ({ ...current, alpaca_live_trading_enabled: true }));
+            setShowLiveConfirmModal(false);
+            setLiveConfirmText("");
+            await fetchAlpacaStatus();
+        } catch {
+            setAlpacaSecretStatus("Failed to enable live trading");
+        } finally {
+            setIsEnablingLive(false);
+        }
+    };
+
+    const disableAlpacaLiveTrading = async () => {
+        try {
+            const response = await fetch("/api/alpaca/settings", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ alpaca_live_trading_enabled: false }),
+            });
+            if (!response.ok) return;
+            setConfig((current) => ({ ...current, alpaca_live_trading_enabled: false }));
+            setSavedConfig((current) => ({ ...current, alpaca_live_trading_enabled: false }));
+            await fetchAlpacaStatus();
+        } catch { /* silent */ }
+    };
+
     const handleDiscardAndLeave = () => {
         setShowDirtyModal(false);
         router.push(pendingNav!);
@@ -1203,6 +1361,53 @@ python run.py`}</code></pre>
                             </div>
                         </div>
                     </div>
+                    </div>
+                </div>
+            )}
+            {showLiveConfirmModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+                    <div className="w-full max-w-sm rounded-2xl border border-rose-800 bg-slate-900 p-6 space-y-4 shadow-2xl">
+                        <div className="flex items-start gap-3">
+                            <div className="mt-0.5 h-5 w-5 flex-shrink-0 rounded-full bg-rose-600/20 flex items-center justify-center">
+                                <span className="text-rose-400 text-xs font-bold">!</span>
+                            </div>
+                            <div>
+                                <h2 className="text-base font-semibold text-white">Enable live trading?</h2>
+                                <p className="text-sm text-slate-400 mt-1">
+                                    This will route real orders to Alpaca using real money. Ensure your guardrails are correctly configured before enabling.
+                                </p>
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-xs text-slate-500 mb-2">
+                                Type <span className="font-mono text-rose-400">LIVE</span> to confirm
+                            </label>
+                            <input
+                                type="text"
+                                value={liveConfirmText}
+                                onChange={(e) => setLiveConfirmText(e.target.value)}
+                                placeholder="LIVE"
+                                autoFocus
+                                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-mono text-white outline-none focus:border-rose-500 placeholder:text-slate-600"
+                            />
+                        </div>
+                        <div className="flex gap-3 justify-end pt-1">
+                            <button
+                                type="button"
+                                onClick={() => { setShowLiveConfirmModal(false); setLiveConfirmText(""); }}
+                                className="px-4 py-2 text-sm text-slate-400 hover:text-white"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={enableAlpacaLiveTrading}
+                                disabled={liveConfirmText !== "LIVE" || isEnablingLive}
+                                className="rounded-lg bg-rose-700 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                                {isEnablingLive ? "Enabling…" : "Enable Live Trading"}
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}
@@ -2289,6 +2494,265 @@ python run.py`}</code></pre>
                         {isSaving ? "Saving..." : "Save Config"}
                     </button>
                 </div>
+
+                <section id="alpaca-live-trading" className="scroll-mt-24 rounded-2xl border border-slate-700 bg-slate-900/70 p-5 space-y-5">
+                    <div>
+                        <h2 className="text-sm font-semibold text-slate-200">Live Trading — Alpaca</h2>
+                        <p className="mt-1 text-xs text-slate-500">
+                            Connect your Alpaca brokerage account to route real orders alongside paper trades. Secrets are stored in the OS keychain, never in the repo.
+                        </p>
+                    </div>
+
+                    {/* API credentials row */}
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm">
+                        <div>
+                            <p className="text-slate-200">API credentials</p>
+                            <p className="mt-1 text-xs text-slate-500">
+                                {alpacaStatus?.secrets?.configured
+                                    ? `${alpacaStatus.secrets.mode === "live" ? "Live" : "Paper"} mode — key ${alpacaStatus.secrets.api_key_masked || "…"}`
+                                    : "Not configured"}
+                            </p>
+                        </div>
+                        <span className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${
+                            alpacaStatus?.secrets?.configured ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-800 text-slate-400"
+                        }`}>
+                            {alpacaStatus?.secrets?.configured ? "Configured" : "Not set"}
+                        </span>
+                    </div>
+
+                    {/* Key entry form */}
+                    <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 space-y-3">
+                        <p className="text-xs text-slate-400 font-medium">Enter Alpaca API keys</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <label className="block">
+                                <span className="text-xs text-slate-500">API Key ID</span>
+                                <input
+                                    type="password"
+                                    autoComplete="off"
+                                    placeholder="PKxxx…"
+                                    value={alpacaSecretForm.api_key}
+                                    onChange={(e) => setAlpacaSecretForm((f) => ({ ...f, api_key: e.target.value }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white font-mono outline-none focus:border-blue-400"
+                                />
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Secret Key</span>
+                                <input
+                                    type="password"
+                                    autoComplete="off"
+                                    placeholder="secret…"
+                                    value={alpacaSecretForm.secret_key}
+                                    onChange={(e) => setAlpacaSecretForm((f) => ({ ...f, secret_key: e.target.value }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white font-mono outline-none focus:border-blue-400"
+                                />
+                            </label>
+                        </div>
+                        <div className="flex items-center gap-3 flex-wrap">
+                            <label className="flex items-center gap-2 text-sm text-slate-300">
+                                <span className="text-xs text-slate-500">Mode:</span>
+                                <select
+                                    value={alpacaSecretForm.trading_mode}
+                                    onChange={(e) => setAlpacaSecretForm((f) => ({ ...f, trading_mode: e.target.value as "paper" | "live" }))}
+                                    className="rounded-lg border border-slate-700 bg-slate-800 px-2 py-1.5 text-sm text-white outline-none focus:border-blue-400"
+                                >
+                                    <option value="paper">Paper (sandbox)</option>
+                                    <option value="live">Live (real money)</option>
+                                </select>
+                            </label>
+                            <button
+                                type="button"
+                                onClick={saveAlpacaSecrets}
+                                disabled={isSavingAlpacaSecrets || !alpacaSecretForm.api_key || !alpacaSecretForm.secret_key}
+                                className="rounded-lg bg-blue-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {isSavingAlpacaSecrets ? "Saving…" : "Save Keys"}
+                            </button>
+                            {alpacaStatus?.secrets?.configured && (
+                                <button
+                                    type="button"
+                                    onClick={clearAlpacaSecrets}
+                                    disabled={isSavingAlpacaSecrets}
+                                    className="rounded-lg border border-slate-700 px-4 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-800 disabled:opacity-50"
+                                >
+                                    Clear Keys
+                                </button>
+                            )}
+                        </div>
+                        {alpacaSecretStatus && (
+                            <p className={`text-xs ${alpacaSecretStatus.toLowerCase().includes("fail") || alpacaSecretStatus.toLowerCase().includes("error") ? "text-amber-300" : "text-emerald-300"}`}>
+                                {alpacaSecretStatus}
+                            </p>
+                        )}
+                    </div>
+
+                    {/* Test connection */}
+                    <div className="flex items-center gap-4 flex-wrap">
+                        <button
+                            type="button"
+                            onClick={testAlpacaConnection}
+                            disabled={isTestingAlpacaConnection || !alpacaStatus?.secrets?.configured}
+                            className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            {isTestingAlpacaConnection ? "Testing…" : "Test Connection"}
+                        </button>
+                        {alpacaTestResult && (
+                            <span className={`text-xs ${alpacaTestResult.ok ? "text-emerald-300" : "text-amber-300"}`}>
+                                {alpacaTestResult.message}
+                            </span>
+                        )}
+                    </div>
+
+                    {/* Account info */}
+                    {alpacaStatus?.account && !("error" in alpacaStatus.account) && (
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {alpacaStatus.account.equity != null && (
+                                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                    <p className="text-[10px] text-slate-500 uppercase tracking-widest">Equity</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">${Number(alpacaStatus.account.equity).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                </div>
+                            )}
+                            {alpacaStatus.account.buying_power != null && (
+                                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                    <p className="text-[10px] text-slate-500 uppercase tracking-widest">Buying Power</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">${Number(alpacaStatus.account.buying_power).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                </div>
+                            )}
+                            {alpacaStatus.account.cash != null && (
+                                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                    <p className="text-[10px] text-slate-500 uppercase tracking-widest">Cash</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">${Number(alpacaStatus.account.cash).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                </div>
+                            )}
+                            {alpacaStatus.account.status != null && (
+                                <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2">
+                                    <p className="text-[10px] text-slate-500 uppercase tracking-widest">Status</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200 capitalize">{String(alpacaStatus.account.status)}</p>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Guardrail settings */}
+                    <div className="space-y-3">
+                        <p className="text-xs text-slate-400 font-medium">Order guardrails</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Max position size (USD, blank = unlimited)</span>
+                                <input
+                                    type="number"
+                                    min={0}
+                                    placeholder="e.g. 5000"
+                                    value={config.alpaca_max_position_usd ?? ""}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_max_position_usd: e.target.value === "" ? null : Number(e.target.value) }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Max total exposure (USD, blank = unlimited)</span>
+                                <input
+                                    type="number"
+                                    min={0}
+                                    placeholder="e.g. 20000"
+                                    value={config.alpaca_max_total_exposure_usd ?? ""}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_max_total_exposure_usd: e.target.value === "" ? null : Number(e.target.value) }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Daily loss limit (USD, blank = disabled)</span>
+                                <input
+                                    type="number"
+                                    min={0}
+                                    placeholder="e.g. 500"
+                                    value={config.alpaca_daily_loss_limit_usd ?? ""}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_daily_loss_limit_usd: e.target.value === "" ? null : Number(e.target.value) }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Max consecutive losses before circuit break</span>
+                                <input
+                                    type="number"
+                                    min={1}
+                                    max={20}
+                                    value={config.alpaca_max_consecutive_losses ?? 3}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_max_consecutive_losses: Number(e.target.value) || 3 }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Order type</span>
+                                <select
+                                    value={config.alpaca_order_type}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_order_type: e.target.value }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                >
+                                    <option value="market">Market</option>
+                                    <option value="limit">Limit</option>
+                                </select>
+                            </label>
+                            <label className="block">
+                                <span className="text-xs text-slate-500">Limit slippage (e.g. 0.002 = 0.2%)</span>
+                                <input
+                                    type="number"
+                                    min={0}
+                                    max={0.05}
+                                    step={0.001}
+                                    value={config.alpaca_limit_slippage_pct}
+                                    onChange={(e) => setConfig((current) => ({ ...current, alpaca_limit_slippage_pct: Number(e.target.value) || 0.002 }))}
+                                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                                />
+                            </label>
+                        </div>
+                        <label className="flex items-center gap-3 text-sm">
+                            <input
+                                type="checkbox"
+                                checked={config.alpaca_allow_short_selling}
+                                onChange={(e) => setConfig((current) => ({ ...current, alpaca_allow_short_selling: e.target.checked }))}
+                            />
+                            Allow direct short selling (for custom symbols without an inverse ETF)
+                        </label>
+                        <p className="text-xs text-slate-600">Guardrail changes are saved with the Save Config button above.</p>
+                    </div>
+
+                    {/* Enable / disable live trading */}
+                    <div className={`flex items-center justify-between gap-4 rounded-xl border px-4 py-3 ${config.alpaca_live_trading_enabled ? "border-rose-800/60 bg-rose-950/20" : "border-slate-800 bg-slate-900/60"}`}>
+                        <div>
+                            <p className="text-sm font-medium text-slate-200">
+                                Live trading
+                                {config.alpaca_live_trading_enabled && (
+                                    <span className="ml-2 rounded-full bg-rose-600/80 px-2 py-0.5 text-[10px] uppercase tracking-widest text-white">ACTIVE</span>
+                                )}
+                            </p>
+                            <p className="text-xs text-slate-500 mt-0.5">
+                                {config.alpaca_live_trading_enabled
+                                    ? "Real orders are being sent to Alpaca. Disable to return to paper-only mode."
+                                    : "Disabled — all signals go to paper simulation only."}
+                            </p>
+                        </div>
+                        {config.alpaca_live_trading_enabled ? (
+                            <button
+                                type="button"
+                                onClick={disableAlpacaLiveTrading}
+                                className="flex-shrink-0 rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                            >
+                                Disable
+                            </button>
+                        ) : (
+                            <button
+                                type="button"
+                                onClick={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
+                                disabled={!alpacaStatus?.secrets?.configured}
+                                className="flex-shrink-0 rounded-lg border border-rose-700 px-4 py-2 text-sm font-semibold text-rose-300 hover:bg-rose-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                                Enable Live
+                            </button>
+                        )}
+                    </div>
+                    {!alpacaStatus?.secrets?.configured && !config.alpaca_live_trading_enabled && (
+                        <p className="text-xs text-amber-400/80">Save API keys above before enabling live trading.</p>
+                    )}
+                </section>
 
                 {isAdvancedMode && (<section id="price-history" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
                     <div>

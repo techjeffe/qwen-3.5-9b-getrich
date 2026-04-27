@@ -132,6 +132,26 @@ async def _data_ingestion_scheduler_loop():
         await asyncio.sleep(ingestion_interval)
 
 
+async def _alpaca_poll_scheduler_loop():
+    """Poll Alpaca every 5 minutes for fill-status updates on pending orders."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            from services.alpaca_broker import is_alpaca_configured, poll_unfilled_orders
+            if is_alpaca_configured():
+                db = SessionLocal()
+                try:
+                    updated = await asyncio.to_thread(poll_unfilled_orders, db)
+                    if updated:
+                        print(f"[alpaca] poll: updated {updated} order(s)")
+                except Exception as exc:
+                    print(f"[alpaca] poll error: {exc}")
+                finally:
+                    db.close()
+        except Exception as exc:
+            print(f"[alpaca] poll scheduler error: {exc}")
+
+
 async def _pnl_scheduler_loop():
     """Resolve due trade snapshots on the same 30-minute cadence as auto-analyze."""
     tracker = PnLTracker()
@@ -155,7 +175,8 @@ async def _pnl_scheduler_loop():
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
     data_ingestion_task = None
-    pnl_scheduler_task = None
+    pnl_scheduler_task  = None
+    alpaca_poll_task    = None
 
     print("=" * 60)
     print("3x Leveraged Sentiment Trading System - Starting...")
@@ -163,6 +184,17 @@ async def lifespan(app: FastAPI):
 
     init_db()
     print("Database initialized")
+
+    try:
+        from services.alpaca_broker import is_alpaca_configured, reconcile_on_startup
+        if is_alpaca_configured():
+            db = SessionLocal()
+            try:
+                reconcile_on_startup(db)
+            finally:
+                db.close()
+    except Exception as exc:
+        print(f"[alpaca] startup reconciliation skipped: {exc}")
 
     bind_host = os.getenv("HOST", "127.0.0.1")
     cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
@@ -179,9 +211,12 @@ async def lifespan(app: FastAPI):
 
     data_ingestion_task = asyncio.create_task(_data_ingestion_scheduler_loop())
     print("Data ingestion scheduler started (fetching RSS feeds and stock quotes)")
-    
+
     pnl_scheduler_task = asyncio.create_task(_pnl_scheduler_loop())
     print("P&L snapshot scheduler started")
+
+    alpaca_poll_task = asyncio.create_task(_alpaca_poll_scheduler_loop())
+    print("Alpaca order poll scheduler started (5 min interval)")
 
     yield
 
@@ -196,6 +231,13 @@ async def lifespan(app: FastAPI):
         pnl_scheduler_task.cancel()
         try:
             await pnl_scheduler_task
+        except asyncio.CancelledError:
+            pass
+
+    if alpaca_poll_task:
+        alpaca_poll_task.cancel()
+        try:
+            await alpaca_poll_task
         except asyncio.CancelledError:
             pass
 

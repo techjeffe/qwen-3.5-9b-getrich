@@ -101,11 +101,14 @@ def _window_active(pos, now: datetime) -> bool:
     return now_utc < win
 
 
-def close_expired_positions(db) -> List[Dict[str, Any]]:
+def close_expired_positions(db, alpaca_pending: Optional[list] = None) -> List[Dict[str, Any]]:
     """
     Close any open positions whose conviction window has expired.
     Called at the start of each analysis run and from process_signals.
     Respects logic_config: close_on_window_expiry and close_expired_during_closed_hours.
+
+    alpaca_pending: if provided, (trade_obj, "close") tuples for actual closes
+    (not trailing activations) are appended so the caller can forward them to Alpaca.
     """
     from database.models import PaperTrade
     from services.data_ingestion.yfinance_client import PriceClient
@@ -192,6 +195,8 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
             })
         else:
             _close_position(pos, exit_price, now, db, reason="window_expired")
+            if alpaca_pending is not None:
+                alpaca_pending.append((pos, "close"))
             closed.append({
                 "underlying": pos.underlying,
                 "execution_ticker": pos.execution_ticker,
@@ -230,19 +235,28 @@ def process_signals(
 
     _cv = _L["conviction"]
 
-    # Re-entry cooldown: same-direction re-entry blocked for this many minutes after a close
-    _reentry_cooldown = int(_L.get("reentry_cooldown_minutes", 0))
+    # Load app config once — used for re-entry cooldown and Alpaca dispatch
+    _app_config = None
     try:
         from services.app_config import get_or_create_app_config as _get_cfg_rc
-        _cfg_rc = _get_cfg_rc(db)
-        _rc_override = getattr(_cfg_rc, "reentry_cooldown_minutes", None)
-        if _rc_override is not None:
-            _reentry_cooldown = int(_rc_override)
+        _app_config = _get_cfg_rc(db)
     except Exception:
         pass
 
-    # Always check for expired windows first, even if market is closed
-    expired_actions = close_expired_positions(db)
+    # Re-entry cooldown: same-direction re-entry blocked for this many minutes after a close
+    _reentry_cooldown = int(_L.get("reentry_cooldown_minutes", 0))
+    if _app_config is not None:
+        _rc_override = getattr(_app_config, "reentry_cooldown_minutes", None)
+        if _rc_override is not None:
+            _reentry_cooldown = int(_rc_override)
+
+    # Collect (paper_trade_obj, "open"|"close") for Alpaca dispatch after commit
+    _alpaca_pending: list = []
+
+    # Always check for expired windows first, even if market is closed.
+    # Pass _alpaca_pending so actual window-expired closes are queued for Alpaca
+    # dispatch at the end of this function alongside all other lifecycle events.
+    expired_actions = close_expired_positions(db, alpaca_pending=_alpaca_pending)
 
     def _expired_action(ea: Dict[str, Any]) -> Dict[str, Any]:
         action = "trailing" if ea.get("reason") == "trailing_activated" else "closed"
@@ -304,6 +318,7 @@ def process_signals(
                 _close_position(open_pos, existing_pos_price, now, db, reason="trailing_stop_hit")
                 action_summary["closed_pnl"] = open_pos.realized_pnl
                 action_summary["exit_price"] = existing_pos_price
+                _alpaca_pending.append((open_pos, "close"))
                 open_pos = None
                 # If new signal is HOLD or same direction, stay flat this run
                 if signal_type == "HOLD" or signal_type == _prev_signal_type:
@@ -406,6 +421,7 @@ def process_signals(
             )
             action_summary["closed_pnl"] = open_pos.realized_pnl
             action_summary["exit_price"] = existing_pos_price
+            _alpaca_pending.append((open_pos, "close"))
         elif window_blocks_close:
             action_summary["action"] = "held"
             action_summary["reason"] = "conviction_window_blocks_flip"
@@ -458,6 +474,7 @@ def process_signals(
                 holding_window_until=window_until,
             )
             db.add(new_trade)
+            _alpaca_pending.append((new_trade, "open"))
             action_summary["action"] = "opened"
             action_summary["entry_price"] = entry_price
             action_summary["holding_window_until"] = _utc_iso(window_until)
@@ -486,6 +503,7 @@ def process_signals(
         exit_price = float(price_data.get("current_price") or price_data.get("price") or pos.entry_price or 0.0)
         if exit_price > 0:
             _close_position(pos, exit_price, now, db, reason="no_recommendation")
+            _alpaca_pending.append((pos, "close"))
             actions.append({
                 "underlying": pos.underlying,
                 "execution_ticker": pos.execution_ticker,
@@ -498,6 +516,7 @@ def process_signals(
             })
 
     db.commit()
+    _dispatch_alpaca_orders(db, _alpaca_pending, _app_config)
     return actions
 
 
@@ -549,6 +568,20 @@ def close_positions_for_removed_symbols(db, removed_symbols: List[str]) -> List[
         db.commit()
 
     return closed_positions
+
+
+def _dispatch_alpaca_orders(db, pending: list, config) -> None:
+    """Fire-and-forget Alpaca order dispatch after paper trades are committed."""
+    if not pending or config is None:
+        return
+    try:
+        from services.alpaca_broker import maybe_execute_alpaca_order
+        for trade, event in pending:
+            maybe_execute_alpaca_order(db, trade, event, config)
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"[alpaca] order dispatch error: {exc}")
 
 
 def _close_position(pos, exit_price: float, now: datetime, db, reason: Optional[str] = None) -> None:
