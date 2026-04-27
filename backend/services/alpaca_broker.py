@@ -151,6 +151,26 @@ def _is_direct_short(paper_trade) -> bool:
     )
 
 
+def _has_live_open_order(db, paper_trade_id) -> bool:
+    """
+    Return True if a non-error AlpacaOrder exists for this paper trade, meaning
+    the open leg was actually submitted to Alpaca (regardless of fill status).
+    Error-status rows indicate a skipped/failed open (e.g. short selling disabled,
+    circuit breaker fired) — those should not trigger a close.
+    """
+    if paper_trade_id is None:
+        return False
+    from database.models import AlpacaOrder
+    return (
+        db.query(AlpacaOrder)
+        .filter(
+            AlpacaOrder.paper_trade_id == paper_trade_id,
+            AlpacaOrder.status != "error",
+        )
+        .first()
+    ) is not None
+
+
 def _is_extended_hours_now(config=None) -> bool:
     """Return True if current ET time is in pre/after-market but not regular hours."""
     from datetime import time as time_cls
@@ -358,6 +378,16 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             notional = min(notional, max_pos)
 
     elif event == "close":
+        # Guard: only close if a live open order was actually placed for this trade.
+        # A skipped or failed open (direct short disabled, circuit breaker, etc.)
+        # produces only an error row, so _has_live_open_order returns False and we
+        # skip — preventing a stray close order from creating unintended exposure.
+        if not _has_live_open_order(db, paper_id):
+            print(
+                f"[alpaca] skipping close for {symbol} (paper_id={paper_id}): "
+                "no successful open order on record"
+            )
+            return
         # Closing a direct short means buying back to cover; everything else is a sell
         side = "buy" if direct_short else "sell"
     else:
@@ -388,6 +418,11 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             2,
         )
         limit_price = max(0.01, limit_price)
+    elif event == "close" and shares > 0:
+        # Regular-hours close: submit the original share count rather than
+        # re-notionalising, so the order matches the live position size even
+        # when price has moved since entry.
+        qty = shares
     else:
         use_notional = notional
 

@@ -101,11 +101,14 @@ def _window_active(pos, now: datetime) -> bool:
     return now_utc < win
 
 
-def close_expired_positions(db) -> List[Dict[str, Any]]:
+def close_expired_positions(db, alpaca_pending: Optional[list] = None) -> List[Dict[str, Any]]:
     """
     Close any open positions whose conviction window has expired.
     Called at the start of each analysis run and from process_signals.
     Respects logic_config: close_on_window_expiry and close_expired_during_closed_hours.
+
+    alpaca_pending: if provided, (trade_obj, "close") tuples for actual closes
+    (not trailing activations) are appended so the caller can forward them to Alpaca.
     """
     from database.models import PaperTrade
     from services.data_ingestion.yfinance_client import PriceClient
@@ -192,6 +195,8 @@ def close_expired_positions(db) -> List[Dict[str, Any]]:
             })
         else:
             _close_position(pos, exit_price, now, db, reason="window_expired")
+            if alpaca_pending is not None:
+                alpaca_pending.append((pos, "close"))
             closed.append({
                 "underlying": pos.underlying,
                 "execution_ticker": pos.execution_ticker,
@@ -248,8 +253,10 @@ def process_signals(
     # Collect (paper_trade_obj, "open"|"close") for Alpaca dispatch after commit
     _alpaca_pending: list = []
 
-    # Always check for expired windows first, even if market is closed
-    expired_actions = close_expired_positions(db)
+    # Always check for expired windows first, even if market is closed.
+    # Pass _alpaca_pending so actual window-expired closes are queued for Alpaca
+    # dispatch at the end of this function alongside all other lifecycle events.
+    expired_actions = close_expired_positions(db, alpaca_pending=_alpaca_pending)
 
     def _expired_action(ea: Dict[str, Any]) -> Dict[str, Any]:
         action = "trailing" if ea.get("reason") == "trailing_activated" else "closed"
