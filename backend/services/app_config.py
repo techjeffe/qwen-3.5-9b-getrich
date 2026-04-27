@@ -40,6 +40,8 @@ DEFAULT_RISK_PROFILE = "moderate"
 VALID_RISK_PROFILES = {"conservative", "moderate", "aggressive", "crazy"}
 DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
 VALID_REMOTE_SNAPSHOT_MODES = {"telegram", "signed_link", "email"}
+DEFAULT_ALPACA_EXECUTION_MODE = "off"
+VALID_ALPACA_EXECUTION_MODES = {"off", "paper", "live"}
 MAX_CUSTOM_SYMBOLS = 3
 MAX_CUSTOM_RSS_FEEDS = 3
 MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
@@ -79,6 +81,11 @@ def _normalize_symbol(value: Any) -> str:
 
 def _normalize_display_timezone(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalize_alpaca_execution_mode(value: Any) -> str:
+    normalized = str(value or DEFAULT_ALPACA_EXECUTION_MODE).strip().lower()
+    return normalized if normalized in VALID_ALPACA_EXECUTION_MODES else DEFAULT_ALPACA_EXECUTION_MODE
 
 
 def _normalize_symbols(symbols: Any, *, fallback: List[str] | None = None, max_items: int = MAX_TRACKED_SYMBOLS) -> List[str]:
@@ -546,6 +553,15 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         if getattr(config, "allow_extended_hours_trading", None) is None:
             config.allow_extended_hours_trading = True
             changed = True
+        normalized_execution_mode = _normalize_alpaca_execution_mode(
+            getattr(config, "alpaca_execution_mode", DEFAULT_ALPACA_EXECUTION_MODE)
+        )
+        if getattr(config, "alpaca_execution_mode", None) != normalized_execution_mode:
+            config.alpaca_execution_mode = normalized_execution_mode
+            changed = True
+        if getattr(config, "alpaca_live_trading_enabled", None) != (normalized_execution_mode == "live"):
+            config.alpaca_live_trading_enabled = normalized_execution_mode == "live"
+            changed = True
         if getattr(config, "remote_snapshot_enabled", None) is None:
             config.remote_snapshot_enabled = False
             changed = True
@@ -626,6 +642,7 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         snapshot_retention_limit=DEFAULT_SNAPSHOT_RETENTION_LIMIT,
         web_research_enabled=False,
         allow_extended_hours_trading=True,
+        alpaca_execution_mode=DEFAULT_ALPACA_EXECUTION_MODE,
         remote_snapshot_enabled=False,
         remote_snapshot_mode=DEFAULT_REMOTE_SNAPSHOT_MODE,
         remote_snapshot_min_pnl_change_usd=5.0,
@@ -798,6 +815,10 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.reentry_cooldown_minutes = _normalize_trading_logic_int(payload.get("reentry_cooldown_minutes"), 0, 10080)
     if "alpaca_live_trading_enabled" in payload:
         config.alpaca_live_trading_enabled = _coerce_bool(payload.get("alpaca_live_trading_enabled"), False)
+        config.alpaca_execution_mode = "live" if config.alpaca_live_trading_enabled else DEFAULT_ALPACA_EXECUTION_MODE
+    if "alpaca_execution_mode" in payload:
+        config.alpaca_execution_mode = _normalize_alpaca_execution_mode(payload.get("alpaca_execution_mode"))
+        config.alpaca_live_trading_enabled = config.alpaca_execution_mode == "live"
     if "alpaca_allow_short_selling" in payload:
         config.alpaca_allow_short_selling = _coerce_bool(payload.get("alpaca_allow_short_selling"), False)
     if "alpaca_max_position_usd" in payload:
@@ -1016,7 +1037,10 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "hold_overnight": bool(getattr(config, "hold_overnight", False)),
         "trail_on_window_expiry": bool(getattr(config, "trail_on_window_expiry", True)),
         "reentry_cooldown_minutes": getattr(config, "reentry_cooldown_minutes", None),
-        # Alpaca live trading settings
+        # Alpaca brokerage execution settings
+        "alpaca_execution_mode":         _normalize_alpaca_execution_mode(
+            getattr(config, "alpaca_execution_mode", DEFAULT_ALPACA_EXECUTION_MODE)
+        ),
         "alpaca_live_trading_enabled":   bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "alpaca_allow_short_selling":    bool(getattr(config, "alpaca_allow_short_selling",    False)),
         "alpaca_max_position_usd":       getattr(config, "alpaca_max_position_usd",            None),

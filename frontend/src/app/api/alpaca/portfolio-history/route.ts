@@ -18,7 +18,14 @@ export async function GET(request: NextRequest) {
         const period = searchParams.get("period") || "1M";
         const timeframe = searchParams.get("timeframe") || "1D";
         const extendedHours = searchParams.get("extended_hours") || "false";
-        const url = `${getBackendApiUrl()}/api/v1/alpaca/portfolio-history?period=${period}&timeframe=${timeframe}&extended_hours=${extendedHours}`;
+        const mode = searchParams.get("mode") || "";
+        const qs = new URLSearchParams({
+            period,
+            timeframe,
+            extended_hours: extendedHours,
+        });
+        if (mode) qs.set("mode", mode);
+        const url = `${getBackendApiUrl()}/api/v1/alpaca/portfolio-history?${qs.toString()}`;
         const response = await fetch(url, {
             cache: "no-store",
             headers: backendHeaders(),

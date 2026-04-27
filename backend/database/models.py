@@ -365,7 +365,8 @@ class AppConfig(Base):
     trail_on_window_expiry = Column(Boolean, nullable=False, default=True)
     reentry_cooldown_minutes = Column(Integer, nullable=True, default=None)
 
-    # ── Alpaca live trading ───────────────────────────────────────────────────
+    # ── Alpaca brokerage execution ────────────────────────────────────────────
+    alpaca_execution_mode         = Column(String(10),  nullable=False, default="off")  # off | paper | live
     alpaca_live_trading_enabled   = Column(Boolean,     nullable=False, default=False)
     alpaca_allow_short_selling    = Column(Boolean,     nullable=False, default=False)
     alpaca_max_position_usd       = Column(Float,       nullable=True,  default=None)

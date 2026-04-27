@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 import { getBackendApiUrl } from "@/lib/backend-api";
 
@@ -12,9 +12,12 @@ function backendHeaders(init?: HeadersInit): Headers {
     return headers;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
     try {
-        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/account`, {
+        const { searchParams } = new URL(request.url);
+        const mode = searchParams.get("mode") || "";
+        const qs = mode ? `?mode=${encodeURIComponent(mode)}` : "";
+        const response = await fetch(`${getBackendApiUrl()}/api/v1/alpaca/account${qs}`, {
             cache: "no-store",
             headers: backendHeaders(),
         });

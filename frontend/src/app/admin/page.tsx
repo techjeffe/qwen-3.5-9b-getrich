@@ -78,6 +78,7 @@ type AppConfig = {
     };
     rss_articles_per_feed: number;
     notices?: string[];
+    alpaca_execution_mode: "off" | "paper" | "live";
     alpaca_live_trading_enabled: boolean;
     alpaca_allow_short_selling: boolean;
     alpaca_max_position_usd: number | null;
@@ -95,6 +96,7 @@ type AlpacaStatus = {
         live:  { configured: boolean; api_key_masked: string };
         error: string;
     };
+    execution_mode: "off" | "paper" | "live";
     live_trading_enabled: boolean;
     allow_short_selling: boolean;
     max_position_usd: number | null;
@@ -169,6 +171,7 @@ const EMPTY_CONFIG: AppConfig = {
     rss_article_detail_mode: "normal",
     rss_article_limits: { light: 5, normal: 10, detailed: 20 },
     rss_articles_per_feed: 15,
+    alpaca_execution_mode: "off",
     alpaca_live_trading_enabled: false,
     alpaca_allow_short_selling: false,
     alpaca_max_position_usd: null,
@@ -243,9 +246,14 @@ function normalizeConfigPayload(payload: Partial<AppConfig> | null | undefined):
         ...EMPTY_CONFIG,
         ...(payload ?? {}),
     } as AppConfig;
+    const executionMode = next.alpaca_execution_mode === "paper" || next.alpaca_execution_mode === "live"
+        ? next.alpaca_execution_mode
+        : "off";
 
     return {
         ...next,
+        alpaca_execution_mode: executionMode,
+        alpaca_live_trading_enabled: executionMode === "live",
         tracked_symbols: Array.isArray(next.tracked_symbols) ? next.tracked_symbols : EMPTY_CONFIG.tracked_symbols,
         custom_symbols: Array.isArray(next.custom_symbols) ? next.custom_symbols : EMPTY_CONFIG.custom_symbols,
         default_symbols: Array.isArray(next.default_symbols) ? next.default_symbols : EMPTY_CONFIG.default_symbols,
@@ -374,7 +382,7 @@ export default function AdminPage() {
         { value: "system", label: "System", description: "Scheduling, timezone, and run status." },
         { value: "remote-snapshot", label: "Remote Snapshot", description: "Outbound delivery, Telegram setup, and manual sends." },
         { value: "price-history", label: "Price History", description: "Indicator data readiness and pulls." },
-        { value: "alpaca-live-trading", label: "Live Trading", description: "Alpaca brokerage connection and real-money guardrails." },
+        { value: "alpaca-live-trading", label: "Brokerage", description: "Alpaca paper/live routing and broker guardrails." },
         { value: "danger-zone", label: "Danger Zone", description: "Destructive reset actions." },
     ];
     const riskOptions: Array<{
@@ -1011,43 +1019,29 @@ export default function AdminPage() {
         }
     };
 
-    const enableAlpacaLiveTrading = async () => {
+    const setAlpacaExecutionMode = async (mode: "off" | "paper" | "live") => {
         setIsEnablingLive(true);
         try {
             const response = await fetch("/api/alpaca/settings", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ alpaca_live_trading_enabled: true }),
+                body: JSON.stringify({ alpaca_execution_mode: mode }),
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
-                setAlpacaSecretStatus(payload?.error || "Failed to enable live trading");
+                setAlpacaSecretStatus(payload?.error || "Failed to update Alpaca routing");
                 return;
             }
-            setConfig((current) => ({ ...current, alpaca_live_trading_enabled: true }));
-            setSavedConfig((current) => ({ ...current, alpaca_live_trading_enabled: true }));
+            setConfig((current) => ({ ...current, alpaca_execution_mode: mode, alpaca_live_trading_enabled: mode === "live" }));
+            setSavedConfig((current) => ({ ...current, alpaca_execution_mode: mode, alpaca_live_trading_enabled: mode === "live" }));
             setShowLiveConfirmModal(false);
             setLiveConfirmText("");
             await fetchAlpacaStatus();
         } catch {
-            setAlpacaSecretStatus("Failed to enable live trading");
+            setAlpacaSecretStatus("Failed to update Alpaca routing");
         } finally {
             setIsEnablingLive(false);
         }
-    };
-
-    const disableAlpacaLiveTrading = async () => {
-        try {
-            const response = await fetch("/api/alpaca/settings", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ alpaca_live_trading_enabled: false }),
-            });
-            if (!response.ok) return;
-            setConfig((current) => ({ ...current, alpaca_live_trading_enabled: false }));
-            setSavedConfig((current) => ({ ...current, alpaca_live_trading_enabled: false }));
-            await fetchAlpacaStatus();
-        } catch { /* silent */ }
     };
 
     const handleDiscardAndLeave = () => {
@@ -1382,7 +1376,7 @@ python run.py`}</code></pre>
                             <div>
                                 <h2 className="text-base font-semibold text-white">Enable live trading?</h2>
                                 <p className="text-sm text-slate-400 mt-1">
-                                    This will route real orders to Alpaca using real money. Ensure your guardrails are correctly configured before enabling.
+                                    This will route real orders to Alpaca using real money. Strategy Paper and Alpaca Paper tracking remain visible; this only changes where broker-side orders are sent.
                                 </p>
                             </div>
                         </div>
@@ -1409,7 +1403,7 @@ python run.py`}</code></pre>
                             </button>
                             <button
                                 type="button"
-                                onClick={enableAlpacaLiveTrading}
+                                onClick={() => setAlpacaExecutionMode("live")}
                                 disabled={liveConfirmText !== "LIVE" || isEnablingLive}
                                 className="rounded-lg bg-rose-700 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-600 disabled:opacity-40 disabled:cursor-not-allowed"
                             >
@@ -2740,42 +2734,60 @@ python run.py`}</code></pre>
                         <p className="text-xs text-slate-600">Guardrail changes are saved with the Save Config button above.</p>
                     </div>
 
-                    {/* Enable / disable live trading */}
-                    <div className={`flex items-center justify-between gap-4 rounded-xl border px-4 py-3 ${config.alpaca_live_trading_enabled ? "border-rose-800/60 bg-rose-950/20" : "border-slate-800 bg-slate-900/60"}`}>
-                        <div>
-                            <p className="text-sm font-medium text-slate-200">
-                                Live trading
-                                {config.alpaca_live_trading_enabled && (
-                                    <span className="ml-2 rounded-full bg-rose-600/80 px-2 py-0.5 text-[10px] uppercase tracking-widest text-white">ACTIVE</span>
-                                )}
-                            </p>
-                            <p className="text-xs text-slate-500 mt-0.5">
-                                {config.alpaca_live_trading_enabled
-                                    ? "Real orders are being sent to Alpaca. Disable to return to paper-only mode."
-                                    : "Disabled — all signals go to paper simulation only."}
-                            </p>
+                    <div className={`rounded-xl border px-4 py-4 ${config.alpaca_execution_mode === "live" ? "border-rose-800/60 bg-rose-950/20" : config.alpaca_execution_mode === "paper" ? "border-sky-800/60 bg-sky-950/10" : "border-slate-800 bg-slate-900/60"}`}>
+                        <div className="flex items-start justify-between gap-4">
+                            <div>
+                                <p className="text-sm font-medium text-slate-200">
+                                    Broker execution destination
+                                    <span className={`ml-2 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-widest ${
+                                        config.alpaca_execution_mode === "live"
+                                            ? "bg-rose-600/80 text-white"
+                                            : config.alpaca_execution_mode === "paper"
+                                            ? "bg-sky-600/30 text-sky-200"
+                                            : "bg-slate-700 text-slate-300"
+                                    }`}>
+                                        {config.alpaca_execution_mode}
+                                    </span>
+                                </p>
+                                <p className="text-xs text-slate-500 mt-0.5">
+                                    Strategy Paper always keeps running. This setting only decides whether the same signals are also mirrored to Alpaca paper or Alpaca live.
+                                </p>
+                            </div>
                         </div>
-                        {config.alpaca_live_trading_enabled ? (
+                        <div className="mt-4 grid gap-3 md:grid-cols-3">
                             <button
                                 type="button"
-                                onClick={disableAlpacaLiveTrading}
-                                className="flex-shrink-0 rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800"
+                                onClick={() => void setAlpacaExecutionMode("off")}
+                                className={`rounded-xl border px-4 py-3 text-left ${config.alpaca_execution_mode === "off" ? "border-slate-500 bg-slate-800" : "border-slate-800 bg-slate-950/40 hover:bg-slate-900/60"}`}
                             >
-                                Disable
+                                <p className="text-sm font-medium text-white">Off</p>
+                                <p className="mt-1 text-xs text-slate-400">Only the internal strategy paper ledger runs.</p>
                             </button>
-                        ) : (
+                            <button
+                                type="button"
+                                onClick={() => void setAlpacaExecutionMode("paper")}
+                                disabled={!alpacaStatus?.secrets?.paper?.configured}
+                                className={`rounded-xl border px-4 py-3 text-left disabled:opacity-40 disabled:cursor-not-allowed ${config.alpaca_execution_mode === "paper" ? "border-sky-500/60 bg-sky-950/20" : "border-slate-800 bg-slate-950/40 hover:bg-slate-900/60"}`}
+                            >
+                                <p className="text-sm font-medium text-white">Alpaca Paper</p>
+                                <p className="mt-1 text-xs text-slate-400">Mirror signals into the broker paper account while keeping Strategy Paper history.</p>
+                            </button>
                             <button
                                 type="button"
                                 onClick={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
                                 disabled={!alpacaStatus?.secrets?.live?.configured}
-                                className="flex-shrink-0 rounded-lg border border-rose-700 px-4 py-2 text-sm font-semibold text-rose-300 hover:bg-rose-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                                className={`rounded-xl border px-4 py-3 text-left disabled:opacity-40 disabled:cursor-not-allowed ${config.alpaca_execution_mode === "live" ? "border-rose-500/60 bg-rose-950/20" : "border-slate-800 bg-slate-950/40 hover:bg-slate-900/60"}`}
                             >
-                                Enable Live
+                                <p className="text-sm font-medium text-white">Alpaca Live</p>
+                                <p className="mt-1 text-xs text-slate-400">Send real-money orders to Alpaca live while still keeping both paper tracks visible.</p>
                             </button>
-                        )}
+                        </div>
                     </div>
-                    {!alpacaStatus?.secrets?.live?.configured && !config.alpaca_live_trading_enabled && (
-                        <p className="text-xs text-amber-400/80">Save live API keys above before enabling live trading.</p>
+                    {!alpacaStatus?.secrets?.paper?.configured && (
+                        <p className="text-xs text-amber-400/80">Save paper API keys above before routing signals to Alpaca Paper.</p>
+                    )}
+                    {!alpacaStatus?.secrets?.live?.configured && config.alpaca_execution_mode !== "live" && (
+                        <p className="text-xs text-amber-400/80">Save live API keys above before routing signals to Alpaca Live.</p>
                     )}
                 </section>
 
