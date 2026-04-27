@@ -295,7 +295,7 @@ function EquityCurve({ data }: { data: EquityPoint[] }) {
 function AlpacaEquityCurve({ history }: { history: AlpacaPortfolioHistory }) {
     if (!history.timestamp || history.timestamp.length === 0) {
         return (
-            <div className=”flex items-center justify-center h-32 text-slate-500 text-sm”>
+            <div className="flex items-center justify-center h-32 text-slate-500 text-sm">
                 No portfolio history available yet
             </div>
         );
@@ -304,7 +304,7 @@ function AlpacaEquityCurve({ history }: { history: AlpacaPortfolioHistory }) {
     const chartData = history.timestamp.map((ts, i) => ({
         x: i,
         equity: history.equity[i] ?? 0,
-        label: new Date(ts * 1000).toLocaleDateString(undefined, { month: “short”, day: “numeric” }),
+        label: new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }),
     }));
 
     const equities = chartData.map(d => d.equity).filter(Boolean);
@@ -313,26 +313,26 @@ function AlpacaEquityCurve({ history }: { history: AlpacaPortfolioHistory }) {
     const lastPnl = (history.profit_loss ?? [])[history.profit_loss.length - 1] ?? 0;
 
     return (
-        <ResponsiveContainer width=”100%” height={160}>
+        <ResponsiveContainer width="100%" height={160}>
             <LineChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray=”3 3” stroke=”rgba(255,255,255,0.05)” />
-                <XAxis dataKey=”x” hide />
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                <XAxis dataKey="x" hide />
                 <YAxis
                     domain={[minEq * 0.998, maxEq * 1.002]}
                     tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`}
-                    tick={{ fill: “#64748b”, fontSize: 10 }}
+                    tick={{ fill: "#64748b", fontSize: 10 }}
                     width={52}
                 />
                 <Tooltip
-                    contentStyle={{ background: “#1e293b”, border: “1px solid rgba(255,255,255,0.1)”, borderRadius: 8, fontSize: 11 }}
-                    labelFormatter={(_, payload) => payload?.[0]?.payload?.label ?? “”}
-                    formatter={(value: number) => [`$${value.toFixed(2)}`, “Account Equity”]}
+                    contentStyle={{ background: "#1e293b", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 11 }}
+                    labelFormatter={(_, payload) => payload?.[0]?.payload?.label ?? ""}
+                    formatter={(value: number) => [`$${value.toFixed(2)}`, "Account Equity"]}
                 />
-                <ReferenceLine y={history.base_value} stroke=”rgba(255,255,255,0.15)” strokeDasharray=”4 4” />
+                <ReferenceLine y={history.base_value} stroke="rgba(255,255,255,0.15)" strokeDasharray="4 4" />
                 <Line
-                    type=”monotone”
-                    dataKey=”equity”
-                    stroke={lastPnl >= 0 ? “#34d399” : “#f87171”}
+                    type="monotone"
+                    dataKey="equity"
+                    stroke={lastPnl >= 0 ? "#34d399" : "#f87171"}
                     strokeWidth={2}
                     dot={false}
                     activeDot={{ r: 4 }}
@@ -725,4 +725,3 @@ export default function TradingPage() {
         </div>
     );
 }
-
