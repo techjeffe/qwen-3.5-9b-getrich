@@ -215,3 +215,73 @@ async def update_alpaca_settings(
         "daily_loss_limit_usd":      getattr(config, "alpaca_daily_loss_limit_usd",        None),
         "max_consecutive_losses":    getattr(config, "alpaca_max_consecutive_losses",      3),
     }
+
+
+# ── Cancel all orders ─────────────────────────────────────────────────────────
+
+@router.post("/cancel-all-orders")
+async def cancel_all_orders(
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    """Cancel every open order on Alpaca. Wired to the circuit-breaker kill switch."""
+    broker = get_broker_from_keychain()
+    if broker is None:
+        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+    try:
+        cancelled = broker.cancel_all_orders()
+        return {"ok": True, "cancelled_count": len(cancelled), "orders": cancelled}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ── Account configurations ────────────────────────────────────────────────────
+
+@router.get("/account/configurations")
+async def get_account_configurations(
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    """Return Alpaca account-level settings (e.g. shorting_enabled)."""
+    broker = get_broker_from_keychain()
+    if broker is None:
+        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+    try:
+        return broker.get_account_configurations()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ── Portfolio history ─────────────────────────────────────────────────────────
+
+@router.get("/portfolio-history")
+async def get_portfolio_history(
+    period: str = "1M",
+    timeframe: str = "1D",
+    extended_hours: bool = False,
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    """Return Alpaca account equity curve for the given period/timeframe."""
+    broker = get_broker_from_keychain()
+    if broker is None:
+        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+    try:
+        return broker.get_portfolio_history(period=period, timeframe=timeframe, extended_hours=extended_hours)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ── Account activities ────────────────────────────────────────────────────────
+
+@router.get("/activities")
+async def get_account_activities(
+    activity_type: Optional[str] = None,
+    limit: int = 100,
+    _admin: None = Depends(require_admin_token),
+) -> List[Dict[str, Any]]:
+    """Return Alpaca account activities (fills, fees, dividends, etc.)."""
+    broker = get_broker_from_keychain()
+    if broker is None:
+        raise HTTPException(status_code=400, detail="Alpaca API keys not configured")
+    try:
+        return broker.get_account_activities(activity_type=activity_type, limit=min(limit, 500))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))

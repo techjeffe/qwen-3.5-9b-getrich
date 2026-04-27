@@ -323,6 +323,7 @@ export default function AdminPage() {
     const [showLiveConfirmModal, setShowLiveConfirmModal] = useState(false);
     const [liveConfirmText, setLiveConfirmText] = useState("");
     const [isEnablingLive, setIsEnablingLive] = useState(false);
+    const [alpacaAccountConfigurations, setAlpacaAccountConfigurations] = useState<Record<string, unknown> | null>(null);
 
     const isDirty = useMemo(
         () => JSON.stringify(config) !== JSON.stringify(savedConfig),
@@ -530,7 +531,14 @@ export default function AdminPage() {
     const fetchAlpacaStatus = useCallback(async () => {
         try {
             const res = await fetch("/api/alpaca/status", { cache: "no-store" });
-            if (res.ok) setAlpacaStatus(await res.json());
+            if (res.ok) {
+                const statusData = await res.json();
+                setAlpacaStatus(statusData);
+                if (statusData?.secrets?.configured) {
+                    const cfgRes = await fetch("/api/alpaca/account/configurations", { cache: "no-store" });
+                    if (cfgRes.ok) setAlpacaAccountConfigurations(await cfgRes.json());
+                }
+            }
         } catch { /* silent */ }
     }, []);
 
@@ -2712,6 +2720,15 @@ python run.py`}</code></pre>
                             />
                             Allow direct short selling (for custom symbols without an inverse ETF)
                         </label>
+                        {config.alpaca_allow_short_selling && alpacaAccountConfigurations !== null && alpacaAccountConfigurations?.shorting_enabled === false && (
+                            <div className="flex items-start gap-2 rounded-lg border border-amber-600/40 bg-amber-900/20 px-3 py-2 text-xs text-amber-300">
+                                <span className="shrink-0 mt-0.5">⚠</span>
+                                <span>
+                                    Short selling is <strong>enabled here</strong> but your Alpaca account has <strong>shorting disabled</strong>.
+                                    Short orders will be rejected by Alpaca until you enable shorting in your Alpaca account settings.
+                                </span>
+                            </div>
+                        )}
                         <p className="text-xs text-slate-600">Guardrail changes are saved with the Save Config button above.</p>
                     </div>
 

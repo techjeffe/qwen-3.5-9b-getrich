@@ -81,14 +81,69 @@ class AlpacaBroker:
     def cancel_order(self, order_id: str) -> None:
         self._delete(f"/v2/orders/{order_id}")
 
+    def cancel_all_orders(self) -> List[Dict[str, Any]]:
+        """Cancel every open order. Returns list of cancellation responses."""
+        result = self._delete("/v2/orders")
+        return result if isinstance(result, list) else []
+
     def close_position(self, symbol: str) -> Dict[str, Any]:
         return self._delete(f"/v2/positions/{symbol.upper()}")
+
+    def get_position(self, symbol: str) -> Dict[str, Any]:
+        return self._get(f"/v2/positions/{symbol.upper()}")
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         return self._get(f"/v2/orders/{order_id}")
 
+    def get_order_by_client_id(self, client_order_id: str) -> Dict[str, Any]:
+        return self._get(f"/v2/orders:by_client_order_id?client_order_id={client_order_id}")
+
+    def modify_order(
+        self,
+        order_id: str,
+        qty: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if qty is not None:
+            payload["qty"] = str(round(qty, 6))
+        if limit_price is not None:
+            payload["limit_price"] = str(round(limit_price, 2))
+        r = httpx.patch(self._base + f"/v2/orders/{order_id}", headers=self._headers, json=payload, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
     def list_orders(self, status: str = "open", limit: int = 50) -> List[Dict[str, Any]]:
         result = self._get(f"/v2/orders?status={status}&limit={limit}")
+        return result if isinstance(result, list) else []
+
+    def get_account_configurations(self) -> Dict[str, Any]:
+        return self._get("/v2/account/configurations")
+
+    def patch_account_configurations(self, **kwargs: Any) -> Dict[str, Any]:
+        r = httpx.patch(self._base + "/v2/account/configurations", headers=self._headers, json=kwargs, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def get_portfolio_history(
+        self,
+        period: str = "1M",
+        timeframe: str = "1D",
+        extended_hours: bool = False,
+    ) -> Dict[str, Any]:
+        params = f"period={period}&timeframe={timeframe}&extended_hours={'true' if extended_hours else 'false'}"
+        return self._get(f"/v2/account/portfolio/history?{params}")
+
+    def get_account_activities(
+        self,
+        activity_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        path = "/v2/account/activities"
+        if activity_type:
+            path += f"/{activity_type}"
+        path += f"?page_size={limit}"
+        result = self._get(path)
         return result if isinstance(result, list) else []
 
     def _get(self, path: str) -> Any:
@@ -246,6 +301,15 @@ def _disable_live_trading(db, config, reason: str) -> None:
         print(f"[alpaca] CIRCUIT BREAKER — live trading auto-disabled: {reason}")
     except Exception as exc:
         print(f"[alpaca] failed to auto-disable live trading: {exc}")
+    # Best-effort cancel all open orders so no in-flight exposure remains
+    try:
+        broker = get_broker_from_keychain()
+        if broker:
+            cancelled = broker.cancel_all_orders()
+            if cancelled:
+                print(f"[alpaca] circuit breaker: cancelled {len(cancelled)} open order(s)")
+    except Exception as exc:
+        print(f"[alpaca] circuit breaker: cancel_all_orders failed (non-fatal): {exc}")
 
 
 # ── DB record helpers ─────────────────────────────────────────────────────────
@@ -418,11 +482,23 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             2,
         )
         limit_price = max(0.01, limit_price)
-    elif event == "close" and shares > 0:
-        # Regular-hours close: submit the original share count rather than
-        # re-notionalising, so the order matches the live position size even
-        # when price has moved since entry.
-        qty = shares
+    elif event == "close":
+        # Prefer the live Alpaca position qty so the close exactly matches what
+        # Alpaca holds (handles partial fills, manual adjustments, etc.).
+        live_qty: Optional[float] = None
+        try:
+            pos_data = broker.get_position(symbol)
+            raw_q = pos_data.get("qty") or pos_data.get("available_shares")
+            if raw_q is not None:
+                live_qty = abs(float(raw_q))
+        except Exception as _pos_exc:
+            print(f"[alpaca] get_position({symbol}) failed, falling back to paper shares: {_pos_exc}")
+        if live_qty and live_qty > 0:
+            qty = live_qty
+        elif shares > 0:
+            qty = shares
+        else:
+            use_notional = notional  # last-resort fallback
     else:
         use_notional = notional
 
@@ -459,6 +535,8 @@ def poll_unfilled_orders(db) -> int:
     """
     Query Alpaca for the current status of any pending (non-terminal) orders
     and update the alpaca_orders rows. Returns count of rows updated.
+    For rows missing alpaca_order_id (e.g. response lost), falls back to
+    get_order_by_client_id to recover the Alpaca order ID.
     """
     from database.models import AlpacaOrder
 
@@ -469,9 +547,9 @@ def poll_unfilled_orders(db) -> int:
     pending = (
         db.query(AlpacaOrder)
         .filter(
-            AlpacaOrder.alpaca_order_id.isnot(None),
             AlpacaOrder.filled_at.is_(None),
             AlpacaOrder.status.notin_(list(_TERMINAL_STATUSES)),
+            AlpacaOrder.error_message.is_(None),
         )
         .all()
     )
@@ -479,7 +557,17 @@ def poll_unfilled_orders(db) -> int:
     updated = 0
     for order in pending:
         try:
-            data = broker.get_order(order.alpaca_order_id)
+            if order.alpaca_order_id:
+                data = broker.get_order(order.alpaca_order_id)
+            elif order.client_order_id:
+                # Fallback: recover order ID via our own client_order_id
+                data = broker.get_order_by_client_id(order.client_order_id)
+                recovered_id = data.get("id")
+                if recovered_id:
+                    order.alpaca_order_id = recovered_id
+            else:
+                continue
+
             new_status = data.get("status")
             if not new_status or new_status == order.status:
                 continue
@@ -495,7 +583,8 @@ def poll_unfilled_orders(db) -> int:
             order.raw_response = data
             updated += 1
         except Exception as exc:
-            print(f"[alpaca] poll: order {order.alpaca_order_id} error: {exc}")
+            oid = order.alpaca_order_id or order.client_order_id or order.id
+            print(f"[alpaca] poll: order {oid} error: {exc}")
 
     if updated:
         db.commit()
