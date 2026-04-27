@@ -115,6 +115,14 @@ type TradingData = {
     equity_curve: EquityPoint[];
 };
 
+type AlpacaPortfolioHistory = {
+    timestamp: number[];
+    equity: number[];
+    profit_loss: number[];
+    profit_loss_pct: number[];
+    base_value: number;
+};
+
 // â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function pnlColor(val: number) {
@@ -282,6 +290,58 @@ function EquityCurve({ data }: { data: EquityPoint[] }) {
     );
 }
 
+// â”€â”€â”€ Alpaca Equity Curve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function AlpacaEquityCurve({ history }: { history: AlpacaPortfolioHistory }) {
+    if (!history.timestamp || history.timestamp.length === 0) {
+        return (
+            <div className=”flex items-center justify-center h-32 text-slate-500 text-sm”>
+                No portfolio history available yet
+            </div>
+        );
+    }
+
+    const chartData = history.timestamp.map((ts, i) => ({
+        x: i,
+        equity: history.equity[i] ?? 0,
+        label: new Date(ts * 1000).toLocaleDateString(undefined, { month: “short”, day: “numeric” }),
+    }));
+
+    const equities = chartData.map(d => d.equity).filter(Boolean);
+    const minEq = Math.min(...equities);
+    const maxEq = Math.max(...equities);
+    const lastPnl = (history.profit_loss ?? [])[history.profit_loss.length - 1] ?? 0;
+
+    return (
+        <ResponsiveContainer width=”100%” height={160}>
+            <LineChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray=”3 3” stroke=”rgba(255,255,255,0.05)” />
+                <XAxis dataKey=”x” hide />
+                <YAxis
+                    domain={[minEq * 0.998, maxEq * 1.002]}
+                    tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`}
+                    tick={{ fill: “#64748b”, fontSize: 10 }}
+                    width={52}
+                />
+                <Tooltip
+                    contentStyle={{ background: “#1e293b”, border: “1px solid rgba(255,255,255,0.1)”, borderRadius: 8, fontSize: 11 }}
+                    labelFormatter={(_, payload) => payload?.[0]?.payload?.label ?? “”}
+                    formatter={(value: number) => [`$${value.toFixed(2)}`, “Account Equity”]}
+                />
+                <ReferenceLine y={history.base_value} stroke=”rgba(255,255,255,0.15)” strokeDasharray=”4 4” />
+                <Line
+                    type=”monotone”
+                    dataKey=”equity”
+                    stroke={lastPnl >= 0 ? “#34d399” : “#f87171”}
+                    strokeWidth={2}
+                    dot={false}
+                    activeDot={{ r: 4 }}
+                />
+            </LineChart>
+        </ResponsiveContainer>
+    );
+}
+
 // â”€â”€â”€ Main Page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export default function TradingPage() {
@@ -291,6 +351,7 @@ export default function TradingPage() {
     const [resetting, setResetting] = useState(false);
     const [alpacaLiveEnabled, setAlpacaLiveEnabled] = useState(false);
     const [alpacaOrders, setAlpacaOrders] = useState<AlpacaOrder[]>([]);
+    const [alpacaHistory, setAlpacaHistory] = useState<AlpacaPortfolioHistory | null>(null);
 
     const load = useCallback(async () => {
         try {
@@ -308,9 +369,10 @@ export default function TradingPage() {
 
     const loadAlpaca = useCallback(async () => {
         try {
-            const [statusRes, ordersRes] = await Promise.all([
+            const [statusRes, ordersRes, historyRes] = await Promise.all([
                 fetch("/api/alpaca/status", { cache: "no-store" }),
                 fetch("/api/alpaca/orders?limit=50", { cache: "no-store" }),
+                fetch("/api/alpaca/portfolio-history?period=1M&timeframe=1D", { cache: "no-store" }),
             ]);
             if (statusRes.ok) {
                 const s = await statusRes.json();
@@ -318,6 +380,10 @@ export default function TradingPage() {
             }
             if (ordersRes.ok) {
                 setAlpacaOrders(await ordersRes.json());
+            }
+            if (historyRes.ok) {
+                const h = await historyRes.json();
+                if (h?.timestamp?.length) setAlpacaHistory(h);
             }
         } catch { /* silent — Alpaca may not be configured */ }
     }, []);
@@ -438,7 +504,7 @@ export default function TradingPage() {
                             <StatCard label="Total Trades" value={String(s!.total_trades)} />
                         </div>
 
-                        {/* Equity curve */}
+                        {/* Paper equity curve */}
                         <div className="rounded-xl border border-white/8 p-5" style={{ background: "rgba(30,41,59,0.7)" }}>
                             <div className="flex items-center gap-2 mb-4">
                                 <BarChart2 size={14} className="text-slate-400" />
@@ -447,6 +513,19 @@ export default function TradingPage() {
                             </div>
                             <EquityCurve data={data.equity_curve} />
                         </div>
+
+                        {/* Alpaca live equity curve */}
+                        {alpacaHistory && (
+                            <div className="rounded-xl border border-rose-600/30 p-5" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                <div className="flex items-center gap-2 mb-4">
+                                    <span className="w-2 h-2 rounded-full bg-rose-400 animate-pulse shrink-0" />
+                                    <p className="text-sm font-semibold text-white">Alpaca Account Equity</p>
+                                    <span className="rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium bg-rose-600/20 text-rose-300 ml-1">LIVE</span>
+                                    <p className="text-[10px] text-slate-500 ml-auto">30-day account equity from Alpaca</p>
+                                </div>
+                                <AlpacaEquityCurve history={alpacaHistory} />
+                            </div>
+                        )}
 
                         {/* Open positions */}
                         {data.open_positions.length > 0 && (
