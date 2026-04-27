@@ -252,19 +252,72 @@ def _is_extended_hours_now(config=None) -> bool:
 
 # ── Circuit breakers ──────────────────────────────────────────────────────────
 
-def _get_alpaca_live_open_exposure() -> Optional[float]:
-    """Return total open position market value from the live Alpaca account.
-
-    Returns None if the broker is unreachable; caller must decide how to handle.
-    """
+def _get_alpaca_live_open_exposure(broker: "AlpacaBroker") -> Optional[float]:
+    """Sum |market_value| of all open live positions. Returns None on error."""
     try:
-        broker = get_broker_from_keychain(mode="live")
-        if broker is None:
-            return None
         positions = broker.get_positions()
         return sum(abs(float(p.get("market_value") or 0)) for p in positions)
     except Exception as exc:
         print(f"[alpaca] could not fetch live positions for exposure check: {exc}")
+        return None
+
+
+def _get_alpaca_live_daily_pnl(broker: "AlpacaBroker") -> Optional[float]:
+    """Return today's P&L from the live account (equity − last_equity). Returns None on error."""
+    try:
+        account = broker.get_account()
+        equity = float(account.get("equity") or 0)
+        last_equity = float(account.get("last_equity") or 0)
+        return equity - last_equity
+    except Exception as exc:
+        print(f"[alpaca] could not fetch account for daily P&L check: {exc}")
+        return None
+
+
+def _get_alpaca_live_recent_pnls(db, n: int) -> Optional[List[float]]:
+    """Return P&L for the last n completed live round-trips from AlpacaOrder records.
+
+    Returns None on error (caller skips the check). Returns a short list if
+    fewer than n round-trips have been completed — the caller handles that.
+    """
+    from database.models import AlpacaOrder
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    try:
+        orders = (
+            db.query(AlpacaOrder)
+            .filter(
+                AlpacaOrder.trading_mode == "live",
+                AlpacaOrder.status == "filled",
+                AlpacaOrder.filled_avg_price.isnot(None),
+                AlpacaOrder.filled_qty.isnot(None),
+                AlpacaOrder.paper_trade_id.isnot(None),
+            )
+            .all()
+        )
+        by_trade: Dict[int, List] = {}
+        for o in orders:
+            by_trade.setdefault(o.paper_trade_id, []).append(o)
+
+        completed: List[tuple] = []
+        for trade_orders in by_trade.values():
+            buys = [o for o in trade_orders if o.side == "buy"]
+            sells = [o for o in trade_orders if o.side == "sell"]
+            if not (buys and sells):
+                continue
+            buy = max(buys, key=lambda o: o.filled_at or _epoch)
+            sell = max(sells, key=lambda o: o.filled_at or _epoch)
+            qty = min(float(buy.filled_qty), float(sell.filled_qty))
+            if qty <= 0:
+                continue
+            pnl = (float(sell.filled_avg_price) - float(buy.filled_avg_price)) * qty
+            close_time = max(buy.filled_at or _epoch, sell.filled_at or _epoch)
+            completed.append((close_time, pnl))
+
+        completed.sort(key=lambda x: x[0], reverse=True)
+        return [pnl for _, pnl in completed[:n]]
+    except Exception as exc:
+        print(f"[alpaca] could not compute live consecutive P&L: {exc}")
         return None
 
 
@@ -273,62 +326,88 @@ def _check_circuit_breakers(db, config, pending_notional: float = 0.0) -> None:
     Raise CircuitBreakerError and auto-disable live trading if a limit is breached.
     Checks: max total open exposure, daily loss limit, consecutive loss streak.
 
-    pending_notional: the notional of the order about to be placed, included in
-    the exposure total so that a single order cannot overshoot the configured max.
+    In live mode every check reads from the real Alpaca account / AlpacaOrder
+    audit table. In paper/sim mode every check reads from the PaperTrade ledger.
+    The two data sources are never mixed.
+
+    pending_notional: notional of the order about to be placed; added to the
+    current open exposure so a single order cannot overshoot the configured max.
     """
     from database.models import PaperTrade
 
+    is_live = getattr(config, "alpaca_execution_mode", None) == "live"
+    live_broker = get_broker_from_keychain(mode="live") if is_live else None
+
+    # ── Max total open exposure ──────────────────────────────────────────────
     max_exposure = getattr(config, "alpaca_max_total_exposure_usd", None)
     if max_exposure and max_exposure > 0:
-        if getattr(config, "alpaca_execution_mode", None) == "live":
-            live_exposure = _get_alpaca_live_open_exposure()
-            if live_exposure is None:
-                # Cannot verify live exposure — skip this check rather than
-                # substituting the paper ledger, which tracks simulated trades
-                # and has no relationship to real Alpaca positions.
-                print("[alpaca] exposure check: live position fetch failed, skipping max-exposure guard")
+        if is_live:
+            if live_broker is None:
+                print("[alpaca] exposure check: no live broker configured, skipping")
             else:
-                open_exposure = live_exposure + pending_notional
-                if open_exposure >= max_exposure:
-                    _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
-                    raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
+                live_exposure = _get_alpaca_live_open_exposure(live_broker)
+                if live_exposure is None:
+                    print("[alpaca] exposure check: live position fetch failed, skipping")
+                else:
+                    open_exposure = live_exposure + pending_notional
+                    if open_exposure >= max_exposure:
+                        _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
+                        raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
         else:
             open_exposure = (
-                sum(
-                    float(t.amount or 0)
-                    for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
-                )
+                sum(float(t.amount or 0) for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all())
                 + pending_notional
             )
             if open_exposure >= max_exposure:
                 _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
                 raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
 
+    # ── Daily loss limit ─────────────────────────────────────────────────────
     daily_limit = getattr(config, "alpaca_daily_loss_limit_usd", None)
     if daily_limit and daily_limit > 0:
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_pnl = sum(
-            float(t.realized_pnl or 0)
-            for t in db.query(PaperTrade)
-            .filter(PaperTrade.exited_at >= today_start, PaperTrade.realized_pnl.isnot(None))
-            .all()
-        )
-        if today_pnl <= -daily_limit:
-            _disable_live_trading(db, config, f"daily loss limit ${daily_limit:.0f} hit (P&L ${today_pnl:.2f})")
-            raise CircuitBreakerError(f"Daily loss limit ${daily_limit:.0f} hit")
+        if is_live:
+            if live_broker is None:
+                print("[alpaca] daily loss check: no live broker configured, skipping")
+            else:
+                today_pnl = _get_alpaca_live_daily_pnl(live_broker)
+                if today_pnl is None:
+                    print("[alpaca] daily loss check: account fetch failed, skipping")
+                elif today_pnl <= -daily_limit:
+                    _disable_live_trading(db, config, f"daily loss limit ${daily_limit:.0f} hit (P&L ${today_pnl:.2f})")
+                    raise CircuitBreakerError(f"Daily loss limit ${daily_limit:.0f} hit")
+        else:
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_pnl = sum(
+                float(t.realized_pnl or 0)
+                for t in db.query(PaperTrade)
+                .filter(PaperTrade.exited_at >= today_start, PaperTrade.realized_pnl.isnot(None))
+                .all()
+            )
+            if today_pnl <= -daily_limit:
+                _disable_live_trading(db, config, f"daily loss limit ${daily_limit:.0f} hit (P&L ${today_pnl:.2f})")
+                raise CircuitBreakerError(f"Daily loss limit ${daily_limit:.0f} hit")
 
+    # ── Consecutive loss streak ──────────────────────────────────────────────
     max_consec = getattr(config, "alpaca_max_consecutive_losses", None)
     if max_consec and max_consec > 0:
-        recent = (
-            db.query(PaperTrade)
-            .filter(PaperTrade.exited_at.isnot(None), PaperTrade.realized_pnl.isnot(None))
-            .order_by(PaperTrade.exited_at.desc())
-            .limit(max_consec)
-            .all()
-        )
-        if len(recent) >= max_consec and all(float(t.realized_pnl or 0) < 0 for t in recent):
-            _disable_live_trading(db, config, f"{max_consec} consecutive losses")
-            raise CircuitBreakerError(f"{max_consec} consecutive losses reached")
+        if is_live:
+            recent_pnls = _get_alpaca_live_recent_pnls(db, max_consec)
+            if recent_pnls is None:
+                print("[alpaca] consecutive loss check: could not compute live P&L, skipping")
+            elif len(recent_pnls) >= max_consec and all(pnl < 0 for pnl in recent_pnls):
+                _disable_live_trading(db, config, f"{max_consec} consecutive losses")
+                raise CircuitBreakerError(f"{max_consec} consecutive losses reached")
+        else:
+            recent = (
+                db.query(PaperTrade)
+                .filter(PaperTrade.exited_at.isnot(None), PaperTrade.realized_pnl.isnot(None))
+                .order_by(PaperTrade.exited_at.desc())
+                .limit(max_consec)
+                .all()
+            )
+            if len(recent) >= max_consec and all(float(t.realized_pnl or 0) < 0 for t in recent):
+                _disable_live_trading(db, config, f"{max_consec} consecutive losses")
+                raise CircuitBreakerError(f"{max_consec} consecutive losses reached")
 
 
 def _disable_live_trading(db, config, reason: str) -> None:
