@@ -1055,6 +1055,11 @@ export default function AdminPage() {
         router.push(pendingNav!);
     };
 
+    const handleSaveAndExit = async () => {
+        await save();
+        router.push("/");
+    };
+
     return (
         <main className="min-h-screen bg-slate-950 text-slate-100 px-6 py-10">
             {showResetModal && (
@@ -2644,7 +2649,26 @@ python run.py`}</code></pre>
 
                     {/* Guardrail settings */}
                     <div className="space-y-3">
-                        <p className="text-xs text-slate-400 font-medium">Order guardrails</p>
+                        <div className="flex items-center gap-2">
+                            <p className="text-xs text-slate-400 font-medium">Order guardrails</p>
+                            {config.alpaca_execution_mode === "live" && (
+                                <span className="rounded-full bg-rose-600/80 px-2 py-0.5 text-[10px] uppercase tracking-widest text-white">Live</span>
+                            )}
+                            {config.alpaca_execution_mode === "paper" && (
+                                <span className="rounded-full bg-sky-600/30 px-2 py-0.5 text-[10px] uppercase tracking-widest text-sky-200">Paper</span>
+                            )}
+                        </div>
+                        {config.alpaca_execution_mode !== "off" && (
+                            <p className={`rounded-lg border px-3 py-2 text-xs ${
+                                config.alpaca_execution_mode === "live"
+                                    ? "border-rose-800/40 bg-rose-950/40 text-rose-300"
+                                    : "border-sky-800/30 bg-sky-950/30 text-sky-300"
+                            }`}>
+                                {config.alpaca_execution_mode === "live"
+                                    ? "Live mode — limits are enforced against your real Alpaca positions and account balance"
+                                    : "Paper mode — limits are enforced against the internal paper trade ledger"}
+                            </p>
+                        )}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <label className="block">
                                 <span className="text-xs text-slate-500">Max position size (USD, blank = unlimited)</span>
@@ -2868,6 +2892,32 @@ python run.py`}</code></pre>
                     </div>
                 </section>
                     </div>
+                </div>
+            </div>
+
+            {/* Floating save / exit panel — stays visible while scrolling */}
+            <div className="fixed bottom-6 right-6 z-40 flex flex-col items-end gap-2">
+                {status && (
+                    <span className="rounded-lg bg-slate-800 px-3 py-1.5 text-xs text-slate-300 shadow">{status}</span>
+                )}
+                <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/95 px-3 py-2 shadow-xl backdrop-blur-sm">
+                    <button
+                        type="button"
+                        onClick={() => handleNavigate("/")}
+                        className="rounded-lg px-3 py-1.5 text-sm text-slate-400 hover:text-white transition-colors"
+                    >
+                        Back
+                    </button>
+                    {isDirty && (
+                        <button
+                            type="button"
+                            onClick={handleSaveAndExit}
+                            disabled={isSaving}
+                            className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-blue-500 disabled:opacity-60 transition-colors"
+                        >
+                            {isSaving ? "Saving…" : "Save & Exit"}
+                        </button>
+                    )}
                 </div>
             </div>
         </main>
