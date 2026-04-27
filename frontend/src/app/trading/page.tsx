@@ -491,6 +491,7 @@ export default function TradingPage() {
         acc[mode] = alpacaOrders.filter((order) => order.trading_mode === mode).length;
         return acc;
     }, {} as Record<BrokerMode, number>);
+    const latestLiveOrderError = alpacaOrders.find((order) => order.trading_mode === "live" && !!order.error_message) ?? null;
     const availableTracks: TradingTrack[] = [
         "strategy_paper",
         ...(configuredBrokerModes.includes("paper") ? ["alpaca_paper" as const] : []),
@@ -853,6 +854,13 @@ export default function TradingPage() {
                             ))}
                             <span className="ml-auto text-[10px] text-slate-500">{alpacaOrders.length} orders</span>
                         </div>
+                        {latestLiveOrderError && (
+                            <div className="mx-5 mt-4 rounded-lg border border-amber-600/40 bg-amber-900/20 px-4 py-3 text-xs text-amber-200">
+                                Latest live order failure: {latestLiveOrderError.symbol} {latestLiveOrderError.side.toUpperCase()} was blocked.
+                                {" "}
+                                <span className="text-amber-300">{latestLiveOrderError.error_message}</span>
+                            </div>
+                        )}
                         <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                                 <thead>
@@ -895,7 +903,7 @@ export default function TradingPage() {
                                                 <td className={`px-4 py-3 ${statusColor}`}>
                                                     {isError ? (
                                                         <span title={order.error_message ?? ""} className="cursor-help">
-                                                            error
+                                                            {`error${order.error_message ? `: ${order.error_message}` : ""}`}
                                                         </span>
                                                     ) : (
                                                         order.status ?? "—"

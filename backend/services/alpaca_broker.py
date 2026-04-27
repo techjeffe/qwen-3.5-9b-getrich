@@ -230,7 +230,7 @@ def _has_live_open_order(db, paper_trade_id) -> bool:
 
 
 def _is_extended_hours_now(config=None) -> bool:
-    """Return True if current ET time is in pre/after-market but not regular hours."""
+    """Return True during Alpaca-supported pre/post-market windows when enabled."""
     from datetime import time as time_cls
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -468,9 +468,11 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     limit_price: Optional[float] = None
     qty:         Optional[float] = None
     use_notional: Optional[float] = None
+    order_type = str(getattr(config, "alpaca_order_type", "market") or "market")
+    time_in_force = "day"
 
     if ext_hours:
-        # Extended hours: Alpaca requires qty + limit price; notional not supported
+        # Pre/post-market: Alpaca requires explicit extended_hours + limit + qty.
         if shares > 0:
             qty = shares
         elif entry_price > 0:
@@ -487,6 +489,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             2,
         )
         limit_price = max(0.01, limit_price)
+        order_type = "limit"
     elif event == "close":
         # Prefer the live Alpaca position qty so the close exactly matches what
         # Alpaca holds (handles partial fills, manual adjustments, etc.).
@@ -507,7 +510,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     else:
         use_notional = notional
 
-    order_type = str(getattr(config, "alpaca_order_type", "market") or "market")
     client_order_id = f"gr-{paper_id}-{event[:1]}-{int(_time.time())}"
 
     try:
@@ -517,7 +519,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             notional        = use_notional,
             qty             = qty,
             order_type      = order_type,
-            time_in_force   = "day",
+            time_in_force   = time_in_force,
             limit_price     = limit_price,
             extended_hours  = ext_hours,
             client_order_id = client_order_id,

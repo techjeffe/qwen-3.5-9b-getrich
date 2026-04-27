@@ -2700,6 +2700,9 @@ python run.py`}</code></pre>
                                     <option value="market">Market</option>
                                     <option value="limit">Limit</option>
                                 </select>
+                                <p className="mt-1 text-[11px] text-slate-500">
+                                    Pre-market and after-hours Alpaca orders are always sent as limit DAY orders with extended-hours enabled.
+                                </p>
                             </label>
                             <label className="block">
                                 <span className="text-xs text-slate-500">Limit slippage (e.g. 0.002 = 0.2%)</span>
