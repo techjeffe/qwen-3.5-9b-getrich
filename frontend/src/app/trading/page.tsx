@@ -464,6 +464,14 @@ export default function TradingPage() {
         } catch { /* ignore */ }
     }, []);
 
+    // When live trading is enabled, auto-promote the preferred track to alpaca_live
+    // unless the user has explicitly chosen alpaca_paper.
+    useEffect(() => {
+        if (alpacaLiveEnabled && availableTracks.includes("alpaca_live")) {
+            setPreferredTrack((prev) => (prev === "alpaca_paper" ? prev : "alpaca_live"));
+        }
+    }, [alpacaLiveEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
+
     useEffect(() => {
         try {
             window.localStorage.setItem(PREFERRED_TRADING_TRACK_KEY, preferredTrack);
@@ -492,6 +500,38 @@ export default function TradingPage() {
         return acc;
     }, {} as Record<BrokerMode, number>);
     const latestLiveOrderError = alpacaOrders.find((order) => order.trading_mode === "live" && !!order.error_message) ?? null;
+
+    // ── Live summary stats computed from Alpaca account + order fills ─────────
+    const liveAccount = alpacaAccounts.live;
+    const liveEquity = liveAccount?.equity != null ? Number(liveAccount.equity) : null;
+    const liveLastEquity = liveAccount?.last_equity != null ? Number(liveAccount.last_equity) : null;
+    const liveDayPnl = liveEquity != null && liveLastEquity != null ? liveEquity - liveLastEquity : null;
+
+    const liveFilled = alpacaOrders.filter(
+        (o) => o.trading_mode === "live" && o.status === "filled" && o.paper_trade_id != null,
+    );
+    const liveByTrade = new Map<number, AlpacaOrder[]>();
+    for (const o of liveFilled) {
+        const key = o.paper_trade_id!;
+        if (!liveByTrade.has(key)) liveByTrade.set(key, []);
+        liveByTrade.get(key)!.push(o);
+    }
+    let liveWins = 0, liveLosses = 0, liveRealized = 0, liveOpenCount = 0;
+    for (const orders of liveByTrade.values()) {
+        const buys = orders.filter((o) => o.side === "buy");
+        const sells = orders.filter((o) => o.side === "sell");
+        if (!buys.length || !sells.length) { liveOpenCount++; continue; }
+        const buy = buys.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
+        const sell = sells.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
+        if (!buy.filled_avg_price || !sell.filled_avg_price) continue;
+        const qty = Math.min(buy.filled_qty ?? 0, sell.filled_qty ?? 0);
+        const pnl = (sell.filled_avg_price - buy.filled_avg_price) * qty;
+        liveRealized += pnl;
+        if (pnl > 0) liveWins++; else liveLosses++;
+    }
+    const liveTotalTrades = liveWins + liveLosses;
+    const liveWinRate = liveTotalTrades > 0 ? (liveWins / liveTotalTrades) * 100 : null;
+
     const availableTracks: TradingTrack[] = [
         "strategy_paper",
         ...(configuredBrokerModes.includes("paper") ? ["alpaca_paper" as const] : []),
@@ -607,40 +647,78 @@ export default function TradingPage() {
                             </div>
                         </div>
 
-                        {/* Summary stats */}
-                        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
-                            <StatCard
-                                label="Net P&L"
-                                value={fmtDollar(s!.total_pnl)}
-                                sub={`${fmt(s!.total_pnl_pct)}% of deployed`}
-                                color={pnlColor(s!.total_pnl)}
-                            />
-                            <StatCard
-                                label="Realized"
-                                value={fmtDollar(s!.realized_pnl)}
-                                sub={`${s!.closed_trades} closed trades`}
-                                color={pnlColor(s!.realized_pnl)}
-                            />
-                            <StatCard
-                                label="Open P&L"
-                                value={fmtDollar(s!.open_pnl)}
-                                sub={`${s!.open_positions} open positions`}
-                                color={pnlColor(s!.open_pnl)}
-                            />
-                            <StatCard
-                                label="Win Rate"
-                                value={`${s!.win_rate.toFixed(0)}%`}
-                                sub={`${s!.win_count}W / ${s!.loss_count}L`}
-                                color={s!.win_rate >= 50 ? "text-emerald-400" : "text-red-400"}
-                            />
-                        </div>
+                        {/* ── Live summary (front and center when live is preferred) ── */}
+                        {preferredTrack === "alpaca_live" && alpacaLiveEnabled && (
+                            <>
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl border border-rose-500/30 bg-rose-950/10 p-3">
+                                    <StatCard
+                                        label="Equity"
+                                        value={liveEquity != null ? fmtMoney(liveEquity) : "—"}
+                                    />
+                                    <StatCard
+                                        label="Day P&L"
+                                        value={liveDayPnl != null ? fmtDollar(liveDayPnl) : "—"}
+                                        color={liveDayPnl != null ? pnlColor(liveDayPnl) : undefined}
+                                    />
+                                    <StatCard
+                                        label="Realized P&L"
+                                        value={fmtDollar(liveRealized)}
+                                        sub={`${liveTotalTrades} closed trades`}
+                                        color={pnlColor(liveRealized)}
+                                    />
+                                    <StatCard
+                                        label="Win Rate"
+                                        value={liveWinRate != null ? `${liveWinRate.toFixed(0)}%` : "—"}
+                                        sub={liveTotalTrades > 0 ? `${liveWins}W / ${liveLosses}L` : "no closed trades"}
+                                        color={liveWinRate != null ? (liveWinRate >= 50 ? "text-emerald-400" : "text-red-400") : undefined}
+                                    />
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl border border-rose-500/30 bg-rose-950/10 p-3">
+                                    <StatCard label="Cash" value={liveAccount?.cash != null ? fmtMoney(liveAccount.cash) : "—"} />
+                                    <StatCard label="Buying Power" value={liveAccount?.buying_power != null ? fmtMoney(liveAccount.buying_power) : "—"} />
+                                    <StatCard label="Open Positions" value={String(liveOpenCount)} />
+                                    <StatCard label="Total Trades" value={String(liveTotalTrades)} />
+                                </div>
+                            </>
+                        )}
 
-                        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
-                            <StatCard label="Avg Win" value={fmtDollar(s!.avg_win)} color="text-emerald-400" />
-                            <StatCard label="Avg Loss" value={fmtDollar(s!.avg_loss)} color="text-red-400" />
-                            <StatCard label="Total Deployed" value={`$${s!.total_deployed.toFixed(0)}`} />
-                            <StatCard label="Total Trades" value={String(s!.total_trades)} />
-                        </div>
+                        {/* ── Paper summary (top when paper preferred, below when live is preferred) ── */}
+                        {preferredTrack !== "alpaca_live" && (
+                            <>
+                                <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
+                                    <StatCard
+                                        label="Net P&L"
+                                        value={fmtDollar(s!.total_pnl)}
+                                        sub={`${fmt(s!.total_pnl_pct)}% of deployed`}
+                                        color={pnlColor(s!.total_pnl)}
+                                    />
+                                    <StatCard
+                                        label="Realized"
+                                        value={fmtDollar(s!.realized_pnl)}
+                                        sub={`${s!.closed_trades} closed trades`}
+                                        color={pnlColor(s!.realized_pnl)}
+                                    />
+                                    <StatCard
+                                        label="Open P&L"
+                                        value={fmtDollar(s!.open_pnl)}
+                                        sub={`${s!.open_positions} open positions`}
+                                        color={pnlColor(s!.open_pnl)}
+                                    />
+                                    <StatCard
+                                        label="Win Rate"
+                                        value={`${s!.win_rate.toFixed(0)}%`}
+                                        sub={`${s!.win_count}W / ${s!.loss_count}L`}
+                                        color={s!.win_rate >= 50 ? "text-emerald-400" : "text-red-400"}
+                                    />
+                                </div>
+                                <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
+                                    <StatCard label="Avg Win" value={fmtDollar(s!.avg_win)} color="text-emerald-400" />
+                                    <StatCard label="Avg Loss" value={fmtDollar(s!.avg_loss)} color="text-red-400" />
+                                    <StatCard label="Total Deployed" value={`$${s!.total_deployed.toFixed(0)}`} />
+                                    <StatCard label="Total Trades" value={String(s!.total_trades)} />
+                                </div>
+                            </>
+                        )}
 
                         {/* Broker accounts */}
                         {(configuredBrokerModes.length > 0 || alpacaOrders.length > 0) && (
@@ -697,35 +775,84 @@ export default function TradingPage() {
                             </div>
                         )}
 
-                        {/* Paper equity curve */}
-                        <div className={`rounded-xl p-5 ${preferredTrack === "strategy_paper" ? "border border-sky-500/30" : "border border-white/8"}`} style={{ background: "rgba(30,41,59,0.7)" }}>
-                            <div className="flex items-center gap-2 mb-4">
-                                <BarChart2 size={14} className="text-slate-400" />
-                                <p className="text-sm font-semibold text-white">Strategy Paper Equity</p>
-                                <p className="text-[10px] text-slate-500 ml-auto">Cumulative realized P&L over closed trades</p>
-                            </div>
-                            <EquityCurve data={data.equity_curve} />
-                        </div>
-
-                        {brokerModes
-                            .filter((mode) => !!alpacaHistories[mode])
-                            .map((mode) => (
-                                <div key={mode} className={`rounded-xl p-5 ${
-                                    mode === "live"
-                                        ? preferredTrack === "alpaca_live" ? "border border-rose-500/40" : "border border-rose-600/30"
-                                        : preferredTrack === "alpaca_paper" ? "border border-cyan-500/40" : "border border-sky-500/20"
-                                }`} style={{ background: "rgba(30,41,59,0.7)" }}>
-                                    <div className="flex items-center gap-2 mb-4">
-                                        <span className={`w-2 h-2 rounded-full shrink-0 ${mode === "live" ? "bg-rose-400" : "bg-sky-400"}`} />
-                                        <p className="text-sm font-semibold text-white">Alpaca {modeLabel(mode)} Equity</p>
-                                        <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium ml-1 ${modeBadgeClass(mode)}`}>
-                                            {mode.toUpperCase()}
-                                        </span>
-                                        <p className="text-[10px] text-slate-500 ml-auto">30-day broker account equity</p>
+                        {/* ── Equity curves: live first when live is preferred ── */}
+                        {preferredTrack === "alpaca_live" ? (
+                            <>
+                                {alpacaHistories.live && (
+                                    <div className="rounded-xl p-5 border border-rose-500/40" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                        <div className="flex items-center gap-2 mb-4">
+                                            <span className="w-2 h-2 rounded-full shrink-0 bg-rose-400" />
+                                            <p className="text-sm font-semibold text-white">Alpaca Live Equity</p>
+                                            <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium ml-1 ${modeBadgeClass("live")}`}>LIVE</span>
+                                            <p className="text-[10px] text-slate-500 ml-auto">30-day broker account equity</p>
+                                        </div>
+                                        <AlpacaEquityCurve history={alpacaHistories.live} />
                                     </div>
-                                    <AlpacaEquityCurve history={alpacaHistories[mode]!} />
+                                )}
+
+                                {/* Paper section below the fold */}
+                                <div className="rounded-xl border border-slate-700/40 p-4 space-y-4" style={{ background: "rgba(15,23,42,0.5)" }}>
+                                    <p className="text-[10px] uppercase tracking-widest text-slate-500 font-medium">Paper Track (simulation)</p>
+                                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                        <StatCard label="Net P&L" value={fmtDollar(s!.total_pnl)} sub={`${fmt(s!.total_pnl_pct)}% of deployed`} color={pnlColor(s!.total_pnl)} />
+                                        <StatCard label="Realized" value={fmtDollar(s!.realized_pnl)} sub={`${s!.closed_trades} closed`} color={pnlColor(s!.realized_pnl)} />
+                                        <StatCard label="Win Rate" value={`${s!.win_rate.toFixed(0)}%`} sub={`${s!.win_count}W / ${s!.loss_count}L`} color={s!.win_rate >= 50 ? "text-emerald-400" : "text-red-400"} />
+                                        <StatCard label="Open P&L" value={fmtDollar(s!.open_pnl)} sub={`${s!.open_positions} open`} color={pnlColor(s!.open_pnl)} />
+                                    </div>
+                                    <div className="rounded-xl p-5 border border-white/8" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                        <div className="flex items-center gap-2 mb-4">
+                                            <BarChart2 size={14} className="text-slate-400" />
+                                            <p className="text-sm font-semibold text-white">Strategy Paper Equity</p>
+                                            <p className="text-[10px] text-slate-500 ml-auto">Cumulative realized P&L</p>
+                                        </div>
+                                        <EquityCurve data={data.equity_curve} />
+                                    </div>
+                                    {alpacaHistories.paper && (
+                                        <div className="rounded-xl p-5 border border-sky-500/20" style={{ background: "rgba(30,41,59,0.7)" }}>
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <span className="w-2 h-2 rounded-full shrink-0 bg-sky-400" />
+                                                <p className="text-sm font-semibold text-white">Alpaca Paper Equity</p>
+                                                <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium ml-1 ${modeBadgeClass("paper")}`}>PAPER</span>
+                                                <p className="text-[10px] text-slate-500 ml-auto">30-day broker account equity</p>
+                                            </div>
+                                            <AlpacaEquityCurve history={alpacaHistories.paper} />
+                                        </div>
+                                    )}
                                 </div>
-                            ))}
+                            </>
+                        ) : (
+                            <>
+                                {/* Paper curve first */}
+                                <div className={`rounded-xl p-5 ${preferredTrack === "strategy_paper" ? "border border-sky-500/30" : "border border-white/8"}`} style={{ background: "rgba(30,41,59,0.7)" }}>
+                                    <div className="flex items-center gap-2 mb-4">
+                                        <BarChart2 size={14} className="text-slate-400" />
+                                        <p className="text-sm font-semibold text-white">Strategy Paper Equity</p>
+                                        <p className="text-[10px] text-slate-500 ml-auto">Cumulative realized P&L over closed trades</p>
+                                    </div>
+                                    <EquityCurve data={data.equity_curve} />
+                                </div>
+
+                                {brokerModes
+                                    .filter((mode) => !!alpacaHistories[mode])
+                                    .map((mode) => (
+                                        <div key={mode} className={`rounded-xl p-5 ${
+                                            mode === "live"
+                                                ? "border border-rose-600/30"
+                                                : preferredTrack === "alpaca_paper" ? "border border-cyan-500/40" : "border border-sky-500/20"
+                                        }`} style={{ background: "rgba(30,41,59,0.7)" }}>
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <span className={`w-2 h-2 rounded-full shrink-0 ${mode === "live" ? "bg-rose-400" : "bg-sky-400"}`} />
+                                                <p className="text-sm font-semibold text-white">Alpaca {modeLabel(mode)} Equity</p>
+                                                <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider font-medium ml-1 ${modeBadgeClass(mode)}`}>
+                                                    {mode.toUpperCase()}
+                                                </span>
+                                                <p className="text-[10px] text-slate-500 ml-auto">30-day broker account equity</p>
+                                            </div>
+                                            <AlpacaEquityCurve history={alpacaHistories[mode]!} />
+                                        </div>
+                                    ))}
+                            </>
+                        )}
 
                         {/* Open positions */}
                         {data.open_positions.length > 0 && (

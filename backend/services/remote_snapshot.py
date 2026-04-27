@@ -23,6 +23,88 @@ from services.secret_store import get_telegram_credentials
 from services.runtime_health import record_data_pull
 
 
+def _build_live_trading_summary(db) -> Dict[str, Any]:
+    """Compute a P&L summary dict from real Alpaca data (account + AlpacaOrder records)."""
+    from database.models import AlpacaOrder
+    from services.alpaca_broker import get_broker_from_keychain
+
+    result: Dict[str, Any] = {
+        "equity": None,
+        "last_equity": None,
+        "day_pnl": None,
+        "realized_pnl": 0.0,
+        "win_count": 0,
+        "loss_count": 0,
+        "win_rate": 0.0,
+        "total_trades": 0,
+        "open_positions": 0,
+    }
+
+    # Live account stats
+    try:
+        broker = get_broker_from_keychain(mode="live")
+        if broker:
+            account = broker.get_account()
+            equity = float(account.get("equity") or 0)
+            last_equity = float(account.get("last_equity") or 0)
+            result["equity"] = equity
+            result["last_equity"] = last_equity
+            result["day_pnl"] = equity - last_equity
+    except Exception as exc:
+        print(f"[snapshot] live account fetch failed: {exc}")
+
+    # Realized P&L + win rate from AlpacaOrder round-trips
+    try:
+        from datetime import timezone as _tz
+        _epoch = datetime(1970, 1, 1, tzinfo=_tz.utc)
+        orders = (
+            db.query(AlpacaOrder)
+            .filter(
+                AlpacaOrder.trading_mode == "live",
+                AlpacaOrder.status == "filled",
+                AlpacaOrder.filled_avg_price.isnot(None),
+                AlpacaOrder.filled_qty.isnot(None),
+                AlpacaOrder.paper_trade_id.isnot(None),
+            )
+            .all()
+        )
+        by_trade: Dict[int, list] = {}
+        for o in orders:
+            by_trade.setdefault(o.paper_trade_id, []).append(o)
+
+        realized_pnl = 0.0
+        wins = losses = open_count = 0
+        for trade_orders in by_trade.values():
+            buys = [o for o in trade_orders if o.side == "buy"]
+            sells = [o for o in trade_orders if o.side == "sell"]
+            if not (buys and sells):
+                open_count += 1
+                continue
+            buy = max(buys, key=lambda o: o.filled_at or _epoch)
+            sell = max(sells, key=lambda o: o.filled_at or _epoch)
+            qty = min(float(buy.filled_qty), float(sell.filled_qty))
+            if qty <= 0:
+                continue
+            pnl = (float(sell.filled_avg_price) - float(buy.filled_avg_price)) * qty
+            realized_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+
+        total = wins + losses
+        result["realized_pnl"] = realized_pnl
+        result["win_count"] = wins
+        result["loss_count"] = losses
+        result["win_rate"] = (wins / total * 100) if total > 0 else 0.0
+        result["total_trades"] = total
+        result["open_positions"] = open_count
+    except Exception as exc:
+        print(f"[snapshot] live order P&L computation failed: {exc}")
+
+    return result
+
+
 def _ensure_utc(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
@@ -199,6 +281,9 @@ def build_remote_snapshot_payload(db, request_id: Optional[str] = None) -> Dict[
     # Image rendering: only include closed trades if the user opted in
     closed_trades_for_render = closed_trades_since_last_send if bool(getattr(config, "remote_snapshot_include_closed_trades", False)) else []
 
+    is_live = getattr(config, "alpaca_execution_mode", None) == "live"
+    live_summary = _build_live_trading_summary(db) if is_live else None
+
     return {
         "request_id": current.request_id,
         "timestamp": _ensure_utc(current.timestamp),
@@ -217,6 +302,7 @@ def build_remote_snapshot_payload(db, request_id: Optional[str] = None) -> Dict[
         "recommendation_changes": _recommendation_changes(recommendations, previous_recommendations),
         "recommendation_fingerprint": _recommendation_fingerprint(recommendations),
         "pnl_summary": paper_summary,
+        "live_summary": live_summary,
         "positions": open_positions,
         "closed_trades": closed_trades_for_render,
         "closed_trades_since_last_send": closed_trades_since_last_send,
@@ -225,11 +311,23 @@ def build_remote_snapshot_payload(db, request_id: Optional[str] = None) -> Dict[
 
 
 def build_remote_snapshot_caption(payload: Dict[str, Any]) -> str:
-    summary = payload.get("pnl_summary") or {}
+    live = payload.get("live_summary")
     change_lines = list(payload.get("recommendation_changes") or [])[:3]
+    if live:
+        day_pnl = live.get("day_pnl")
+        equity = live.get("equity")
+        realized = live.get("realized_pnl", 0.0)
+        win_rate = live.get("win_rate", 0.0)
+        pnl_line = (
+            f"[LIVE] Equity {_format_money(equity)} | Day P&L {_format_money(day_pnl)} | "
+            f"Realized {_format_money(realized)} | Win Rate {win_rate:.1f}%"
+        )
+    else:
+        summary = payload.get("pnl_summary") or {}
+        pnl_line = f"Net P&L {_format_money(summary.get('total_pnl'))} | Open {_format_money(summary.get('open_pnl'))} | Realized {_format_money(summary.get('realized_pnl'))}"
     base_lines = [
         f"{payload.get('timestamp_label', '')} | {payload.get('request_id', '')}",
-        f"Net P&L {_format_money(summary.get('total_pnl'))} | Open {_format_money(summary.get('open_pnl'))} | Realized {_format_money(summary.get('realized_pnl'))}",
+        pnl_line,
     ]
     if change_lines:
         base_lines.extend(change_lines)
@@ -241,6 +339,7 @@ def build_remote_snapshot_caption(payload: Dict[str, Any]) -> str:
 
 
 def _build_snapshot_html(payload: Dict[str, Any]) -> str:
+    live = payload.get("live_summary")
     summary = payload.get("pnl_summary") or {}
     recommendations = payload.get("recommendations") or []
     positions = payload.get("positions") or []
@@ -293,6 +392,30 @@ def _build_snapshot_html(payload: Dict[str, Any]) -> str:
     if extraction and reasoning and extraction != reasoning:
         model_label = f"{extraction} -> {reasoning}"
 
+    # Build metric cards — use live account data when available, else paper summary
+    if live:
+        def _acc(key: str, fallback: float = 0.0) -> float:
+            v = live.get(key)
+            return float(v) if v is not None else fallback
+
+        metric_cards_html = "".join([
+            metric_card("Equity", _format_money(_acc("equity")) if live.get("equity") is not None else "—", "neutral"),
+            metric_card("Day P&L", _format_money(_acc("day_pnl")), "positive" if _acc("day_pnl") > 0 else ("negative" if _acc("day_pnl") < 0 else "neutral")),
+            metric_card("Realized P&L", _format_money(_acc("realized_pnl")), "positive" if _acc("realized_pnl") > 0 else ("negative" if _acc("realized_pnl") < 0 else "neutral")),
+            metric_card("Win Rate", f"{_acc('win_rate'):.1f}%", "neutral"),
+        ])
+        trades_footer = f"Live trades {int(_acc('total_trades'))} | Open ~{int(_acc('open_positions'))} | Closed {int(_acc('win_count')) + int(_acc('loss_count'))}"
+        live_badge_html = "<span style='display:inline-block;margin-left:10px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;background:#be123c;color:#fff;'>LIVE</span>"
+    else:
+        metric_cards_html = "".join([
+            metric_card("Net P&L", _format_money(summary.get("total_pnl")), "positive" if float(summary.get("total_pnl") or 0) > 0 else ("negative" if float(summary.get("total_pnl") or 0) < 0 else "neutral")),
+            metric_card("Open P&L", _format_money(summary.get("open_pnl")), "positive" if float(summary.get("open_pnl") or 0) > 0 else ("negative" if float(summary.get("open_pnl") or 0) < 0 else "neutral")),
+            metric_card("Realized P&L", _format_money(summary.get("realized_pnl")), "positive" if float(summary.get("realized_pnl") or 0) > 0 else ("negative" if float(summary.get("realized_pnl") or 0) < 0 else "neutral")),
+            metric_card("Win Rate", f"{float(summary.get('win_rate') or 0):.1f}%", "neutral"),
+        ])
+        trades_footer = f"Total trades {int(summary.get('total_trades') or 0)} | Open {int(summary.get('open_positions') or 0)} | Closed {int(summary.get('closed_trades') or 0)}"
+        live_badge_html = ""
+
     return f"""
 <!DOCTYPE html>
 <html>
@@ -303,13 +426,17 @@ def _build_snapshot_html(payload: Dict[str, Any]) -> str:
     body {{
       margin: 0;
       font-family: "Segoe UI", Arial, sans-serif;
-      background: linear-gradient(135deg, #07111f 0%, #102238 60%, #173253 100%);
+      background: {
+          "linear-gradient(135deg, #1a0010 0%, #3b0020 60%, #5c0030 100%)"
+          if live else
+          "linear-gradient(135deg, #07111f 0%, #102238 60%, #173253 100%)"
+      };
       color: #f8fafc;
     }}
     .wrap {{ width: 920px; padding: 28px; }}
     .panel {{
       background: rgba(10, 18, 34, 0.88);
-      border: 1px solid rgba(148, 163, 184, 0.18);
+      border: 1px solid {'"rgba(190,18,60,0.35)"' if live else '"rgba(148,163,184,0.18)"'};
       border-radius: 22px;
       padding: 24px;
       box-shadow: 0 18px 60px rgba(0, 0, 0, 0.3);
@@ -368,7 +495,7 @@ def _build_snapshot_html(payload: Dict[str, Any]) -> str:
       <div class="header">
         <div>
           <div class="eyebrow">Remote Snapshot</div>
-          <h1>Recommendations + P&amp;L</h1>
+          <h1>Recommendations + P&amp;L {live_badge_html}</h1>
           <div class="sub">{escape(str(payload.get("timestamp_label") or ""))} | Model {escape(model_label)}</div>
         </div>
         <div class="req">
@@ -378,10 +505,7 @@ def _build_snapshot_html(payload: Dict[str, Any]) -> str:
         </div>
       </div>
       <div class="metrics">
-        {metric_card("Net P&L", _format_money(summary.get("total_pnl")), "positive" if float(summary.get("total_pnl") or 0) > 0 else ("negative" if float(summary.get("total_pnl") or 0) < 0 else "neutral"))}
-        {metric_card("Open P&L", _format_money(summary.get("open_pnl")), "positive" if float(summary.get("open_pnl") or 0) > 0 else ("negative" if float(summary.get("open_pnl") or 0) < 0 else "neutral"))}
-        {metric_card("Realized P&L", _format_money(summary.get("realized_pnl")), "positive" if float(summary.get("realized_pnl") or 0) > 0 else ("negative" if float(summary.get("realized_pnl") or 0) < 0 else "neutral"))}
-        {metric_card("Win Rate", f"{float(summary.get('win_rate') or 0):.1f}%", "neutral")}
+        {metric_cards_html}
       </div>
       <div class="grid">
         <div class="section">
@@ -415,7 +539,7 @@ def _build_snapshot_html(payload: Dict[str, Any]) -> str:
         </div>
       </div>
       <div class="footer">
-        <div>Total trades {int(summary.get("total_trades") or 0)} | Open {int(summary.get("open_positions") or 0)} | Closed {int(summary.get("closed_trades") or 0)}</div>
+        <div>{trades_footer}</div>
         <div>Private outbound delivery only</div>
       </div>
     </div>
