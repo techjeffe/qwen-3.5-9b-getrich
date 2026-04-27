@@ -255,7 +255,7 @@ def _is_extended_hours_now(config=None) -> bool:
 def _get_alpaca_live_open_exposure() -> Optional[float]:
     """Return total open position market value from the live Alpaca account.
 
-    Returns None if the broker is unreachable so the caller can fall back.
+    Returns None if the broker is unreachable; caller must decide how to handle.
     """
     try:
         broker = get_broker_from_keychain(mode="live")
@@ -268,32 +268,41 @@ def _get_alpaca_live_open_exposure() -> Optional[float]:
         return None
 
 
-def _check_circuit_breakers(db, config) -> None:
+def _check_circuit_breakers(db, config, pending_notional: float = 0.0) -> None:
     """
     Raise CircuitBreakerError and auto-disable live trading if a limit is breached.
     Checks: max total open exposure, daily loss limit, consecutive loss streak.
+
+    pending_notional: the notional of the order about to be placed, included in
+    the exposure total so that a single order cannot overshoot the configured max.
     """
     from database.models import PaperTrade
 
     max_exposure = getattr(config, "alpaca_max_total_exposure_usd", None)
     if max_exposure and max_exposure > 0:
         if getattr(config, "alpaca_execution_mode", None) == "live":
-            open_exposure = _get_alpaca_live_open_exposure()
-            if open_exposure is None:
-                # Live fetch failed; fall back to paper ledger to stay safe
-                print("[alpaca] exposure check: live position fetch failed, falling back to paper ledger")
-                open_exposure = sum(
+            live_exposure = _get_alpaca_live_open_exposure()
+            if live_exposure is None:
+                # Cannot verify live exposure — skip this check rather than
+                # substituting the paper ledger, which tracks simulated trades
+                # and has no relationship to real Alpaca positions.
+                print("[alpaca] exposure check: live position fetch failed, skipping max-exposure guard")
+            else:
+                open_exposure = live_exposure + pending_notional
+                if open_exposure >= max_exposure:
+                    _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
+                    raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
+        else:
+            open_exposure = (
+                sum(
                     float(t.amount or 0)
                     for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
                 )
-        else:
-            open_exposure = sum(
-                float(t.amount or 0)
-                for t in db.query(PaperTrade).filter(PaperTrade.exited_at.is_(None)).all()
+                + pending_notional
             )
-        if open_exposure >= max_exposure:
-            _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
-            raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
+            if open_exposure >= max_exposure:
+                _disable_live_trading(db, config, f"max total exposure ${max_exposure:.0f} reached (current ${open_exposure:.0f})")
+                raise CircuitBreakerError(f"Max total exposure ${max_exposure:.0f} reached")
 
     daily_limit = getattr(config, "alpaca_daily_loss_limit_usd", None)
     if daily_limit and daily_limit > 0:
@@ -463,7 +472,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             side = "buy"    # long, or buying the inverse ETF for a short signal
 
         try:
-            _check_circuit_breakers(db, config)
+            _check_circuit_breakers(db, config, pending_notional=notional)
         except CircuitBreakerError as exc:
             _record_alpaca_order_error(db, paper_id, side, symbol, notional, f"circuit breaker: {exc}", broker.mode)
             return
