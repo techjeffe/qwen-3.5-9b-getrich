@@ -228,9 +228,10 @@ def migrate():
                 conn.commit()
                 print("scraped_articles table created.")
 
-            # ── app_config: Alpaca live trading columns ────────────────────
+            # ── app_config: Alpaca brokerage execution columns ─────────────
             existing_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(app_config)")).fetchall()]
             for column_name, column_type, default_value in [
+                ("alpaca_execution_mode",         "VARCHAR(10)", "'off'"),
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "0"),
                 ("alpaca_allow_short_selling",    "BOOLEAN", "0"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
@@ -468,8 +469,9 @@ def migrate():
                     conn.execute(text(f"ALTER TABLE paper_trades ADD COLUMN {column_name} {column_type}"))
                     conn.commit()
 
-            # ── app_config: Alpaca live trading columns ────────────────────
+            # ── app_config: Alpaca brokerage execution columns ─────────────
             for column_name, column_type, default_value in [
+                ("alpaca_execution_mode",         "VARCHAR(10)", "'off'"),
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "FALSE"),
                 ("alpaca_allow_short_selling",    "BOOLEAN", "FALSE"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),

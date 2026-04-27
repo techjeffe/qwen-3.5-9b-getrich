@@ -298,6 +298,7 @@ def _check_circuit_breakers(db, config) -> None:
 
 def _disable_live_trading(db, config, reason: str) -> None:
     try:
+        config.alpaca_execution_mode = "off"
         config.alpaca_live_trading_enabled = False
         db.add(config)
         db.commit()
@@ -403,10 +404,11 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     event: "open" | "close"
     Never raises — all failures are logged to alpaca_orders and printed.
     """
-    if not getattr(config, "alpaca_live_trading_enabled", False):
+    execution_mode = str(getattr(config, "alpaca_execution_mode", "off") or "off").strip().lower()
+    if execution_mode not in {"paper", "live"}:
         return
 
-    broker = get_broker_from_keychain(mode="live")
+    broker = get_broker_from_keychain(mode=execution_mode)
     if broker is None:
         return
 

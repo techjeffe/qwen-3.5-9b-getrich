@@ -29,6 +29,7 @@ class AlpacaSecretsPayload(BaseModel):
 
 
 class AlpacaSettingsPayload(BaseModel):
+    alpaca_execution_mode:         Optional[str]   = None
     alpaca_live_trading_enabled:   Optional[bool]  = None
     alpaca_allow_short_selling:    Optional[bool]  = None
     alpaca_max_position_usd:       Optional[float] = None
@@ -68,6 +69,7 @@ async def get_alpaca_status(
 
     return {
         "secrets":                   secret_status,
+        "execution_mode":            str(getattr(config, "alpaca_execution_mode", "off") or "off"),
         "live_trading_enabled":      bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "allow_short_selling":       bool(getattr(config, "alpaca_allow_short_selling",    False)),
         "max_position_usd":          getattr(config, "alpaca_max_position_usd",            None),
@@ -227,6 +229,7 @@ async def update_alpaca_settings(
     config = update_app_config(db, data)
     return {
         "ok":                        True,
+        "execution_mode":            str(getattr(config, "alpaca_execution_mode", "off") or "off"),
         "live_trading_enabled":      bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "allow_short_selling":       bool(getattr(config, "alpaca_allow_short_selling",    False)),
         "max_position_usd":          getattr(config, "alpaca_max_position_usd",            None),

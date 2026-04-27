@@ -107,6 +107,7 @@ type AlpacaOrder = {
 };
 
 type BrokerMode = "paper" | "live";
+type TradingTrack = "strategy_paper" | "alpaca_paper" | "alpaca_live";
 
 type AlpacaAccount = {
     trading_mode?: BrokerMode;
@@ -120,12 +121,15 @@ type AlpacaAccount = {
 };
 
 type AlpacaStatus = {
+    execution_mode?: "off" | "paper" | "live";
     live_trading_enabled: boolean;
     secrets?: {
         paper?: { configured?: boolean };
         live?: { configured?: boolean };
     };
 };
+
+const PREFERRED_TRADING_TRACK_KEY = "preferredTradingTrack";
 
 type TradingData = {
     market: MarketStatus;
@@ -264,6 +268,12 @@ function modeBadgeClass(mode: BrokerMode) {
         : "bg-sky-500/10 text-sky-300 border-sky-500/20";
 }
 
+function trackLabel(track: TradingTrack) {
+    if (track === "strategy_paper") return "Strategy Paper";
+    if (track === "alpaca_paper") return "Alpaca Paper";
+    return "Alpaca Live";
+}
+
 // â”€â”€â”€ Stat Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function StatCard({ label, value, sub, color = "" }: { label: string; value: string; sub?: string; color?: string }) {
@@ -391,6 +401,7 @@ export default function TradingPage() {
     const [alpacaOrders, setAlpacaOrders] = useState<AlpacaOrder[]>([]);
     const [alpacaAccounts, setAlpacaAccounts] = useState<Partial<Record<BrokerMode, AlpacaAccount>>>({});
     const [alpacaHistories, setAlpacaHistories] = useState<Partial<Record<BrokerMode, AlpacaPortfolioHistory>>>({});
+    const [preferredTrack, setPreferredTrack] = useState<TradingTrack>("strategy_paper");
 
     const load = useCallback(async () => {
         try {
@@ -444,6 +455,21 @@ export default function TradingPage() {
 
     useEffect(() => { load(); loadAlpaca(); }, [load, loadAlpaca]);
 
+    useEffect(() => {
+        try {
+            const stored = window.localStorage.getItem(PREFERRED_TRADING_TRACK_KEY);
+            if (stored === "strategy_paper" || stored === "alpaca_paper" || stored === "alpaca_live") {
+                setPreferredTrack(stored);
+            }
+        } catch { /* ignore */ }
+    }, []);
+
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(PREFERRED_TRADING_TRACK_KEY, preferredTrack);
+        } catch { /* ignore */ }
+    }, [preferredTrack]);
+
     const handleReset = async () => {
         if (!confirm("Reset all paper trading history? This cannot be undone.")) return;
         setResetting(true);
@@ -465,6 +491,17 @@ export default function TradingPage() {
         acc[mode] = alpacaOrders.filter((order) => order.trading_mode === mode).length;
         return acc;
     }, {} as Record<BrokerMode, number>);
+    const availableTracks: TradingTrack[] = [
+        "strategy_paper",
+        ...(configuredBrokerModes.includes("paper") ? ["alpaca_paper" as const] : []),
+        ...(configuredBrokerModes.includes("live") ? ["alpaca_live" as const] : []),
+    ];
+
+    useEffect(() => {
+        if (!availableTracks.includes(preferredTrack)) {
+            setPreferredTrack("strategy_paper");
+        }
+    }, [availableTracks, preferredTrack]);
 
     return (
         <div className="min-h-screen" style={{ backgroundColor: "#0f172a", color: "#f8fafc" }}>
@@ -477,7 +514,7 @@ export default function TradingPage() {
                                 Trading
                             </h1>
                             <p className="text-slate-500 text-xs mt-0.5">
-                                Simulated strategy performance plus broker-side paper and live account tracking
+                                Keep Strategy Paper visible at all times, then layer Alpaca Paper and Alpaca Live on top as confidence grows
                             </p>
                         </div>
                         <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-500/20 bg-sky-500/10 px-3 py-1 text-xs font-medium text-sky-300">
@@ -540,8 +577,37 @@ export default function TradingPage() {
 
                 {data && (
                     <>
+                        <div className="rounded-xl border border-white/8 p-4 space-y-3" style={{ background: "rgba(30,41,59,0.7)" }}>
+                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                                <div>
+                                    <p className="text-sm font-semibold text-white">Preferred Track</p>
+                                    <p className="text-[11px] text-slate-500 mt-0.5">This only changes what the page emphasizes first. All tracks stay visible and keep their own history.</p>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    {availableTracks.map((track) => (
+                                        <button
+                                            key={track}
+                                            type="button"
+                                            onClick={() => setPreferredTrack(track)}
+                                            className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                                                preferredTrack === track
+                                                    ? track === "strategy_paper"
+                                                        ? "border-sky-400/50 bg-sky-500/15 text-sky-200"
+                                                        : track === "alpaca_paper"
+                                                        ? "border-cyan-400/50 bg-cyan-500/15 text-cyan-200"
+                                                        : "border-rose-400/50 bg-rose-500/15 text-rose-200"
+                                                    : "border-slate-700 text-slate-400 hover:text-white"
+                                            }`}
+                                        >
+                                            {trackLabel(track)}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+
                         {/* Summary stats */}
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
                             <StatCard
                                 label="Net P&L"
                                 value={fmtDollar(s!.total_pnl)}
@@ -568,7 +634,7 @@ export default function TradingPage() {
                             />
                         </div>
 
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl ${preferredTrack === "strategy_paper" ? "border border-sky-500/20 p-3" : ""}`}>
                             <StatCard label="Avg Win" value={fmtDollar(s!.avg_win)} color="text-emerald-400" />
                             <StatCard label="Avg Loss" value={fmtDollar(s!.avg_loss)} color="text-red-400" />
                             <StatCard label="Total Deployed" value={`$${s!.total_deployed.toFixed(0)}`} />
@@ -578,7 +644,7 @@ export default function TradingPage() {
                         {/* Broker accounts */}
                         {(configuredBrokerModes.length > 0 || alpacaOrders.length > 0) && (
                             <div className="rounded-xl border border-white/8 p-5 space-y-4" style={{ background: "rgba(30,41,59,0.7)" }}>
-                                <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2">
                                     <Activity size={14} className="text-slate-400" />
                                     <p className="text-sm font-semibold text-white">Broker Accounts</p>
                                     <p className="text-[10px] text-slate-500 ml-auto">Tracked separately from the internal strategy paper ledger</p>
@@ -588,7 +654,13 @@ export default function TradingPage() {
                                         const account = alpacaAccounts[mode];
                                         const configured = !!alpacaStatus?.secrets?.[mode]?.configured;
                                         return (
-                                            <div key={mode} className="rounded-xl border border-white/8 p-4 space-y-3">
+                                            <div key={mode} className={`rounded-xl border p-4 space-y-3 ${
+                                                preferredTrack === (mode === "paper" ? "alpaca_paper" : "alpaca_live")
+                                                    ? mode === "paper"
+                                                        ? "border-cyan-500/30 bg-cyan-950/10"
+                                                        : "border-rose-500/30 bg-rose-950/10"
+                                                    : "border-white/8"
+                                            }`}>
                                                 <div className="flex items-center gap-2">
                                                     <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider ${modeBadgeClass(mode)}`}>
                                                         Alpaca {modeLabel(mode)}
@@ -625,10 +697,10 @@ export default function TradingPage() {
                         )}
 
                         {/* Paper equity curve */}
-                        <div className="rounded-xl border border-white/8 p-5" style={{ background: "rgba(30,41,59,0.7)" }}>
+                        <div className={`rounded-xl p-5 ${preferredTrack === "strategy_paper" ? "border border-sky-500/30" : "border border-white/8"}`} style={{ background: "rgba(30,41,59,0.7)" }}>
                             <div className="flex items-center gap-2 mb-4">
                                 <BarChart2 size={14} className="text-slate-400" />
-                                <p className="text-sm font-semibold text-white">Equity Curve</p>
+                                <p className="text-sm font-semibold text-white">Strategy Paper Equity</p>
                                 <p className="text-[10px] text-slate-500 ml-auto">Cumulative realized P&L over closed trades</p>
                             </div>
                             <EquityCurve data={data.equity_curve} />
@@ -637,7 +709,11 @@ export default function TradingPage() {
                         {brokerModes
                             .filter((mode) => !!alpacaHistories[mode])
                             .map((mode) => (
-                                <div key={mode} className={`rounded-xl p-5 ${mode === "live" ? "border border-rose-600/30" : "border border-sky-500/20"}`} style={{ background: "rgba(30,41,59,0.7)" }}>
+                                <div key={mode} className={`rounded-xl p-5 ${
+                                    mode === "live"
+                                        ? preferredTrack === "alpaca_live" ? "border border-rose-500/40" : "border border-rose-600/30"
+                                        : preferredTrack === "alpaca_paper" ? "border border-cyan-500/40" : "border border-sky-500/20"
+                                }`} style={{ background: "rgba(30,41,59,0.7)" }}>
                                     <div className="flex items-center gap-2 mb-4">
                                         <span className={`w-2 h-2 rounded-full shrink-0 ${mode === "live" ? "bg-rose-400" : "bg-sky-400"}`} />
                                         <p className="text-sm font-semibold text-white">Alpaca {modeLabel(mode)} Equity</p>
@@ -655,7 +731,7 @@ export default function TradingPage() {
                             <div className="rounded-xl border border-white/8 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
                                 <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
                                     <Activity size={14} className="text-emerald-400" />
-                                    <p className="text-sm font-semibold text-white">Open Positions</p>
+                                    <p className="text-sm font-semibold text-white">Strategy Paper Open Positions</p>
                                     <span className="ml-auto text-[10px] text-slate-500">{data.open_positions.length} position{data.open_positions.length !== 1 ? "s" : ""}</span>
                                 </div>
                                 <div className="overflow-x-auto">
@@ -713,7 +789,7 @@ export default function TradingPage() {
                             <div className="rounded-xl border border-white/8 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
                                 <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
                                     <DollarSign size={14} className="text-slate-400" />
-                                    <p className="text-sm font-semibold text-white">Closed Trades</p>
+                                    <p className="text-sm font-semibold text-white">Strategy Paper Closed Trades</p>
                                     <span className="ml-auto text-[10px] text-slate-500">{data.closed_trades.length} trades</span>
                                 </div>
                                 <div className="overflow-x-auto">
