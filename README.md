@@ -1,8 +1,10 @@
 # Sentiment Trading Alpha
 
-Geopolitical sentiment pipeline that now uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
+Geopolitical sentiment pipeline that uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
 
-This app is untested in the real world, not financial advice, and for amusement purposes only. 
+Live brokerage execution via Alpaca is now supported alongside the paper simulation. When Alpaca keys are configured and live trading is enabled from Admin, every paper trade open/close is mirrored to Alpaca in real time with configurable guardrails (position caps, daily loss limits, consecutive-loss circuit breaker, extended-hours handling). All order attempts are written to an audit log regardless of outcome.
+
+This app is untested in the real world, not financial advice, and for amusement purposes only.
 
 Frontend baseline:
 
@@ -76,12 +78,13 @@ python run.py
 ```
 
 If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
-`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
+`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`, and all `/api/v1/alpaca/*` routes.
 
-Secure remote snapshot secrets:
+Secure secrets (Telegram + Alpaca):
 
-- `keyring` is included in `requirements.txt` and is used to store Telegram secrets in the OS keychain
+- `keyring` is included in `requirements.txt` and is used to store Telegram and Alpaca API keys in the OS keychain
 - On Windows, secrets saved from the Admin UI go to Credential Manager
+- On macOS, secrets go to Keychain Access
 - If you prefer to install it directly: `pip install keyring`
 
 #### 3. Start the frontend
@@ -160,11 +163,11 @@ python3.12 run.py
 ```
 
 If `ADMIN_API_TOKEN` is set, these routes require an `X-Admin-Token` header:
-`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`
+`GET /api/v1/config`, `PUT /api/v1/config`, `POST /api/v1/trades/{trade_id}/execute`, and all `/api/v1/alpaca/*` routes.
 
-Secure remote snapshot secrets:
+Secure secrets (Telegram + Alpaca):
 
-- `keyring` is included in `requirements.txt` and is used to store Telegram secrets in the OS keychain
+- `keyring` is included in `requirements.txt` and is used to store Telegram and Alpaca API keys in the OS keychain
 - On macOS, secrets saved from the Admin UI go to Keychain Access
 - If you prefer to install it directly: `python3.12 -m pip install keyring`
 
@@ -217,6 +220,14 @@ Remote snapshot delivery can also be configured from Admin:
 - enable/disable remote snapshot delivery and tune resend thresholds
 - save Telegram `bot token` and `chat id` securely from the UI without storing them in the repo
 - secrets are stored in the OS keychain through `keyring` and only masked status is shown back in the UI
+
+Alpaca live trading can be configured from Admin (Live Trading section):
+
+- enter Alpaca API key + secret key and choose paper or live mode; stored in the OS keychain
+- test the connection before enabling real orders
+- configure guardrails: max position size, max total exposure, daily loss limit, consecutive-loss circuit breaker, order type (market/limit), limit slippage %, allow short selling
+- enable live trading with a "type LIVE to confirm" modal; one-click disable at any time
+- the circuit breaker auto-disables live trading if a limit is breached between runs
 
 ## Testing Your Extraction Model (Stage 1)
 
@@ -306,6 +317,15 @@ The migration script will detect any missing columns and add them with safe defa
 | `best_price_seen` | `paper_trades` | `NULL` | High/low-water mark used to update trailing stop each run |
 | `trail_on_window_expiry` | `app_config` | `true` | Transition to trailing stop instead of flat close when holding window expires |
 | `reentry_cooldown_minutes` | `app_config` | `NULL` | Block same-direction re-entry within N minutes of a close (falls back to `logic_config.json` default of 120) |
+| `alpaca_live_trading_enabled` | `app_config` | `false` | Master kill switch for Alpaca real-money order routing |
+| `alpaca_allow_short_selling` | `app_config` | `false` | Allow direct short sells for symbols with no inverse ETF mapping |
+| `alpaca_max_position_usd` | `app_config` | `NULL` | Per-trade notional cap in USD (unlimited when NULL) |
+| `alpaca_max_total_exposure_usd` | `app_config` | `NULL` | Sum-of-open-positions circuit breaker in USD |
+| `alpaca_order_type` | `app_config` | `'market'` | `market` or `limit` |
+| `alpaca_limit_slippage_pct` | `app_config` | `0.002` | Slippage added to limit price (0.002 = 0.2%) |
+| `alpaca_daily_loss_limit_usd` | `app_config` | `NULL` | Daily realized loss circuit breaker |
+| `alpaca_max_consecutive_losses` | `app_config` | `3` | Consecutive losing trades before live trading is auto-disabled |
+| `alpaca_orders` | table | — | Full audit log of every Alpaca order attempt (success and error) |
 
 To run the migration manually (e.g. to confirm it applied):
 
@@ -329,7 +349,7 @@ Backend:
 - Frozen analysis snapshot persistence for model-to-model replay in Advanced Mode
 - Persistent admin configuration stored in the local database so saved symbols, feeds, prompt overrides, and timezone survive rebuilds/restarts
 - Paper trading hook wired into every analysis save — simulates $100 per signal, manages position lifecycle, stores results in a dedicated `paper_trades` table independent of all other analysis tables
-
+- Alpaca brokerage integration — every paper trade open/close is optionally mirrored to Alpaca in real time; extended-hours orders use qty+limit automatically; a circuit breaker auto-disables live trading when exposure/loss limits are hit; all order outcomes written to `alpaca_orders` for audit
 - Analysis lease/lock coordination in `app_config` so scheduled runs and urgent off-cycle runs do not process the same queued articles in parallel
 
 Model flow:
@@ -373,6 +393,9 @@ Model flow:
 - **Trailing stop on HOLD** — a HOLD signal on an open position sets a tightened trailing stop instead of force-closing; stop tracks `best_price_seen` and closes only if price crosses; thesis re-confirmation clears the trailing stop
 - **Trail on window expiry** — when a conviction holding window expires, the position transitions to trailing stop mode instead of closing flat; configurable per-run via Admin (`trail_on_window_expiry`)
 - **Re-entry cooldown** — same-direction re-entry in the same symbol is blocked for a configurable window (default 120 minutes) after a close, preventing same-direction churn on choppy signals; configurable in Admin (`reentry_cooldown_minutes`)
+- **Alpaca live trading** — paper trade lifecycle events (open, close, window-expired close) are optionally forwarded to Alpaca as real orders; paper and live execution run in parallel so the paper record is always preserved; close orders are guarded against sending if no successful open is on record (prevents stray orders when an open was skipped or rejected)
+- **Alpaca order log** — the `/trading` page shows a live order log beneath the paper tables, with side badges, fill price, mode (PAPER/LIVE), and status; the header badge and title change to reflect when live trading is active
+- **Alpaca guardrails** — configurable per-position cap, total exposure cap, daily loss limit, consecutive-loss circuit breaker, order type (market/limit), and limit slippage %; any breach auto-disables live trading and records the reason
 - **Conviction window reset** — when a re-run confirms the same direction, the holding window resets to a full window; same/upgraded trade type resets fully; downgraded type shrinks proportionally; capped by `max_holding_minutes` per type
 - **Corrected SHORT bias** — three compounding factors that systematically over-produced SHORT signals have been addressed: `unconfirmed_bluster_penalty` lowered, `unconfirmed_policy_multiplier` raised, and SHORT score changed to a weighted blend (40% bluster / 60% policy) so pure rhetoric no longer produces full-magnitude SHORT signals
 - **Dynamic materiality gate** — thesis-flip guard uses a rolling per-symbol article baseline (last 20 runs, mean ± 1 stddev) instead of a fixed count; falls back to fixed threshold until 5 runs of history exist
@@ -414,6 +437,7 @@ The Admin page is organized around the things users change most often first.
 7. **Scheduling & System** — auto-run cadence, snapshot retention, display timezone
 8. **Remote Snapshot Delivery** — enable outbound PNG delivery after qualifying runs; configure Telegram bot token and chat ID securely (stored in the OS keychain, never in the repo); tune resend interval, P&L threshold, and heartbeat; **Send Snapshot Now** button bypasses all gates and immediately queues the most recent run for delivery
 9. **Price History** — pull and status panel: per-symbol row count, date range, ready/needs-pull indicator, and a pull trigger button; the `price_history` table is independent of the analysis database and is never cleared by reset-data
+10. **Live Trading — Alpaca** — API key entry (stored in OS keychain), paper/live mode selector, Test Connection button with account equity display, guardrail fields, and an Enable/Disable Live toggle with a "type LIVE to confirm" modal
 
 Advanced additions:
 
@@ -502,12 +526,13 @@ qwen-3.5-9b-getrich/
 |  |- test_stage1.py          # Stage 1 smoke test (built-in + custom symbols)
 |  |- routers/
 |  |  |- analysis.py
-|  |  `- config.py            # includes /admin/price-history/status and /pull
+|  |  |- config.py            # includes /admin/price-history/status and /pull
+|  |  `- alpaca.py            # Alpaca status, secrets, test-connection, orders, settings
 |  |- schemas/
 |  |  `- analysis.py
 |  |- database/
 |  |  |- engine.py
-|  |  |- models.py            # includes PriceHistory table
+|  |  |- models.py            # includes PriceHistory, AlpacaOrder tables
 |  |  `- migrate.py
 |  `- services/
 |     |- data_ingestion/
@@ -518,19 +543,29 @@ qwen-3.5-9b-getrich/
 |     |- sentiment/
 |     |  |- engine.py            # includes _generate_symbol_keywords + _keyword_cache
 |     |  `- prompts.py           # includes SYMBOL_KEYWORD_GENERATION_PROMPT
+|     |- alpaca_broker.py        # AlpacaBroker, maybe_execute_alpaca_order, circuit breakers
+|     |- secret_store.py         # OS keychain helpers for Telegram and Alpaca secrets
 |     |- runtime_health.py
 |     |- trading_instruments.py
 |     `- paper_trading.py        # Trading simulation, position lifecycle, get_summary
 |- frontend/
 |  |- src/app/page.tsx
-|  |- src/app/admin/page.tsx     # includes Price History section
+|  |- src/app/admin/page.tsx     # includes Price History and Live Trading sections
 |  |- src/app/health/
-|  |- src/app/trading/           # paper trading page
+|  |- src/app/trading/           # paper trading + Alpaca order log page
 |  |- src/lib/
 |  `- src/app/api/
-|     |- paper-trading/route.ts  
+|     |- paper-trading/route.ts
 |     |- admin/price-history/pull/route.ts
-|     `- admin/price-history/status/route.ts
+|     |- admin/price-history/status/route.ts
+|     `- alpaca/                 # proxy routes for all /api/v1/alpaca/* endpoints
+|        |- status/route.ts
+|        |- secrets/route.ts
+|        |- test-connection/route.ts
+|        |- account/route.ts
+|        |- positions/route.ts
+|        |- orders/route.ts
+|        `- settings/route.ts
 |- RELEASENOTES.md
 `- README.md
 ```

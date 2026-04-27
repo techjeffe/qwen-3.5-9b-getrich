@@ -1,3 +1,74 @@
+# Release Notes — April 27, 2026
+
+## Alpaca Live Brokerage Trading
+
+Every paper trade open and close is now optionally mirrored to an Alpaca brokerage account in real time. Paper simulation always runs first and is always preserved regardless of what happens on the Alpaca side.
+
+**Secrets and connection:**
+
+- Alpaca API key + secret are stored in the OS keychain (Windows Credential Manager / macOS Keychain Access) through `keyring` — never in the repo or frontend bundle
+- Paper mode (`paper-api.alpaca.markets`) and live mode (`api.alpaca.markets`) are stored alongside the credentials so the correct endpoint is always used
+- A Test Connection button in Admin validates the stored keys and shows account equity before anything is enabled
+
+**Order routing:**
+
+- Open events route as a `buy` (long) or `sell` (direct short when `alpaca_allow_short_selling` is enabled)
+- Close events route as `sell` (long close / inverse ETF close) or `buy` (cover for a direct short)
+- Regular-hours closes submit the original **share quantity** rather than re-notionalising with the entry dollar amount, so orders match the live position size even when price has moved
+- Extended-hours opens and closes automatically switch to `qty + limit_price` (entry price ± slippage) because Alpaca does not support notional/fractional orders outside regular hours
+- Close orders are guarded: if no successful open is on record for the paper trade (e.g. the open was skipped because short selling was disabled, or a circuit breaker fired), the close is silently skipped to prevent unintended reverse exposure
+
+**Window-expired closes dispatched to Alpaca:**
+
+- `close_expired_positions()` now receives the pending dispatch list so conviction-window-expired closes are forwarded to Alpaca in the same post-commit dispatch call as all other lifecycle events; previously these exits committed in paper but were never sent live
+
+**Circuit breakers (auto-disable live trading):**
+
+- Max total open exposure exceeded
+- Daily realized loss limit hit
+- N consecutive losing trades (default 3)
+- Any breach commits `alpaca_live_trading_enabled = false` to the database and logs the reason
+
+**Guardrails (all configurable from Admin):**
+
+- Per-position size cap (USD)
+- Total open exposure cap (USD)
+- Daily loss limit (USD)
+- Max consecutive losses before circuit break
+- Order type: `market` or `limit`
+- Limit slippage percentage (applied to entry price for extended-hours limit orders)
+- Allow direct short selling toggle
+
+**Audit log:**
+
+- Every order attempt — success, pending, or error — is written to a new `alpaca_orders` table with symbol, side, notional/qty, order type, status, fill price, trading mode, and Alpaca order ID
+- Skipped and rejected opens are recorded with `status="error"` so there is always a traceable record of why a close was or was not sent
+
+**Admin UI — Live Trading section:**
+
+- Sits after Save Config, before Price History; always visible (not gated by Advanced Mode)
+- API key / secret inputs (password-masked), mode selector (paper/live), Save Keys / Clear Keys buttons
+- Configured/Not-set badge showing masked key prefix and active mode
+- Test Connection with inline result showing account equity
+- Account info cards: equity, buying power, cash, status (shown when keys are valid)
+- Guardrail fields wired into the main Save Config flow
+- Enable Live Trading button (disabled until keys are saved) with a "type LIVE to confirm" modal
+- Disable button shown when live trading is active; one click, no confirmation needed
+
+**Trading page updates:**
+
+- Header renames to "Live Trading" and shows a pulsing red **LIVE** badge when `alpaca_live_trading_enabled` is true
+- Alpaca Order Log table at page bottom whenever orders exist: symbol, side, notional/qty, order type, status, fill price, mode badge (LIVE/PAPER), submitted timestamp
+- Alpaca status and orders are fetched in parallel with paper trading data on each page load
+
+**DB migration:**
+
+- 8 new columns added to `app_config` (all safe-default, non-breaking)
+- New `alpaca_orders` table created with `CREATE TABLE IF NOT EXISTS` plus indexed columns
+- Runs automatically on backend startup via `migrate.py`
+
+---
+
 # Release Notes — April 24, 2026
 
 ## Mac/Turbopack and Config Hardening
