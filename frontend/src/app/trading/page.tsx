@@ -119,6 +119,10 @@ type AlpacaAccount = {
     cash?: string | number;
     buying_power?: string | number;
     unrealized_pl?: string | number;
+    daytrade_count?: string | number;
+    daytrading_buying_power?: string | number;
+    pattern_day_trader?: boolean | string;
+    trading_blocked?: boolean | string;
 };
 
 type AlpacaStatus = {
@@ -175,6 +179,11 @@ function fmtMoney(val: string | number | null | undefined) {
     const num = typeof val === "number" ? val : Number(val ?? NaN);
     if (!Number.isFinite(num)) return "—";
     return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function toNumber(val: string | number | null | undefined) {
+    const num = typeof val === "number" ? val : Number(val ?? NaN);
+    return Number.isFinite(num) ? num : null;
 }
 
 function fmtDate(iso: string | null) {
@@ -504,10 +513,43 @@ export default function TradingPage() {
 
     // ── Live summary stats computed from Alpaca account + order fills ─────────
     const liveAccount = alpacaAccounts.live;
-    const liveEquity = liveAccount?.equity != null ? Number(liveAccount.equity) : null;
+    const liveEquity = toNumber(liveAccount?.equity);
     // unrealized_pl comes directly from Alpaca and excludes cash deposits — use it
     // instead of equity-last_equity which would incorrectly include funding movements.
-    const liveUnrealizedPnl = liveAccount?.unrealized_pl != null ? Number(liveAccount.unrealized_pl) : null;
+    const liveUnrealizedPnl = toNumber(liveAccount?.unrealized_pl);
+    const liveDaytradeCount = toNumber(liveAccount?.daytrade_count);
+    const liveDaytradingBuyingPower = toNumber(liveAccount?.daytrading_buying_power);
+    const livePatternDayTrader = String(liveAccount?.pattern_day_trader ?? "").toLowerCase() === "true";
+    const liveTradingBlocked = String(liveAccount?.trading_blocked ?? "").toLowerCase() === "true";
+    const liveUnderPdtEquity = liveEquity != null && liveEquity < 25000;
+    const livePdtRiskLevel = liveTradingBlocked || livePatternDayTrader || (liveUnderPdtEquity && (liveDaytradeCount ?? 0) >= 3)
+        ? "blocked"
+        : liveUnderPdtEquity && (liveDaytradeCount ?? 0) >= 2
+        ? "warning"
+        : liveUnderPdtEquity
+        ? "watch"
+        : "clear";
+    const livePdtTone = livePdtRiskLevel === "blocked"
+        ? "border-red-500/35 bg-red-500/10 text-red-200"
+        : livePdtRiskLevel === "warning"
+        ? "border-amber-500/35 bg-amber-500/10 text-amber-100"
+        : livePdtRiskLevel === "watch"
+        ? "border-sky-500/30 bg-sky-500/10 text-sky-100"
+        : "border-emerald-500/25 bg-emerald-500/10 text-emerald-100";
+    const livePdtHeadline = livePdtRiskLevel === "blocked"
+        ? "PDT protection active"
+        : livePdtRiskLevel === "warning"
+        ? "PDT threshold close"
+        : livePdtRiskLevel === "watch"
+        ? "Sub-$25k account"
+        : "PDT status clear";
+    const livePdtBody = livePdtRiskLevel === "blocked"
+        ? "New opens and same-day closes can be blocked to avoid pattern day trading violations."
+        : livePdtRiskLevel === "warning"
+        ? "This account is below $25k and is near the 3 day-trade threshold in the rolling 5-day window."
+        : livePdtRiskLevel === "watch"
+        ? "This account is below $25k, so same-day round trips need to stay limited."
+        : "Equity is above the standard PDT threshold or the account is not currently at risk.";
 
     const liveFilled = alpacaOrders.filter(
         (o) => o.trading_mode === "live" && o.status === "filled" && o.paper_trade_id != null,
@@ -525,7 +567,7 @@ export default function TradingPage() {
     const liveClosedRows: LiveClosedRow[] = [];
     let liveWins = 0, liveLosses = 0, liveRealized = 0;
 
-    for (const orders of liveByTrade.values()) {
+    for (const orders of Array.from(liveByTrade.values())) {
         const buys  = orders.filter((o) => o.side === "buy");
         const sells = orders.filter((o) => o.side === "sell");
         const sym   = orders[0]?.symbol ?? "?";
@@ -707,6 +749,35 @@ export default function TradingPage() {
                                     <StatCard label="Buying Power" value={liveAccount?.buying_power != null ? fmtMoney(liveAccount.buying_power) : "—"} />
                                     <StatCard label="Open Positions" value={String(liveOpenRows.length)} />
                                     <StatCard label="Total Trades" value={String(liveTotalTrades)} />
+                                </div>
+                                <div className={`rounded-xl border p-4 ${livePdtTone}`}>
+                                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                                        <div>
+                                            <p className="text-sm font-semibold">{livePdtHeadline}</p>
+                                            <p className="mt-1 text-xs text-current/80">{livePdtBody}</p>
+                                        </div>
+                                        <span className="rounded-full border border-current/20 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide">
+                                            {livePdtRiskLevel}
+                                        </span>
+                                    </div>
+                                    <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                                        <div>
+                                            <p className="text-current/65">Equity</p>
+                                            <p className="mt-1 font-semibold">{liveEquity != null ? fmtMoney(liveEquity) : "—"}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-current/65">Day Trades</p>
+                                            <p className="mt-1 font-semibold">{liveDaytradeCount != null ? String(liveDaytradeCount) : "—"}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-current/65">PDT Flag</p>
+                                            <p className="mt-1 font-semibold">{livePatternDayTrader ? "Yes" : "No"}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-current/65">Daytrade BP</p>
+                                            <p className="mt-1 font-semibold">{liveDaytradingBuyingPower != null ? fmtMoney(liveDaytradingBuyingPower) : "—"}</p>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 {/* Live open positions */}

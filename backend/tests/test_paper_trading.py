@@ -96,7 +96,7 @@ def test_process_signals_closes_existing_position_using_existing_ticker_price(db
         "label": "Market Open",
         "tradeable": True,
     }
-    paper_trading_module.close_expired_positions = lambda db: []
+    paper_trading_module.close_expired_positions = lambda db, alpaca_pending=None: []
     try:
         actions = process_signals(
             db=db_session,
@@ -200,7 +200,7 @@ def test_spy_short_leverage_upgrade_is_not_treated_as_direction_flip(db_session)
         "label": "Market Open",
         "tradeable": True,
     }
-    paper_trading_module.close_expired_positions = lambda db: []
+    paper_trading_module.close_expired_positions = lambda db, alpaca_pending=None: []
     try:
         actions = process_signals(
             db=db_session,
@@ -241,3 +241,147 @@ def test_spy_short_leverage_upgrade_is_not_treated_as_direction_flip(db_session)
     assert new_trade is not None
     assert new_trade.signal_type == "SHORT"
     assert new_trade.execution_ticker == "SDS"
+
+
+def test_min_same_day_exit_edge_blocks_tiny_profitable_flip(db_session):
+    _seed_config(
+        db_session,
+        paper_trade_amount=1000.0,
+        reentry_cooldown_minutes=0,
+        min_same_day_exit_edge_pct=0.5,
+    )
+    open_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=1000.0,
+        shares=10.0,
+        entry_price=100.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="prev",
+    )
+    db_session.add(open_trade)
+    db_session.commit()
+
+    from services import paper_trading as paper_trading_module
+
+    original_market_status = paper_trading_module.market_status
+    original_close_expired_positions = paper_trading_module.close_expired_positions
+    paper_trading_module.market_status = lambda allow_extended_hours=True: {
+        "status": "open",
+        "label": "Market Open",
+        "tradeable": True,
+    }
+    paper_trading_module.close_expired_positions = lambda db, alpaca_pending=None: []
+    try:
+        actions = process_signals(
+            db=db_session,
+            recommendations=[
+                {
+                    "underlying": "USO",
+                    "execution_ticker": "SCO",
+                    "signal_type": "SHORT",
+                    "leverage": "1x",
+                    "conviction_level": "HIGH",
+                    "trading_type": "SWING",
+                    "holding_minutes": 180,
+                }
+            ],
+            quotes_by_symbol={
+                "USO": {"current_price": 100.3},
+                "SCO": {"current_price": 20.0},
+            },
+            request_id="next",
+            trade_amount=1000.0,
+        )
+    finally:
+        paper_trading_module.market_status = original_market_status
+        paper_trading_module.close_expired_positions = original_close_expired_positions
+
+    still_open = (
+        db_session.query(PaperTrade)
+        .filter(PaperTrade.id == open_trade.id, PaperTrade.exited_at.is_(None))
+        .first()
+    )
+    opposite_open = (
+        db_session.query(PaperTrade)
+        .filter(PaperTrade.underlying == "USO", PaperTrade.id != open_trade.id, PaperTrade.exited_at.is_(None))
+        .first()
+    )
+
+    assert still_open is not None
+    assert opposite_open is None
+    assert actions[0]["action"] == "held"
+    assert actions[0]["reason"] == "min_same_day_exit_edge"
+
+
+def test_min_same_day_exit_edge_does_not_block_same_day_loss_cut(db_session):
+    _seed_config(
+        db_session,
+        paper_trade_amount=1000.0,
+        reentry_cooldown_minutes=0,
+        min_same_day_exit_edge_pct=0.5,
+    )
+    open_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=1000.0,
+        shares=10.0,
+        entry_price=100.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="prev",
+    )
+    db_session.add(open_trade)
+    db_session.commit()
+
+    from services import paper_trading as paper_trading_module
+
+    original_market_status = paper_trading_module.market_status
+    original_close_expired_positions = paper_trading_module.close_expired_positions
+    paper_trading_module.market_status = lambda allow_extended_hours=True: {
+        "status": "open",
+        "label": "Market Open",
+        "tradeable": True,
+    }
+    paper_trading_module.close_expired_positions = lambda db, alpaca_pending=None: []
+    try:
+        actions = process_signals(
+            db=db_session,
+            recommendations=[
+                {
+                    "underlying": "USO",
+                    "execution_ticker": "SCO",
+                    "signal_type": "SHORT",
+                    "leverage": "1x",
+                    "conviction_level": "HIGH",
+                    "trading_type": "SWING",
+                    "holding_minutes": 180,
+                }
+            ],
+            quotes_by_symbol={
+                "USO": {"current_price": 99.0},
+                "SCO": {"current_price": 20.0},
+            },
+            request_id="next",
+            trade_amount=1000.0,
+        )
+    finally:
+        paper_trading_module.market_status = original_market_status
+        paper_trading_module.close_expired_positions = original_close_expired_positions
+
+    closed_trade = db_session.query(PaperTrade).filter(PaperTrade.id == open_trade.id).first()
+    new_trade = (
+        db_session.query(PaperTrade)
+        .filter(PaperTrade.underlying == "USO", PaperTrade.id != open_trade.id, PaperTrade.exited_at.is_(None))
+        .first()
+    )
+
+    assert closed_trade is not None
+    assert closed_trade.exited_at is not None
+    assert new_trade is not None
+    assert actions[0]["action"] == "opened"

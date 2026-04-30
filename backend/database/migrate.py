@@ -77,6 +77,7 @@ def migrate():
                 ("materiality_min_posts_delta", "INTEGER"),
                 ("materiality_min_sentiment_delta", "REAL"),
                 ("reentry_cooldown_minutes", "INTEGER"),
+                ("min_same_day_exit_edge_pct", "REAL"),
             ]:
                 if column_name not in existing_cols:
                     print(f"Adding {column_name} to app_config...")
@@ -343,6 +344,7 @@ def migrate():
                 ("materiality_min_posts_delta", "INTEGER"),
                 ("materiality_min_sentiment_delta", "FLOAT"),
                 ("reentry_cooldown_minutes", "INTEGER"),
+                ("min_same_day_exit_edge_pct", "FLOAT"),
             ]:
                 result = conn.execute(
                     text("SELECT column_name FROM information_schema.columns WHERE table_name='app_config' AND column_name=:col"),

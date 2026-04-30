@@ -101,6 +101,40 @@ def _window_active(pos, now: datetime) -> bool:
     return now_utc < win
 
 
+def _same_market_day(a: Optional[datetime], b: Optional[datetime]) -> bool:
+    if a is None or b is None:
+        return False
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return a.astimezone(_MARKET_TZ).date() == b.astimezone(_MARKET_TZ).date()
+
+
+def _min_same_day_exit_edge_pct(app_config) -> float:
+    try:
+        override = getattr(app_config, "min_same_day_exit_edge_pct", None) if app_config is not None else None
+        if override is not None:
+            return max(0.0, float(override))
+    except Exception:
+        pass
+    return max(0.0, float(_L.get("min_same_day_exit_edge_pct", 0.5)))
+
+
+def _same_day_exit_edge_blocks_close(open_pos, exit_price: float, now: datetime, threshold_pct: float) -> bool:
+    """
+    Block tiny same-day winners from being closed just to churn the account.
+    Loss-cutting remains allowed.
+    """
+    if open_pos is None or threshold_pct <= 0 or exit_price <= 0:
+        return False
+    entered_at = getattr(open_pos, "entered_at", None)
+    if not _same_market_day(entered_at, now):
+        return False
+    pnl_pct = _directional_return_pct(open_pos.signal_type, float(open_pos.entry_price or 0.0), exit_price)
+    return pnl_pct > 0 and pnl_pct < threshold_pct
+
+
 def close_expired_positions(db, alpaca_pending: Optional[list] = None) -> List[Dict[str, Any]]:
     """
     Close any open positions whose conviction window has expired.
@@ -249,6 +283,7 @@ def process_signals(
         _rc_override = getattr(_app_config, "reentry_cooldown_minutes", None)
         if _rc_override is not None:
             _reentry_cooldown = int(_rc_override)
+    _min_same_day_edge_pct = _min_same_day_exit_edge_pct(_app_config)
 
     # Collect (paper_trade_obj, "open"|"close") for Alpaca dispatch after commit
     _alpaca_pending: list = []
@@ -415,6 +450,16 @@ def process_signals(
             and _window_active(open_pos, now)
         )
         if open_pos and existing_pos_price > 0 and not window_blocks_close:
+            if _same_day_exit_edge_blocks_close(open_pos, existing_pos_price, now, _min_same_day_edge_pct):
+                action_summary["action"] = "held"
+                action_summary["reason"] = "min_same_day_exit_edge"
+                action_summary["exit_edge_pct"] = round(
+                    _directional_return_pct(open_pos.signal_type, open_pos.entry_price, existing_pos_price),
+                    4,
+                )
+                action_summary["min_same_day_exit_edge_pct"] = _min_same_day_edge_pct
+                actions.append(action_summary)
+                continue
             _close_position(
                 open_pos, existing_pos_price, now, db,
                 reason="direction_flip" if is_direction_flip else "ticker_leverage_change",
@@ -502,6 +547,18 @@ def process_signals(
         price_data = quotes_by_symbol.get(pos.execution_ticker) or quotes_by_symbol.get(pos.underlying) or {}
         exit_price = float(price_data.get("current_price") or price_data.get("price") or pos.entry_price or 0.0)
         if exit_price > 0:
+            if _same_day_exit_edge_blocks_close(pos, exit_price, now, _min_same_day_edge_pct):
+                actions.append({
+                    "underlying": pos.underlying,
+                    "execution_ticker": pos.execution_ticker,
+                    "signal_type": pos.signal_type,
+                    "action": "held",
+                    "reason": "min_same_day_exit_edge",
+                    "exit_edge_pct": round(_directional_return_pct(pos.signal_type, pos.entry_price, exit_price), 4),
+                    "min_same_day_exit_edge_pct": _min_same_day_edge_pct,
+                    "session": session["label"],
+                })
+                continue
             _close_position(pos, exit_price, now, db, reason="no_recommendation")
             _alpaca_pending.append((pos, "close"))
             actions.append({

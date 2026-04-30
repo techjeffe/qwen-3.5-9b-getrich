@@ -813,6 +813,8 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.trail_on_window_expiry = bool(payload.get("trail_on_window_expiry"))
     if "reentry_cooldown_minutes" in payload:
         config.reentry_cooldown_minutes = _normalize_trading_logic_int(payload.get("reentry_cooldown_minutes"), 0, 10080)
+    if "min_same_day_exit_edge_pct" in payload:
+        config.min_same_day_exit_edge_pct = _normalize_trading_logic_float(payload.get("min_same_day_exit_edge_pct"), 0.0, 25.0)
     if "alpaca_live_trading_enabled" in payload:
         config.alpaca_live_trading_enabled = _coerce_bool(payload.get("alpaca_live_trading_enabled"), False)
         config.alpaca_execution_mode = "live" if config.alpaca_live_trading_enabled else DEFAULT_ALPACA_EXECUTION_MODE
@@ -1037,6 +1039,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "hold_overnight": bool(getattr(config, "hold_overnight", False)),
         "trail_on_window_expiry": bool(getattr(config, "trail_on_window_expiry", True)),
         "reentry_cooldown_minutes": getattr(config, "reentry_cooldown_minutes", None),
+        "min_same_day_exit_edge_pct": getattr(config, "min_same_day_exit_edge_pct", None),
         # Alpaca brokerage execution settings
         "alpaca_execution_mode":         _normalize_alpaca_execution_mode(
             getattr(config, "alpaca_execution_mode", DEFAULT_ALPACA_EXECUTION_MODE)
@@ -1058,6 +1061,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             "materiality_min_posts_delta": _L["materiality_gate"]["min_posts_delta"],
             "materiality_min_sentiment_delta": _L["materiality_gate"]["min_sentiment_delta"],
             "reentry_cooldown_minutes": int(_L.get("reentry_cooldown_minutes", 120)),
+            "min_same_day_exit_edge_pct": float(_L.get("min_same_day_exit_edge_pct", 0.5)),
         },
         "last_analysis_started_at": config.last_analysis_started_at.isoformat() if config.last_analysis_started_at else None,
         "last_analysis_completed_at": config.last_analysis_completed_at.isoformat() if config.last_analysis_completed_at else None,

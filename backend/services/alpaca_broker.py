@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
+from zoneinfo import ZoneInfo
 
 PAPER_BASE = "https://paper-api.alpaca.markets"
 LIVE_BASE  = "https://api.alpaca.markets"
+_ET = ZoneInfo("America/New_York")
 
 _TERMINAL_STATUSES = frozenset({"filled", "cancelled", "expired", "rejected", "error"})
 
@@ -510,6 +512,136 @@ def _record_alpaca_order_error(
         db.rollback()
 
 
+def _record_alpaca_order_skip(
+    db,
+    paper_trade_id: Optional[int],
+    side: str,
+    symbol: str,
+    notional: Optional[float],
+    trading_mode: str,
+    reason: str,
+    client_order_id: Optional[str] = None,
+) -> None:
+    from database.models import AlpacaOrder
+    order = AlpacaOrder(
+        paper_trade_id  = paper_trade_id,
+        client_order_id = client_order_id,
+        symbol          = symbol.upper(),
+        side            = side,
+        notional        = notional,
+        status          = "skipped",
+        trading_mode    = trading_mode,
+        error_message   = reason,
+        raw_response    = {"reason": reason},
+    )
+    try:
+        db.add(order)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _get_live_symbol_position(broker: "AlpacaBroker", symbol: str) -> Optional[Dict[str, Any]]:
+    """Return current live position details for one symbol, or None if flat/unavailable."""
+    try:
+        pos = broker.get_position(symbol)
+    except Exception:
+        return None
+
+    if not isinstance(pos, dict) or not pos:
+        return None
+
+    market_value = None
+    try:
+        raw_mv = pos.get("market_value")
+        if raw_mv is not None:
+            market_value = abs(float(raw_mv))
+    except Exception:
+        market_value = None
+
+    qty = None
+    try:
+        raw_qty = pos.get("qty") or pos.get("available_shares")
+        if raw_qty is not None:
+            qty = float(raw_qty)
+    except Exception:
+        qty = None
+
+    side = str(pos.get("side") or "").strip().lower()
+    if side not in {"long", "short"}:
+        if qty is not None:
+            if qty > 0:
+                side = "long"
+            elif qty < 0:
+                side = "short"
+            else:
+                side = ""
+
+    if market_value is None and qty is not None:
+        try:
+            price = float(pos.get("current_price") or pos.get("avg_entry_price") or 0.0)
+            if price > 0:
+                market_value = abs(qty) * price
+        except Exception:
+            market_value = None
+
+    return {
+        "market_value": market_value,
+        "qty": abs(qty) if qty is not None else None,
+        "side": side or None,
+    }
+
+
+def _same_trading_day_as_now(ts: Optional[datetime]) -> bool:
+    if ts is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(_ET).date() == datetime.now(_ET).date()
+
+
+def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str) -> Optional[str]:
+    """
+    Return a human-readable reason when the order should be blocked to avoid
+    pattern day trading issues on sub-$25k live accounts.
+    """
+    try:
+        account = broker.get_account()
+    except Exception as exc:
+        print(f"[alpaca] PDT check: account fetch failed, skipping check: {exc}")
+        return None
+
+    try:
+        equity = float(account.get("equity") or 0.0)
+    except Exception:
+        equity = 0.0
+    try:
+        daytrade_count = int(account.get("daytrade_count") or 0)
+    except Exception:
+        daytrade_count = 0
+    raw_pdt = account.get("pattern_day_trader")
+    is_pdt_flagged = str(raw_pdt).strip().lower() in {"true", "1", "yes"} if raw_pdt is not None else False
+
+    if equity >= 25000.0 and not is_pdt_flagged:
+        return None
+
+    if event == "open":
+        if is_pdt_flagged or daytrade_count >= 3:
+            return (
+                f"PDT protection: live account equity ${equity:.2f} with "
+                f"daytrade_count={daytrade_count} blocks opening new positions"
+            )
+        return None
+
+    if event == "close" and _same_trading_day_as_now(getattr(paper_trade, "entered_at", None)):
+        if is_pdt_flagged or daytrade_count >= 3:
+            return (
+                f"PDT protection: live account equity ${equity:.2f} with "
+                f"daytrade_count={daytrade_count} blocks same-day close"
+            )
+    return None
+
+
 # ── Main hook ─────────────────────────────────────────────────────────────────
 
 def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
@@ -535,6 +667,22 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     direct_short = _is_direct_short(paper_trade)
     allow_short  = bool(getattr(config, "alpaca_allow_short_selling", False))
 
+    if execution_mode == "live":
+        pdt_block_reason = _get_pdt_block_reason(broker, paper_trade, event)
+        if pdt_block_reason:
+            side_hint = "sell" if (event == "close" and _is_direct_short(paper_trade)) else ("buy" if event == "open" else "sell")
+            _record_alpaca_order_skip(
+                db,
+                paper_id,
+                side_hint,
+                symbol,
+                notional if event == "open" else None,
+                broker.mode,
+                pdt_block_reason,
+            )
+            print(f"[alpaca] skipping {event} for {symbol}: {pdt_block_reason}")
+            return
+
     # ── Determine Alpaca side ────────────────────────────────────────────────
     if event == "open":
         if direct_short:
@@ -558,7 +706,33 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
 
         max_pos = getattr(config, "alpaca_max_position_usd", None)
         if max_pos and max_pos > 0:
-            notional = min(notional, max_pos)
+            live_pos = _get_live_symbol_position(broker, symbol)
+            live_side = str((live_pos or {}).get("side") or "").lower()
+            live_value = (live_pos or {}).get("market_value")
+            same_direction_live = (
+                (side == "buy" and live_side == "long") or
+                (side == "sell" and live_side == "short")
+            )
+            if same_direction_live and live_value is not None:
+                remaining_capacity = max(0.0, float(max_pos) - float(live_value))
+                if remaining_capacity <= 0.01:
+                    _record_alpaca_order_skip(
+                        db,
+                        paper_id,
+                        side,
+                        symbol,
+                        0.0,
+                        broker.mode,
+                        f"position cap reached for {symbol}: current ${live_value:.2f} >= max ${float(max_pos):.2f}",
+                    )
+                    print(
+                        f"[alpaca] skipping {side} for {symbol}: "
+                        f"position cap reached (current ${live_value:.2f}, max ${float(max_pos):.2f})"
+                    )
+                    return
+                notional = min(notional, remaining_capacity)
+            else:
+                notional = min(notional, max_pos)
 
     elif event == "close":
         # Guard: only close if a live open order was actually placed for this trade.
@@ -587,7 +761,9 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
 
     if ext_hours:
         # Pre/post-market: Alpaca requires explicit extended_hours + limit + qty.
-        if shares > 0:
+        if event == "open" and entry_price > 0 and notional > 0:
+            qty = round(notional / entry_price, 6)
+        elif shares > 0:
             qty = shares
         elif entry_price > 0:
             qty = round(notional / entry_price, 6)

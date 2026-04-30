@@ -364,6 +364,7 @@ class AppConfig(Base):
     hold_overnight = Column(Boolean, nullable=False, default=False)
     trail_on_window_expiry = Column(Boolean, nullable=False, default=True)
     reentry_cooldown_minutes = Column(Integer, nullable=True, default=None)
+    min_same_day_exit_edge_pct = Column(Float, nullable=True, default=None)
 
     # ── Alpaca brokerage execution ────────────────────────────────────────────
     alpaca_execution_mode         = Column(String(10),  nullable=False, default="off")  # off | paper | live

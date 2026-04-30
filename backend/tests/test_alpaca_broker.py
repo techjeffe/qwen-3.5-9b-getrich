@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,6 +53,8 @@ class DummyBroker:
     def __init__(self, mode: str = "live") -> None:
         self.mode = mode
         self.orders = []
+        self.position = {"qty": "2"}
+        self.account = {"equity": "50000", "daytrade_count": "0", "pattern_day_trader": False}
 
     def place_order(self, **kwargs):
         self.orders.append(kwargs)
@@ -66,7 +68,10 @@ class DummyBroker:
         }
 
     def get_position(self, symbol: str):
-        return {"qty": "2"}
+        return self.position
+
+    def get_account(self):
+        return self.account
 
 
 @pytest.mark.parametrize("event,side", [("open", "buy"), ("close", "sell")])
@@ -109,7 +114,7 @@ def test_extended_hours_orders_use_limit_and_qty(db_session, monkeypatch, event,
     broker = DummyBroker(mode="live")
     monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
     monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: True)
-    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg: None)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
 
     maybe_execute_alpaca_order(db_session, paper_trade, event, config)
 
@@ -144,7 +149,7 @@ def test_regular_hours_respects_configured_order_type(db_session, monkeypatch):
     broker = DummyBroker(mode="live")
     monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
     monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
-    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg: None)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
 
     maybe_execute_alpaca_order(db_session, paper_trade, "open", config)
 
@@ -155,3 +160,144 @@ def test_regular_hours_respects_configured_order_type(db_session, monkeypatch):
     assert order["notional"] == 500.0
     assert order["qty"] is None
     assert order["limit_price"] is None
+
+
+def test_open_skips_when_existing_live_position_already_at_cap(db_session, monkeypatch):
+    config = _seed_config(db_session, alpaca_max_position_usd=100.0)
+    paper_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=100.0,
+        shares=0.666667,
+        entry_price=150.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="req-3",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.position = {"qty": "0.7", "market_value": "103.11", "side": "long"}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "open", config)
+
+    assert broker.orders == []
+    skip = db_session.query(AlpacaOrder).filter(AlpacaOrder.status == "skipped").one()
+    assert skip.symbol == "USO"
+    assert "position cap reached" in (skip.error_message or "")
+
+
+def test_extended_hours_open_uses_remaining_capacity_qty(db_session, monkeypatch):
+    config = _seed_config(db_session, alpaca_max_position_usd=100.0, allow_extended_hours_trading=True)
+    paper_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="after-hours",
+        amount=100.0,
+        shares=0.666667,
+        entry_price=150.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="req-4",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.position = {"qty": "0.4", "market_value": "60.00", "side": "long"}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: True)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "open", config)
+
+    assert len(broker.orders) == 1
+    order = broker.orders[0]
+    assert order["notional"] is None
+    assert order["qty"] == pytest.approx(40.0 / 150.0, rel=0, abs=1e-6)
+
+
+def test_open_skips_when_pdt_limit_reached_for_sub_25k_live_account(db_session, monkeypatch):
+    config = _seed_config(db_session, alpaca_max_position_usd=100.0)
+    paper_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=100.0,
+        shares=0.666667,
+        entry_price=150.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="req-5",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.account = {"equity": "24000.00", "daytrade_count": "3", "pattern_day_trader": False}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "open", config)
+
+    assert broker.orders == []
+    skip = db_session.query(AlpacaOrder).filter(AlpacaOrder.status == "skipped").one()
+    assert "PDT protection" in (skip.error_message or "")
+    assert "blocks opening new positions" in (skip.error_message or "")
+
+
+def test_same_day_close_skips_when_pdt_limit_reached_for_sub_25k_live_account(db_session, monkeypatch):
+    config = _seed_config(db_session)
+    paper_trade = PaperTrade(
+        underlying="USO",
+        execution_ticker="USO",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=100.0,
+        shares=0.666667,
+        entry_price=150.0,
+        entered_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        analysis_request_id="req-6",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+    db_session.add(
+        AlpacaOrder(
+            paper_trade_id=paper_trade.id,
+            alpaca_order_id="existing-open-uso",
+            client_order_id="existing-client-open-uso",
+            symbol="USO",
+            side="buy",
+            notional=100.0,
+            qty=0.666667,
+            order_type="market",
+            time_in_force="day",
+            extended_hours=False,
+            status="filled",
+            trading_mode="live",
+        )
+    )
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.account = {"equity": "24000.00", "daytrade_count": "3", "pattern_day_trader": False}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "close", config)
+
+    assert broker.orders == []
+    skips = db_session.query(AlpacaOrder).filter(AlpacaOrder.status == "skipped").all()
+    assert len(skips) == 1
+    assert "blocks same-day close" in (skips[0].error_message or "")

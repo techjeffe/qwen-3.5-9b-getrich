@@ -34,6 +34,7 @@ type AppConfig = {
     hold_overnight: boolean;
     trail_on_window_expiry: boolean;
     reentry_cooldown_minutes: number | null;
+    min_same_day_exit_edge_pct: number | null;
     remote_snapshot_enabled: boolean;
     remote_snapshot_mode: "telegram" | "signed_link" | "email";
     remote_snapshot_interval_minutes: number;
@@ -54,6 +55,7 @@ type AppConfig = {
         materiality_min_posts_delta: number;
         materiality_min_sentiment_delta: number;
         reentry_cooldown_minutes: number;
+        min_same_day_exit_edge_pct: number;
     };
     available_models: string[];
     last_analysis_started_at: string | null;
@@ -132,6 +134,7 @@ const EMPTY_CONFIG: AppConfig = {
     hold_overnight: false,
     trail_on_window_expiry: true,
     reentry_cooldown_minutes: null,
+    min_same_day_exit_edge_pct: null,
     remote_snapshot_enabled: false,
     remote_snapshot_mode: "telegram",
     remote_snapshot_interval_minutes: 360,
@@ -152,6 +155,7 @@ const EMPTY_CONFIG: AppConfig = {
         materiality_min_posts_delta: 6,
         materiality_min_sentiment_delta: 0.24,
         reentry_cooldown_minutes: 120,
+        min_same_day_exit_edge_pct: 0.5,
     },
     available_models: [],
     last_analysis_started_at: null,
@@ -193,6 +197,7 @@ const BASIC_MODE_DEFAULTS: Partial<AppConfig> = {
     hold_overnight: false,
     trail_on_window_expiry: true,
     reentry_cooldown_minutes: null,
+    min_same_day_exit_edge_pct: null,
     paper_trade_amount: null,
     entry_threshold: null,
     stop_loss_pct: null,
@@ -440,6 +445,7 @@ export default function AdminPage() {
             config.hold_overnight !== d.hold_overnight ||
             config.trail_on_window_expiry !== d.trail_on_window_expiry ||
             config.reentry_cooldown_minutes !== d.reentry_cooldown_minutes ||
+            config.min_same_day_exit_edge_pct !== d.min_same_day_exit_edge_pct ||
             config.paper_trade_amount !== d.paper_trade_amount ||
             config.entry_threshold !== d.entry_threshold ||
             config.stop_loss_pct !== d.stop_loss_pct ||
@@ -1912,6 +1918,22 @@ python run.py`}</code></pre>
                                 value={config.reentry_cooldown_minutes ?? ""}
                                 placeholder={String(config.logic_defaults.reentry_cooldown_minutes)}
                                 onChange={(e) => setConfig((c) => ({ ...c, reentry_cooldown_minutes: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                            />
+                        </label>
+                        <label className="block">
+                            <span className="text-xs text-slate-400">Minimum Same-Day Exit Edge (%)</span>
+                            <p className="text-[11px] text-slate-600 mt-0.5">
+                                Minimum profit edge required before the system is allowed to close a same-day winner on a flip,
+                                ticker/leverage change, or missing recommendation. Small winners below this stay open to avoid churn.
+                                Loss-cutting is still allowed. Default: {config.logic_defaults.min_same_day_exit_edge_pct}%
+                            </p>
+                            <input
+                                type="number"
+                                min={0} max={25} step={0.1}
+                                value={config.min_same_day_exit_edge_pct ?? ""}
+                                placeholder={String(config.logic_defaults.min_same_day_exit_edge_pct)}
+                                onChange={(e) => setConfig((c) => ({ ...c, min_same_day_exit_edge_pct: e.target.value === "" ? null : Number(e.target.value) }))}
                                 className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
                             />
                         </label>
