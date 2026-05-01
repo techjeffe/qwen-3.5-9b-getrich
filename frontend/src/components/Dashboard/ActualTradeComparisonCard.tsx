@@ -1,9 +1,9 @@
 "use client";
 
 import GlassCard from "./GlassCard";
-import { PnLSummary, TradeCloseRecord } from "@/lib/types/analysis";
-import { Prices } from "@/lib/types/analysis";
-import { formatSignedUsd, paperPnlUsd } from "@/lib/utils/timing";
+import { PnLSummary, Prices } from "@/lib/types/analysis";
+import { formatSignedUsd, livePnl } from "@/lib/utils/timing";
+import { UNDERLYING_PRICE_MAP } from "@/lib/constants/analysis";
 
 interface ActualTradeComparisonCardProps {
     pnlSummary: PnLSummary | null;
@@ -14,39 +14,33 @@ interface ActualTradeComparisonCardProps {
 
 export default function ActualTradeComparisonCard({
     pnlSummary,
-    currentRequestId,
+    currentRequestId: _currentRequestId,
     prices,
     onCloseTrade,
 }: ActualTradeComparisonCardProps) {
-    if (!pnlSummary || !currentRequestId) {
+    if (!pnlSummary) {
         return null;
     }
 
-    const currentTrades = pnlSummary.trades.filter((t) => t.request_id === currentRequestId);
-    const closedTrades = currentTrades.filter((t) => t.trade_close);
-    const openTrades = currentTrades.filter((t) => !t.trade_close);
+    const allExecuted = pnlSummary.trades
+        .filter((trade) => trade.actual_execution)
+        .sort((a, b) => {
+            const left = new Date(b.actual_execution!.executed_at).getTime();
+            const right = new Date(a.actual_execution!.executed_at).getTime();
+            return left - right;
+        });
+    const openTrades = allExecuted.filter((trade) => !trade.trade_close);
+    const closedTrades = allExecuted.filter((trade) => !!trade.trade_close);
 
-    if (currentTrades.length === 0) {
+    if (allExecuted.length === 0) {
         return null;
     }
 
-    const handleToggle = (tradeId: number) => {
-        const el = document.getElementById(`close-form-${tradeId}`);
-        if (el) {
-            el.scrollIntoView({ behavior: "smooth", block: "center" });
-        }
-    };
-
-    const handleSaveClose = async (
-        tradeId: number,
-        symbol: string,
-        entryPrice: number,
-        action: "BUY" | "SELL"
-    ) => {
+    const handleSaveClose = async (tradeId: number, symbol: string) => {
         const price = prompt(`Enter close price for ${symbol}:`, prices?.[symbol]?.price?.toString() ?? "");
         if (price === null) return;
         const closedPrice = parseFloat(price);
-        if (isNaN(closedPrice)) return;
+        if (!Number.isFinite(closedPrice) || closedPrice <= 0) return;
 
         const notesPrompt = prompt("Add notes (optional):", "");
         const notes = notesPrompt ?? "";
@@ -54,11 +48,18 @@ export default function ActualTradeComparisonCard({
         await onCloseTrade(tradeId, closedPrice, notes);
     };
 
+    const allTimePnl = closedTrades.reduce((sum, trade) => {
+        const pct = trade.trade_close!.exec_closed_return_pct ?? trade.trade_close!.closed_return_pct;
+        return sum + pct;
+    }, 0);
+    const wins = closedTrades.filter((trade) => {
+        const pct = trade.trade_close!.exec_closed_return_pct ?? trade.trade_close!.closed_return_pct;
+        return pct > 0;
+    }).length;
+
     return (
         <GlassCard>
-            <h2 className="text-sm font-semibold text-slate-300 mb-4">
-                Trade Performance — {currentRequestId.slice(0, 8)}
-            </h2>
+            <h2 className="text-sm font-semibold text-slate-300 mb-4">Trade Performance</h2>
 
             {/* Execution Summary */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6">
@@ -94,13 +95,17 @@ export default function ActualTradeComparisonCard({
                 </div>
             </div>
 
-            {/* Paper Trade Notional */}
-            {pnlSummary.paper_trade_notional_usd && (
-                <div className="mb-6 rounded-xl border border-slate-700/50 bg-slate-900/50 px-4 py-3 text-sm">
-                    <p className="text-slate-500">Paper Trade Notional</p>
-                    <p className="text-lg font-mono font-bold text-blue-300">
-                        {formatSignedUsd(pnlSummary.paper_trade_notional_usd)}
-                    </p>
+            {closedTrades.length > 0 && (
+                <div className="mb-6 rounded-xl border border-slate-700/60 bg-slate-950/50 p-4">
+                    <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500 mb-2">All-time realized P&L</p>
+                    <div className="flex items-baseline gap-3">
+                        <span className={`text-2xl font-black tabular-nums ${allTimePnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                            {allTimePnl >= 0 ? "+" : ""}{allTimePnl.toFixed(2)}%
+                        </span>
+                        <span className="text-xs text-slate-500">
+                            {wins}W / {closedTrades.length - wins}L across {closedTrades.length} closed trade{closedTrades.length !== 1 ? "s" : ""}
+                        </span>
+                    </div>
                 </div>
             )}
 
@@ -113,9 +118,14 @@ export default function ActualTradeComparisonCard({
                     <div className="space-y-3">
                         {openTrades.map((trade) => {
                             const snapshotEntry = trade.comparison;
-                            const snapshotPrice = snapshotEntry?.snapshot_price;
-                            const currentPrice = prices?.[trade.symbol]?.price;
-                            const displayPrice = snapshotPrice ?? currentPrice;
+                            const priceSymbol = prices?.[trade.symbol]
+                                ? trade.symbol
+                                : (UNDERLYING_PRICE_MAP[trade.symbol] ?? trade.symbol);
+                            const currentPrice = prices?.[priceSymbol]?.price ?? snapshotEntry?.snapshot_price ?? null;
+                            const actualExecution = trade.actual_execution;
+                            const liveActualReturn = actualExecution && currentPrice !== null
+                                ? livePnl(actualExecution.executed_action, actualExecution.executed_price, currentPrice)
+                                : null;
 
                             return (
                                 <div
@@ -140,17 +150,21 @@ export default function ActualTradeComparisonCard({
                                                     </p>
                                                 </div>
                                             )}
-                                            {trade.actual_execution && (
+                                            {actualExecution && (
                                                 <div className="text-right">
                                                     <p className="text-[10px] uppercase tracking-wider text-slate-500">Actual Return</p>
-                                                    <p className="text-sm font-bold font-mono text-blue-400">
-                                                        —
-                                                    </p>
+                                                    {liveActualReturn !== null ? (
+                                                        <p className={`text-sm font-bold font-mono ${liveActualReturn >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                                                            {liveActualReturn >= 0 ? "+" : ""}{liveActualReturn.toFixed(2)}%
+                                                        </p>
+                                                    ) : (
+                                                        <p className="text-sm font-bold font-mono text-blue-400">—</p>
+                                                    )}
                                                 </div>
                                             )}
                                             <button
                                                 type="button"
-                                                onClick={() => handleSaveClose(trade.id, trade.symbol, trade.entry_price, trade.action)}
+                                                onClick={() => handleSaveClose(trade.id, trade.symbol)}
                                                 className="text-xs bg-amber-500/20 text-amber-400 px-3 py-1.5 rounded-lg hover:bg-amber-500/30 transition-colors"
                                             >
                                                 Close
@@ -163,10 +177,10 @@ export default function ActualTradeComparisonCard({
                                             <p className="text-[10px] uppercase tracking-wider text-slate-500">Entry</p>
                                             <p className="font-mono text-slate-300">{trade.entry_price.toFixed(2)}</p>
                                         </div>
-                                        {displayPrice && (
+                                        {currentPrice !== null && (
                                             <div>
                                                 <p className="text-[10px] uppercase tracking-wider text-slate-500">Current</p>
-                                                <p className="font-mono text-slate-300">{displayPrice.toFixed(2)}</p>
+                                                <p className="font-mono text-slate-300">{currentPrice.toFixed(2)}</p>
                                             </div>
                                         )}
                                         <div>
@@ -201,7 +215,7 @@ export default function ActualTradeComparisonCard({
                                                                 <span className={`font-mono font-bold ${snap.leveraged_return_pct >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                                                                     {snap.leveraged_return_pct >= 0 ? "+" : ""}{snap.leveraged_return_pct.toFixed(2)}%
                                                                 </span>
-                                                                {snap.paper_pnl_usd && (
+                                                                {snap.paper_pnl_usd !== undefined && (
                                                                     <span className={`font-mono font-bold ${snap.paper_pnl_usd >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                                                                         {formatSignedUsd(snap.paper_pnl_usd)}
                                                                     </span>

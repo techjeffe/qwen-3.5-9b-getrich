@@ -1,9 +1,8 @@
 "use client";
 
 import { Recommendation, PnLTrade } from "@/lib/types/analysis";
-import { Prices } from "@/lib/types/analysis";
 import { X, ArrowRight, AlertTriangle } from "lucide-react";
-import { UNDERLYING_PRICE_MAP, EXECUTION_SYMBOLS_BY_UNDERLYING } from "@/lib/constants/analysis";
+import { EXECUTION_SYMBOLS_BY_UNDERLYING } from "@/lib/constants/analysis";
 
 interface TradeExecutionModalProps {
     recommendation: Recommendation;
@@ -62,7 +61,7 @@ export default function TradeExecutionModal({
                 </div>
 
                 {/* Body */}
-                <form onSubmit={handleSave} className="px-6 py-5 space-y-4">
+                <form id="trade-execution-form" onSubmit={handleSave} className="px-6 py-5 space-y-4">
                     {/* Recommendation details */}
                     <div className="rounded-xl border border-slate-700/40 bg-slate-900/50 p-4">
                         <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-2">Recommendation</p>
@@ -165,11 +164,6 @@ export default function TradeExecutionModal({
                         type="submit"
                         form="trade-execution-form"
                         className="flex items-center gap-2 px-5 py-2 text-sm font-bold text-white bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors"
-                        onClick={(e) => {
-                            // Trigger the form submit
-                            const form = e.currentTarget.closest("form");
-                            if (form) form.requestSubmit();
-                        }}
                     >
                         <ArrowRight size={14} />
                         Execute Trade

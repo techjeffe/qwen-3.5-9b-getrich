@@ -1,6 +1,7 @@
 // ─── Formatting & Display Utilities ─────────────────────────────────────────
 
 import { AnalysisResult, AnalysisSnapshotItem, FeedItem, SentimentEntry } from "@/lib/types/analysis";
+import { formatTs as formatTimestamp, formatTime as formatClockTime } from "@/lib/timezone";
 
 export function formatSnapshotLabel(snapshot: AnalysisSnapshotItem, timeZone: string) {
     const timestamp = snapshot.timestamp ? (typeof snapshot.timestamp === "string" ? formatTs(snapshot.timestamp, timeZone) : "Unknown time") : "Unknown time";
@@ -23,10 +24,19 @@ export function compactReasoning(reasoning?: string | null) {
 }
 
 export function formatTs(timestamp: string | number | Date, timeZone: string): string {
+    if (typeof timestamp === "string") {
+        return formatTimestamp(timestamp, timeZone, {
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+            year: undefined,
+        });
+    }
+
     try {
-        const date = typeof timestamp === "string" ? new Date(timestamp) :
-            typeof timestamp === "number" ? new Date(timestamp * 1000) :
-                timestamp;
+        const date = typeof timestamp === "number" ? new Date(timestamp * 1000) : timestamp;
         if (isNaN(date.getTime())) return "Unknown time";
         return date.toLocaleString("en-US", {
             timeZone: timeZone || undefined,
@@ -42,10 +52,13 @@ export function formatTs(timestamp: string | number | Date, timeZone: string): s
 }
 
 export function formatTime(timestamp: string | number | Date, timeZone: string): string {
+    if (typeof timestamp === "string") {
+        const formatted = formatClockTime(timestamp, timeZone);
+        return formatted === "—" ? "" : formatted;
+    }
+
     try {
-        const date = typeof timestamp === "string" ? new Date(timestamp) :
-            typeof timestamp === "number" ? new Date(timestamp * 1000) :
-                timestamp;
+        const date = typeof timestamp === "number" ? new Date(timestamp * 1000) : timestamp;
         if (isNaN(date.getTime())) return "";
         return date.toLocaleString("en-US", {
             timeZone: timeZone || undefined,
