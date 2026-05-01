@@ -217,7 +217,7 @@ SYMBOL_RELEVANCE_TERMS: Dict[str, List[str]] = {
         "opec cut", "opec quota", "output cut", "production cut",
         "russia oil", "iran oil", "iranian oil", "venezuela oil",
     ],
-    "BITO": [
+    "IBIT": [
         "bitcoin", "btc", "crypto", "cryptocurrency", "blockchain",
         "stablecoin", "defi", "nft", "altcoin", "ethereum", "eth",
         "sec crypto", "cftc crypto", "crypto regulation", "crypto etf",
@@ -384,7 +384,7 @@ async def get_market_prices(
     config = get_or_create_app_config(db)
     requested_symbols = [
         str(symbol).upper().strip()
-        for symbol in (symbols.split(",") if symbols else (config.tracked_symbols or ["USO", "BITO", "QQQ", "SPY"]))
+        for symbol in (symbols.split(",") if symbols else (config.tracked_symbols or ["USO", "IBIT", "QQQ", "SPY"]))
         if str(symbol).strip()
     ]
     now = time.monotonic()
@@ -1749,7 +1749,7 @@ async def _ingest_data(
 
 
 def _apply_request_defaults(request: AnalysisRequest, config: Any) -> AnalysisRequest:
-    symbols = request.symbols or config.tracked_symbols or ["USO", "BITO", "QQQ", "SPY"]
+    symbols = request.symbols or config.tracked_symbols or ["USO", "IBIT", "QQQ", "SPY"]
     return AnalysisRequest(
         symbols=symbols,
         max_posts=request.max_posts or config.max_posts,

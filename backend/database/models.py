@@ -318,7 +318,7 @@ class AppConfig(Base):
 
     auto_run_enabled = Column(Boolean, nullable=False, default=True)
     auto_run_interval_minutes = Column(Integer, nullable=False, default=30)
-    tracked_symbols = Column(JSON, nullable=False, default=["USO", "BITO", "QQQ", "SPY"])
+    tracked_symbols = Column(JSON, nullable=False, default=["USO", "IBIT", "QQQ", "SPY"])
     custom_symbols = Column(JSON, nullable=False, default=[])
     max_posts = Column(Integer, nullable=False, default=50)
     include_backtest = Column(Boolean, nullable=False, default=True)

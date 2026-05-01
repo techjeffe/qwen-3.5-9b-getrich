@@ -23,10 +23,15 @@ INSTRUMENT_SPECS: Dict[str, Dict[str, Any]] = {
         "bull": {1: "USO", 2: "UCO"},
         "bear": {1: "USO", 2: "SCO"},
     },
+    "IBIT": {
+        "max_leverage": 2,
+        "bull": {1: "IBIT", 2: "BITU"},
+        "bear": {1: "IBIT", 2: "SBIT"},
+    },
     "BITO": {
         "max_leverage": 2,
-        "bull": {1: "BITO", 2: "BITU"},
-        "bear": {1: "BITO", 2: "SBIT"},
+        "bull": {1: "IBIT", 2: "BITU"},
+        "bear": {1: "IBIT", 2: "SBIT"},
     },
 }
 

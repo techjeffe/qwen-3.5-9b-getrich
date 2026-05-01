@@ -552,9 +552,9 @@ type AnalysisSnapshotItem = {
 const DEFAULT_APP_CONFIG: AppConfig = {
     auto_run_enabled: true,
     auto_run_interval_minutes: 30,
-    tracked_symbols: ["USO", "BITO", "QQQ", "SPY"],
+    tracked_symbols: ["USO", "IBIT", "QQQ", "SPY"],
     custom_symbols: [],
-    default_symbols: ["USO", "BITO", "QQQ", "SPY"],
+    default_symbols: ["USO", "IBIT", "QQQ", "SPY"],
     max_custom_symbols: 3,
     max_posts: 50,
     lookback_days: 14,
@@ -571,7 +571,7 @@ const DEFAULT_APP_CONFIG: AppConfig = {
     last_analysis_request_id: null,
     seconds_until_next_auto_run: 0,
     can_auto_run_now: true,
-    supported_symbols: ["USO", "BITO", "QQQ", "SPY"],
+    supported_symbols: ["USO", "IBIT", "QQQ", "SPY"],
     estimated_analysis_seconds: 82,
     recent_analysis_seconds: [],
     extraction_model: "",
@@ -2326,14 +2326,14 @@ const UNDERLYING_PRICE_MAP: Record<string, string> = {
     QLD: "QQQ", QID: "QQQ", TQQQ: "QQQ", SQQQ: "QQQ",
     SSO: "SPY", SDS: "SPY", SPXL: "SPY", SPXS: "SPY",
     UCO: "USO", SCO: "USO",
-    BITU: "BITO", SBIT: "BITO",
+    BITU: "IBIT", SBIT: "IBIT",
 };
 
 const EXECUTION_SYMBOLS_BY_UNDERLYING: Record<string, string[]> = {
     QQQ: ["QQQ", "QLD", "QID", "TQQQ", "SQQQ"],
     SPY: ["SPY", "SSO", "SDS", "SPXL", "SPXS"],
     USO: ["USO", "UCO", "SCO"],
-    BITO: ["BITO", "BITU", "SBIT"],
+    IBIT: ["IBIT", "BITU", "SBIT"],
 };
 
 function livePnl(action: "BUY" | "SELL", entryPrice: number, currentPrice: number): number {

@@ -26,7 +26,7 @@ TICKER_PROXY_MAP: dict[str, list[str]] = {
         "russia oil", "iran oil", "iranian oil", "venezuela oil", "opec cut",
         "output cut", "production cut",
     ],
-    "BITO": [
+    "IBIT": [
         "bitcoin", "BTC", "crypto", "cryptocurrency", "blockchain",
         "satoshi", "halving", "digital asset", "ethereum", "ETH",
         "stablecoin", "DeFi", "NFT", "altcoin", "mining",

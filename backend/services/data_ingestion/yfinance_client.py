@@ -40,7 +40,7 @@ class PriceClient:
     SUPPORTED_SYMBOLS = {
         "SPY", "SSO", "SDS", "SPXL", "SPXS",
         "USO", "UCO", "SCO",
-        "BITO", "BITU", "SBIT",
+        "IBIT", "BITO", "BITU", "SBIT",
         "QQQ", "QLD", "QID", "TQQQ", "SQQQ",
         "UNG",
     }

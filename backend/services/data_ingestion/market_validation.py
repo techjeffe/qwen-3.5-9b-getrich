@@ -76,8 +76,8 @@ class MarketValidationClient:
         for symbol in normalized_symbols:
             if symbol == "USO":
                 bundle[symbol] = self._build_uso_validation()
-            elif symbol == "BITO":
-                bundle[symbol] = self._build_bito_validation()
+            elif symbol in {"BITO", "IBIT"}:
+                bundle[symbol] = self._build_bito_validation(symbol)
             elif symbol == "QQQ":
                 bundle[symbol] = self._build_qqq_validation()
             elif symbol == "SPY":
@@ -129,12 +129,12 @@ class MarketValidationClient:
 
         return self._finalize_symbol_payload("USO", metrics)
 
-    def _build_bito_validation(self) -> Dict[str, Any]:
+    def _build_bito_validation(self, symbol: str = "IBIT") -> Dict[str, Any]:
         metrics = [
             self._safe_fred_metric("m2_money_stock", "M2SL", "US M2", "billions_usd"),
             self._safe_fred_metric("real_m2_money_stock", "M2REAL", "Real M2", "billions_1982_84_usd"),
         ]
-        return self._finalize_symbol_payload("BITO", metrics)
+        return self._finalize_symbol_payload(symbol, metrics)
 
     def _build_qqq_validation(self) -> Dict[str, Any]:
         metrics = [
@@ -389,7 +389,7 @@ class MarketValidationClient:
         metric_map = {metric["name"]: metric for metric in metrics}
         if symbol == "USO":
             return self._build_uso_summary(metric_map)
-        if symbol == "BITO":
+        if symbol in {"BITO", "IBIT"}:
             return self._build_bito_summary(metric_map)
         if symbol == "QQQ":
             return self._build_qqq_summary(metric_map)

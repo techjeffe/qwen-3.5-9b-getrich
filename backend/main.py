@@ -90,7 +90,7 @@ async def _data_ingestion_scheduler_loop():
             quotes_failed = []
             try:
                 config = get_or_create_app_config(db)
-                symbols = config.tracked_symbols or ["USO", "BITO", "QQQ", "SPY"]
+                symbols = config.tracked_symbols or ["USO", "IBIT", "QQQ", "SPY"]
 
                 # Fetch real-time quotes for tracked symbols
                 for symbol in symbols:
@@ -369,7 +369,7 @@ async def health_check():
             "last_status": last_analysis.get("status"),
             "last_error": last_analysis.get("error"),
             "recent_run_count": recent_run_count,
-            "tracked_symbols": config_payload.get("tracked_symbols") or ["USO", "BITO", "QQQ", "SPY"],
+            "tracked_symbols": config_payload.get("tracked_symbols") or ["USO", "IBIT", "QQQ", "SPY"],
             "auto_run_enabled": config_payload.get("auto_run_enabled"),
             "seconds_until_next_auto_run": config_payload.get("seconds_until_next_auto_run"),
         },

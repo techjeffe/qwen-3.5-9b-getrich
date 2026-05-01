@@ -117,21 +117,22 @@ SYMBOL_RESEARCH_PROFILES: Dict[str, Dict[str, List[str] | str]] = {
         ],
         "keywords": ["oil", "crude", "opec", "refinery", "wti", "brent", "supply"],
     },
-    "BITO": {
-        "company": "Bitcoin Strategy ETF",
+    "IBIT": {
+        "company": "iShares Bitcoin Trust",
         "queries": [
-            '"BITO" bitcoin etf regulation',
+            '"IBIT" bitcoin etf regulation',
             '"bitcoin" etf regulation liquidity',
-            '"BITO" site:reuters.com OR site:cnbc.com',
+            '"IBIT" site:reuters.com OR site:cnbc.com',
         ],
-        "keywords": ["bitcoin", "btc", "etf", "crypto", "regulation", "liquidity", "mining"],
+        "keywords": ["bitcoin", "btc", "ibit", "etf", "crypto", "regulation", "liquidity", "mining"],
     },
 }
 _cache: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
 
 
 def _normalize_symbol(symbol: str) -> str:
-    return str(symbol or "").upper().strip()
+    normalized = str(symbol or "").upper().strip()
+    return "IBIT" if normalized == "BITO" else normalized
 
 
 def _parse_pubdate(value: str) -> str:
