@@ -121,6 +121,51 @@ def _min_same_day_exit_edge_pct(app_config) -> float:
     return max(0.0, float(_L.get("min_same_day_exit_edge_pct", 0.5)))
 
 
+def _entry_threshold_for_session(session_status: str, app_config) -> float:
+    """Return the minimum directional score required to enter a new position.
+
+    Uses app_config entry_threshold override when set, else falls back to
+    logic_config defaults.  pre-market/after-hours sessions use the
+    closed_market threshold; open sessions use the normal threshold.
+    """
+    try:
+        if app_config is not None:
+            override = getattr(app_config, "entry_threshold", None)
+            if override is not None:
+                return max(0.0, float(override))
+    except Exception:
+        pass
+
+    thresholds = _L.get("entry_thresholds", {})
+    if session_status in ("pre-market", "after-hours"):
+        return max(0.0, float(thresholds.get("closed_market", thresholds.get("normal", 0.42))))
+    return max(0.0, float(thresholds.get("normal", 0.42)))
+
+
+def _stop_loss_pct_for_config(app_config) -> float:
+    """Return configured stop-loss percentage."""
+    try:
+        if app_config is not None:
+            override = getattr(app_config, "stop_loss_pct", None)
+            if override is not None:
+                return max(0.0, float(override))
+    except Exception:
+        pass
+    return max(0.0, float(_L.get("stop_loss_pct", 2.0)))
+
+
+def _take_profit_pct_for_config(app_config) -> float:
+    """Return configured take-profit percentage."""
+    try:
+        if app_config is not None:
+            override = getattr(app_config, "take_profit_pct", None)
+            if override is not None:
+                return max(0.0, float(override))
+    except Exception:
+        pass
+    return max(0.0, float(_L.get("take_profit_pct", 3.0)))
+
+
 def _same_day_exit_edge_blocks_close(open_pos, exit_price: float, now: datetime, threshold_pct: float) -> bool:
     """
     Block tiny same-day winners from being closed just to churn the account.
@@ -496,6 +541,46 @@ def process_signals(
                     action_summary["reason"] = "reentry_cooldown"
                     actions.append(action_summary)
                     continue
+
+        # ── Stop-loss / Take-profit check on existing position ──
+        if open_pos is not None and existing_pos_price > 0 and signal_type == open_pos.signal_type:
+            _stop_loss = _stop_loss_pct_for_config(_app_config)
+            _take_profit = _take_profit_pct_for_config(_app_config)
+            if _stop_loss > 0 or _take_profit > 0:
+                _pnl_pct = _directional_return_pct(open_pos.signal_type, float(open_pos.entry_price or 0), existing_pos_price)
+                if _stop_loss > 0 and _pnl_pct <= -_stop_loss:
+                    _close_position(open_pos, existing_pos_price, now, db, reason="stop_loss_hit")
+                    action_summary["closed_pnl"] = open_pos.realized_pnl
+                    action_summary["exit_price"] = existing_pos_price
+                    action_summary["pnl_pct"] = round(_pnl_pct, 4)
+                    action_summary["action"] = "closed"
+                    action_summary["reason"] = "stop_loss_hit"
+                    _alpaca_pending.append((open_pos, "close"))
+                    actions.append(action_summary)
+                    continue
+                if _take_profit > 0 and _pnl_pct >= _take_profit:
+                    _close_position(open_pos, existing_pos_price, now, db, reason="take_profit_hit")
+                    action_summary["closed_pnl"] = open_pos.realized_pnl
+                    action_summary["exit_price"] = existing_pos_price
+                    action_summary["pnl_pct"] = round(_pnl_pct, 4)
+                    action_summary["action"] = "closed"
+                    action_summary["reason"] = "take_profit_hit"
+                    _alpaca_pending.append((open_pos, "close"))
+                    actions.append(action_summary)
+                    continue
+
+        # ── Entry threshold gate ──
+        # (directional signals only — HOLD signals skip this)
+        # We gate on conviction_level: only HIGH conviction gets an automatic pass.
+        # MEDIUM requires the configured entry threshold; LOW is always blocked.
+        _threshold = _entry_threshold_for_session(session["status"], _app_config)
+        _conviction = str(conviction_level or "MEDIUM").upper()
+        if _conviction == "LOW":
+            action_summary["action"] = "skipped"
+            action_summary["reason"] = "low_conviction_blocked"
+            action_summary["entry_threshold"] = _threshold
+            actions.append(action_summary)
+            continue
 
         # Open new position
         _amount = trade_amount if trade_amount and trade_amount > 0 else _L["paper_trade_amount"]

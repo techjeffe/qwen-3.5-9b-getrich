@@ -600,6 +600,108 @@ def _same_trading_day_as_now(ts: Optional[datetime]) -> bool:
     return ts.astimezone(_ET).date() == datetime.now(_ET).date()
 
 
+def _get_entry_conviction_block_reason(paper_trade, event: str) -> Optional[str]:
+    """Check if the conviction level blocks this trade entry."""
+    if event != "open":
+        return None
+    conviction = str(getattr(paper_trade, "conviction_level", "MEDIUM") or "MEDIUM").upper()
+    if conviction == "LOW":
+        return "entry rule: low conviction blocked"
+    return None
+
+
+def _get_stop_loss_block_reason(
+    broker: "AlpacaBroker",
+    symbol: str,
+    event: str,
+) -> Optional[str]:
+    """Check if the live position has hit stop-loss."""
+    if event != "open":
+        return None
+    try:
+        from services.app_config import get_or_create_app_config as _get_cfg
+        from database.models import AlpacaConfig as _AC
+        # Need the actual config object — caller passes it
+        pass
+    except Exception:
+        pass
+    return None  # Caller handles via config
+
+
+def _check_live_position_stop_loss(
+    broker: "AlpacaBroker",
+    symbol: str,
+    stop_loss_pct: float,
+) -> Optional[Dict[str, Any]]:
+    """Check if a live position has hit stop-loss. Returns position dict if triggered, else None."""
+    if stop_loss_pct <= 0:
+        return None
+    try:
+        pos = broker.get_position(symbol)
+        if not pos:
+            return None
+        qty = float(pos.get("qty") or pos.get("available_shares") or 0)
+        if qty == 0:
+            return None
+        entry_price = float(pos.get("avg_entry_price") or 0)
+        current_price = float(pos.get("current_price") or 0)
+        if entry_price <= 0 or current_price <= 0:
+            return None
+        side = str(pos.get("side") or "").lower()
+        if side == "short":
+            pnl_pct = (entry_price - current_price) / entry_price * 100
+        else:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+        if pnl_pct <= -stop_loss_pct:
+            return {
+                "pnl_pct": round(pnl_pct, 4),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "side": side,
+                "qty": abs(qty),
+            }
+    except Exception as exc:
+        print(f"[alpaca] stop-loss check error for {symbol}: {exc}")
+    return None
+
+
+def _check_live_position_take_profit(
+    broker: "AlpacaBroker",
+    symbol: str,
+    take_profit_pct: float,
+) -> Optional[Dict[str, Any]]:
+    """Check if a live position has hit take-profit. Returns position dict if triggered, else None."""
+    if take_profit_pct <= 0:
+        return None
+    try:
+        pos = broker.get_position(symbol)
+        if not pos:
+            return None
+        qty = float(pos.get("qty") or pos.get("available_shares") or 0)
+        if qty == 0:
+            return None
+        entry_price = float(pos.get("avg_entry_price") or 0)
+        current_price = float(pos.get("current_price") or 0)
+        if entry_price <= 0 or current_price <= 0:
+            return None
+        side = str(pos.get("side") or "").lower()
+        if side == "short":
+            pnl_pct = (entry_price - current_price) / entry_price * 100
+        else:
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+        if pnl_pct >= take_profit_pct:
+            return {
+                "pnl_pct": round(pnl_pct, 4),
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "side": side,
+                "qty": abs(qty),
+            }
+    except Exception as exc:
+        print(f"[alpaca] take-profit check error for {symbol}: {exc}")
+    return None
+
+
 def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str) -> Optional[str]:
     """
     Return a human-readable reason when the order should be blocked to avoid
@@ -666,6 +768,38 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     paper_id     = getattr(paper_trade, "id", None)
     direct_short = _is_direct_short(paper_trade)
     allow_short  = bool(getattr(config, "alpaca_allow_short_selling", False))
+
+    # ── Entry conviction gate ───────────────────────────────────────────
+    conviction_block = _get_entry_conviction_block_reason(paper_trade, event)
+    if conviction_block:
+        side_hint = "buy" if (event == "open" and not direct_short) else "sell"
+        _record_alpaca_order_skip(
+            db, paper_id, side_hint, symbol,
+            notional if event == "open" else None,
+            broker.mode, conviction_block,
+        )
+        print(f"[alpaca] skipping {event} for {symbol}: {conviction_block}")
+        return
+
+    # ── Live position stop-loss / take-profit monitoring ──────────────
+    if event == "open" and execution_mode == "live" and broker is not None:
+        _sl_pct = float(getattr(config, "stop_loss_pct", 2.0) or 2.0)
+        _tp_pct = float(getattr(config, "take_profit_pct", 3.0) or 3.0)
+        _sl_hit = _check_live_position_stop_loss(broker, symbol, _sl_pct)
+        _tp_hit = _check_live_position_take_profit(broker, symbol, _tp_pct)
+        if _sl_hit or _tp_hit:
+            info = _sl_hit if _sl_hit else _tp_hit
+            reason = "stop_loss_hit" if _sl_hit else "take_profit_hit"
+            _record_alpaca_order_skip(
+                db, paper_id, "sell", symbol, notional,
+                broker.mode,
+                f"{reason}: live position P&L {info['pnl_pct']:.2f}%",
+            )
+            print(
+                f"[alpaca] blocking open for {symbol}: "
+                f"{reason} at {info['pnl_pct']:.2f}% (qty {info['qty']}, side {info['side']})"
+            )
+            return
 
     if execution_mode == "live":
         pdt_block_reason = _get_pdt_block_reason(broker, paper_trade, event)

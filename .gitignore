@@ -28,6 +28,7 @@ backend/node_modules/
 *.local
 
 # Virtual environments
+.venv/
 venv/
 venvbk/
 
