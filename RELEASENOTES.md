@@ -1,3 +1,68 @@
+# Release Notes — May 1, 2026
+
+## Dashboard Deconstruction and Trading Enforcement Hardening
+
+This release broke the monolithic `frontend/src/app/page.tsx` dashboard into smaller shared modules, tightened live/paper trading enforcement on the backend, and then shipped a quick follow-up fix for the UI regressions that surfaced after the refactor.
+
+**Dashboard deconstruction:**
+
+- Split the oversized dashboard page into focused reusable components including `SignalHero`, `AnalysisStatusCard`, `ArticleCard`, `PullHistoryCard`, `ModelComparePanel`, `DebugPanel`, `TradeExecutionModal`, `TradeCard`, and `ActualTradeComparisonCard`
+- Moved shared dashboard contracts into `frontend/src/lib/types/analysis.ts` so component props and analysis payload shapes are centralized instead of being redeclared inline in `page.tsx`
+- Moved shared constants into `frontend/src/lib/constants/analysis.ts`, including stage labels, local-storage keys, signal rules, and execution/underlying symbol maps
+- Moved formatting, timing, and comparison helpers into `frontend/src/lib/utils/*` so the page now composes behavior instead of embedding hundreds of lines of local helper code
+- Added a lightweight shared `GlassCard` wrapper so the extracted cards keep the same visual treatment without duplicating shell markup
+
+**Backend trading enforcement:**
+
+- Added `paper_trading_validator.py` to centralize paper-trading checks instead of scattering those guardrails through the execution path
+- Hardened live Alpaca enforcement in `alpaca_broker.py` and paper-trading execution in `paper_trading.py` so trading-cap and validation behavior is handled more consistently
+- Added dedicated backend coverage with `test_alpaca_broker_guards.py` and `test_paper_trading_enforcement.py` to lock down the new limit/validation paths
+
+**Operational cleanup:**
+
+- Added `.venv/` to `.gitignore` so local virtual environments stay out of the repo
+
+---
+
+# Release Notes — April 30, 2026
+
+## Live Trading Guardrails and Bitcoin Proxy Update
+
+This release tightened the real-money execution path, reduced same-day churn in the strategy layer, and switched future Bitcoin default coverage from `BITO` to `IBIT`.
+
+**Alpaca per-symbol cap fix:**
+
+- Live per-position caps now account for what Alpaca already holds in that symbol instead of only capping each new order in isolation
+- Repeated same-direction confirmations no longer stack past the configured USD cap when live exposure is already full
+- When the cap is already reached, the order is skipped and recorded in `alpaca_orders` with `status="skipped"` and an explicit reason
+- Extended-hours opens now use the reduced remaining-capacity quantity rather than the original uncapped share count
+
+**Pattern day trading protection:**
+
+- Live execution now checks Alpaca account fields including equity, `daytrade_count`, and PDT flag status before sending orders
+- For sub-$25k live accounts, the broker path can skip fresh opens and same-day closes when they would create PDT risk
+- PDT-related skips are written to `alpaca_orders` so there is always an audit trail for why the order was not routed
+
+**Trading page PDT visibility:**
+
+- The `/trading` page now shows a live PDT status card with equity, `daytrade_count`, PDT flag state, and day-trading buying power
+- The card surfaces a simple state badge (`clear`, `watch`, `warning`, `blocked`) so PDT risk is visible before the bot tries to trade
+
+**Same-day churn filter:**
+
+- Added a new trading-logic control: `min_same_day_exit_edge_pct`
+- Default is `0.5%`, configurable from Admin, or inherited from `logic_config.json` when the field is left blank
+- Same-day winners below that threshold are held instead of being closed on a flip, ticker/leverage change, or no-recommendation churn
+- Loss-cutting is still allowed, so the filter only blocks tiny profitable churn, not defensive exits
+
+**Bitcoin default proxy switched to `IBIT`:**
+
+- Built-in default tracked symbols now use `IBIT` instead of `BITO`
+- Legacy `BITO` inputs are normalized to `IBIT` for future runs so existing history remains readable while new Bitcoin trades use the new default
+- Bitcoin validation, keyword maps, execution mapping, and UI defaults were updated to treat `IBIT` as the primary built-in symbol
+
+---
+
 # Release Notes — April 27, 2026
 
 ## Alpaca Live Brokerage Trading

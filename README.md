@@ -1,8 +1,8 @@
 # Sentiment Trading Alpha
 
-Geopolitical sentiment pipeline that uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, BITO, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
+Geopolitical sentiment pipeline that uses a DB-backed producer/consumer ingestion queue: a background worker polls RSS feeds, stores cleaned article text for later analysis, and the main batch analysis consumes pending queued articles, overlays structured FRED and EIA validation data, runs symbol-specific local LLM specialist analysis, and generates broker-friendly BUY/SELL trade recommendations for USO, IBIT, QQQ, and SPY using actual tradable execution tickers when leverage is applied. Auto-runs every 30 minutes.
 
-Live brokerage execution via Alpaca is now supported alongside the paper simulation. Let me be very clear - this is Alpha--- functionality. Do not trade with real money using this. When Alpaca keys are configured and live trading is enabled from Admin, every paper trade open/close is mirrored to Alpaca in real time with configurable guardrails (position caps, daily loss limits, consecutive-loss circuit breaker, extended-hours handling). All order attempts are written to an audit log regardless of outcome.
+Live brokerage execution via Alpaca is now supported alongside the paper simulation. Let me be very clear - this is Alpha--- functionality. Do not trade with real money using this. When Alpaca keys are configured and live trading is enabled from Admin, every paper trade open/close is mirrored to Alpaca in real time with configurable guardrails (per-symbol caps against existing live exposure, PDT protection for sub-$25k accounts, daily loss limits, consecutive-loss circuit breaker, extended-hours handling). All order attempts are written to an audit log regardless of outcome.
 
 This app is untested in the real world, not financial advice, and for amusement purposes only.
 
@@ -226,6 +226,8 @@ Alpaca live trading can be configured from Admin (Live Trading section):
 - enter Alpaca API key + secret key and choose paper or live mode; stored in the OS keychain
 - test the connection before enabling real orders
 - configure guardrails: max position size, max total exposure, daily loss limit, consecutive-loss circuit breaker, order type (market/limit), limit slippage %, allow short selling
+- live opens now honor the current same-symbol exposure before submitting a new order, so repeated confirmations do not stack past the configured per-position cap
+- sub-$25k live accounts are protected from pattern day trading churn: the broker path can skip fresh opens and same-day closes when Alpaca reports PDT risk
 - enable live trading with a "type LIVE to confirm" modal; one-click disable at any time
 - the circuit breaker auto-disables live trading if a limit is breached between runs
 
@@ -244,7 +246,7 @@ Or with a specific model:
 python test_stage1.py llama3.2:latest
 ```
 
-The test covers both built-in symbols (USO/BITO/QQQ/SPY, which use a static keyword map and require no LLM call) and custom symbols (NVDA/NOW, which call the LLM once to generate proxy keywords). It prints:
+The test covers both built-in symbols (USO/IBIT/QQQ/SPY, which use a static keyword map and require no LLM call) and custom symbols (NVDA/NOW, which call the LLM once to generate proxy keywords). It prints:
 
 - Which keyword source was used per symbol: `(static)` or `(LLM-generated)`
 - The generated keywords for each custom symbol
@@ -317,6 +319,7 @@ The migration script will detect any missing columns and add them with safe defa
 | `best_price_seen` | `paper_trades` | `NULL` | High/low-water mark used to update trailing stop each run |
 | `trail_on_window_expiry` | `app_config` | `true` | Transition to trailing stop instead of flat close when holding window expires |
 | `reentry_cooldown_minutes` | `app_config` | `NULL` | Block same-direction re-entry within N minutes of a close (falls back to `logic_config.json` default of 120) |
+| `min_same_day_exit_edge_pct` | `app_config` | `NULL` | Minimum profit edge required before closing a same-day winner (falls back to `logic_config.json` default of 0.5%) |
 | `alpaca_live_trading_enabled` | `app_config` | `false` | Master kill switch for Alpaca real-money order routing |
 | `alpaca_allow_short_selling` | `app_config` | `false` | Allow direct short sells for symbols with no inverse ETF mapping |
 | `alpaca_max_position_usd` | `app_config` | `NULL` | Per-trade notional cap in USD (unlimited when NULL) |
@@ -349,7 +352,7 @@ Backend:
 - Frozen analysis snapshot persistence for model-to-model replay in Advanced Mode
 - Persistent admin configuration stored in the local database so saved symbols, feeds, prompt overrides, and timezone survive rebuilds/restarts
 - Paper trading hook wired into every analysis save — simulates $100 per signal, manages position lifecycle, stores results in a dedicated `paper_trades` table independent of all other analysis tables
-- Alpaca brokerage integration — every paper trade open/close is optionally mirrored to Alpaca in real time; extended-hours orders use qty+limit automatically; a circuit breaker auto-disables live trading when exposure/loss limits are hit; all order outcomes written to `alpaca_orders` for audit
+- Alpaca brokerage integration — every paper trade open/close is optionally mirrored to Alpaca in real time; extended-hours orders use qty+limit automatically; same-symbol live exposure is checked before new opens; PDT-risk opens/closes can be skipped on sub-$25k accounts; a circuit breaker auto-disables live trading when exposure/loss limits are hit; all order outcomes written to `alpaca_orders` for audit
 - Analysis lease/lock coordination in `app_config` so scheduled runs and urgent off-cycle runs do not process the same queued articles in parallel
 
 Model flow:
@@ -358,11 +361,11 @@ Model flow:
 - High-impact macro headlines can trigger a Fast Lane off-cycle analysis run for the affected symbols
 - Each symbol gets its own specialist prompt and its own narrowed validation context
 - `USO` uses `EIA` validation
-- `BITO`, `QQQ`, and `SPY` use `FRED` validation
+- `IBIT`, `QQQ`, and `SPY` use `FRED` validation
 - The dashboard polls Ollama and shows the active served model instead of assuming a fixed model name
 - Saved analysis snapshots can be replayed against a different served model without re-downloading the articles, price context, or validation context
 - A configurable two-stage pipeline separates entity extraction (Stage 1) from financial reasoning (Stage 2), optionally using different models for each stage
-- Stage 1 uses keyword matching to filter articles: built-in symbols (USO/BITO/QQQ/SPY) use a static proxy term map; custom symbols (e.g. NVDA, NOW) call the LLM once to generate 15-20 proxy keywords, cache them for the session, then use pure keyword matching — no per-article LLM calls
+- Stage 1 uses keyword matching to filter articles: built-in symbols (USO/IBIT/QQQ/SPY) use a static proxy term map; custom symbols (e.g. NVDA, NOW) call the LLM once to generate 15-20 proxy keywords, cache them for the session, then use pure keyword matching — no per-article LLM calls
 - Stage 2 receives only the relevant articles plus the Stage 1 proxy-term context and an exposure quality hint (DIRECT / INDIRECT / BROAD) derived from the keyword match ratio, so specialists calibrate confidence when articles matched weakly
 - The specialist JSON schema appears before the news text in each prompt so the model frames its reading with the full output contract first; cross-symbol prices and basket-level signal rules are excluded from the specialist path
 - Pipeline depth is set per-run: Light uses one model for both stages, Normal uses two-stage only when both models are explicitly configured, Detailed always runs the full two-stage pipeline
@@ -393,9 +396,11 @@ Model flow:
 - **Trailing stop on HOLD** — a HOLD signal on an open position sets a tightened trailing stop instead of force-closing; stop tracks `best_price_seen` and closes only if price crosses; thesis re-confirmation clears the trailing stop
 - **Trail on window expiry** — when a conviction holding window expires, the position transitions to trailing stop mode instead of closing flat; configurable per-run via Admin (`trail_on_window_expiry`)
 - **Re-entry cooldown** — same-direction re-entry in the same symbol is blocked for a configurable window (default 120 minutes) after a close, preventing same-direction churn on choppy signals; configurable in Admin (`reentry_cooldown_minutes`)
+- **Minimum same-day exit edge** — same-day winners below a configurable profit threshold (default 0.5%) are held instead of being closed on a flip, ticker/leverage change, or no-recommendation churn; configurable in Admin (`min_same_day_exit_edge_pct`)
 - **Alpaca live trading** — paper trade lifecycle events (open, close, window-expired close) are optionally forwarded to Alpaca as real orders; paper and live execution run in parallel so the paper record is always preserved; close orders are guarded against sending if no successful open is on record (prevents stray orders when an open was skipped or rejected)
 - **Alpaca order log** — the `/trading` page shows a live order log beneath the paper tables, with side badges, fill price, mode (PAPER/LIVE), and status; the header badge and title change to reflect when live trading is active
-- **Alpaca guardrails** — configurable per-position cap, total exposure cap, daily loss limit, consecutive-loss circuit breaker, order type (market/limit), and limit slippage %; any breach auto-disables live trading and records the reason
+- **Alpaca guardrails** — configurable per-position cap, total exposure cap, daily loss limit, consecutive-loss circuit breaker, order type (market/limit), and limit slippage %; new opens respect existing live same-symbol exposure, PDT-risk orders can be skipped on sub-$25k accounts, and any breach auto-disables live trading and records the reason
+- **Trading page PDT banner** — the live trading view now surfaces equity, `daytrade_count`, PDT flag status, and day-trading buying power with a clear/warn/blocked state badge
 - **Conviction window reset** — when a re-run confirms the same direction, the holding window resets to a full window; same/upgraded trade type resets fully; downgraded type shrinks proportionally; capped by `max_holding_minutes` per type
 - **Corrected SHORT bias** — three compounding factors that systematically over-produced SHORT signals have been addressed: `unconfirmed_bluster_penalty` lowered, `unconfirmed_policy_multiplier` raised, and SHORT score changed to a weighted blend (40% bluster / 60% policy) so pure rhetoric no longer produces full-magnitude SHORT signals
 - **Dynamic materiality gate** — thesis-flip guard uses a rolling per-symbol article baseline (last 20 runs, mean ± 1 stddev) instead of a fixed count; falls back to fixed threshold until 5 runs of history exist
@@ -430,14 +435,14 @@ The Admin page is organized around the things users change most often first.
    - Light: single "Analysis Model" (same model for Stage 1 and Stage 2)
    - Normal: optional Stage 1 and Stage 2 selectors; single-stage if only one is set
    - Detailed: both models required; amber warning shown until both are selected
-3. **Trading Logic** — session hours toggle (allow pre-market / after-hours paper trading), and threshold overrides for paper trade amount, entry threshold, stop loss, take profit, and the materiality gate; trail-on-expiry toggle and re-entry cooldown minutes; leave fields blank to use `logic_config.json` defaults
+3. **Trading Logic** — session hours toggle (allow pre-market / after-hours paper trading), and threshold overrides for paper trade amount, entry threshold, stop loss, take profit, the materiality gate, and minimum same-day exit edge; trail-on-expiry toggle and re-entry cooldown minutes; leave fields blank to use `logic_config.json` defaults
 4. **Symbols** — enable/disable default symbols, add up to 3 custom symbols
 5. **RSS Sources** — enable/disable the built-in feeds, add up to 3 custom feeds, and set a display label for each custom feed
 6. **Prompt Overrides** — per-symbol specialist prompt guidance
 7. **Scheduling & System** — auto-run cadence, snapshot retention, display timezone
 8. **Remote Snapshot Delivery** — enable outbound PNG delivery after qualifying runs; configure Telegram bot token and chat ID securely (stored in the OS keychain, never in the repo); tune resend interval, P&L threshold, and heartbeat; **Send Snapshot Now** button bypasses all gates and immediately queues the most recent run for delivery
 9. **Price History** — pull and status panel: per-symbol row count, date range, ready/needs-pull indicator, and a pull trigger button; the `price_history` table is independent of the analysis database and is never cleared by reset-data
-10. **Live Trading — Alpaca** — API key entry (stored in OS keychain), paper/live mode selector, Test Connection button with account equity display, guardrail fields, and an Enable/Disable Live toggle with a "type LIVE to confirm" modal
+10. **Live Trading — Alpaca** — API key entry (stored in OS keychain), paper/live mode selector, Test Connection button with account equity display, guardrail fields, PDT-aware live execution protections, and an Enable/Disable Live toggle with a "type LIVE to confirm" modal
 
 Advanced additions:
 
@@ -453,14 +458,14 @@ Important behavior:
 - If a symbol is unchecked, it will not be evaluated by the model
 - If an RSS feed is unchecked, it will not be included in ingestion
 - Stage 1 calls the LLM once to generate proxy keywords for any symbol not in the built-in map and caches the result for the session
-- Only built-in symbols (`USO`, `BITO`, `QQQ`, `SPY`) have the richer FRED/EIA validation bundles
+- Only built-in symbols (`USO`, `IBIT`, `QQQ`, `SPY`) have the richer FRED/EIA validation bundles
 - Technical indicators are injected when price history is available; if the `price_history` table is empty the analysis prompt is unchanged and analysis completes normally
 - When Light Web Research is enabled, the model receives a compact recent-news block per active symbol from a small trusted-source allowlist rather than scraping a huge feed universe
 
 ## Validation Sources
 
 - `USO` - `EIA` weekly petroleum pages for refinery utilization, commercial crude stocks, gasoline stocks, and distillate stocks
-- `BITO` - `FRED` `M2SL` and `M2REAL`
+- `IBIT` - `FRED` `M2SL` and `M2REAL`
 - `QQQ` - `FRED` `DFII10` for 10-year TIPS real yield
 - `SPY` - `FRED` `BAMLH0A0HYM2` and `BAMLC0A0CM` for credit spreads
 
@@ -500,7 +505,7 @@ Bluster and policy scores are computed entirely in Python from LLM-extracted fac
 
 ## Execution Mapping
 
-The analysis still reasons about the underlying symbols `USO`, `BITO`, `QQQ`, and `SPY`, but the recommendation layer now converts leverage into actual broker-tradable execution tickers.
+The analysis still reasons about the underlying symbols `USO`, `IBIT`, `QQQ`, and `SPY`, but the recommendation layer now converts leverage into actual broker-tradable execution tickers. Legacy `BITO` inputs are normalized to `IBIT` for future runs so old history remains readable while new Bitcoin trades use the new default.
 
 - `QQQ` bullish `3x` -> `BUY TQQQ`
 - `QQQ` bearish `3x` -> `BUY SQQQ`
@@ -508,8 +513,8 @@ The analysis still reasons about the underlying symbols `USO`, `BITO`, `QQQ`, an
 - `SPY` bearish `3x` -> `BUY SPXS`
 - `USO` bullish `2x` -> `BUY UCO`
 - `USO` bearish `2x` -> `BUY SCO`
-- `BITO` bullish `2x` -> `BUY BITU`
-- `BITO` bearish `2x` -> `BUY SBIT`
+- `IBIT` bullish `2x` -> `BUY BITU`
+- `IBIT` bearish `2x` -> `BUY SBIT`
 
 Notes:
 
@@ -579,7 +584,7 @@ SSE pipeline. Events: `log`, `article`, `result`, `error`.
 Example request:
 
 ```json
-{ "symbols": ["USO", "BITO", "QQQ", "SPY"], "max_posts": 50, "lookback_days": 14 }
+{ "symbols": ["USO", "IBIT", "QQQ", "SPY"], "max_posts": 50, "lookback_days": 14 }
 ```
 
 `result` payloads now include:
