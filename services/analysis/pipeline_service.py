@@ -272,7 +272,8 @@ class PipelineService:
     # ── Helpers (private) ───────────────────────────────────────────────
 
     def _get_default_symbols(self) -> List[str]:
-        return ["USO"]
+        """Return the default symbol list when no symbols are explicitly provided."""
+        return ["USO", "IBIT", "QQQ", "SPY"]
 
     def _resolve_active_model_name(self, config: Any) -> str:
         return str(getattr(config, 'analysis_model', None) or "qwen3.5")
