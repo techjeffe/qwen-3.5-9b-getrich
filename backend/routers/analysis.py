@@ -84,6 +84,7 @@ from services.analysis.backtest_service import BacktestService
 from services.analysis.market_data_service import MarketDataService
 from services.analysis.pipeline_service import PipelineService
 from config.market_constants import SYMBOL_RELEVANCE_TERMS
+from services.risk_policy_runtime import build_crazy_ramp_context
 
 
 router = APIRouter()
@@ -652,10 +653,11 @@ async def rerun_analysis_snapshot(
             extraction_model=rerun_extraction,
             reasoning_model=rerun_reasoning,
             web_context_by_symbol=web_context_by_symbol,
+            symbol_proxy_terms_by_symbol=dict(getattr(config, "symbol_proxy_terms", {}) or {}),
         )
         stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
 
-        snapshot_risk = str(snapshot.get("risk_profile") or getattr(config, "risk_profile", "moderate") or "moderate")
+        snapshot_risk = str(snapshot.get("risk_profile") or getattr(config, "risk_profile", "standard") or "standard")
         previous_signal = None
         if previous_response:
             prev_signal_payload = previous_response.get("blue_team_signal") or previous_response.get("trading_signal")
@@ -677,6 +679,12 @@ async def rerun_analysis_snapshot(
             stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
             price_context=price_context,
             signal_age_hours=signal_age_hours,
+            crazy_ramp_context=await build_crazy_ramp_context(
+                symbols=symbols,
+                risk_profile=snapshot_risk,
+                risk_policy=dict(getattr(config, "risk_policy", {}) or {}),
+                price_context=price_context,
+            ),
         )
 
         per_symbol_counts = materiality_service._count_symbol_articles(
@@ -1000,7 +1008,7 @@ def _build_symbol_specific_news_context(
 def _generate_trading_signal(
     sentiment_results: Dict[str, Dict],
     quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
-    risk_profile: str = "aggressive",
+    risk_profile: str = "standard",
     previous_signal: Optional[TradingSignal] = None,
     stability_mode: str = "normal",
     entry_threshold_override: Optional[float] = None,
@@ -1095,6 +1103,7 @@ async def _pre_ingest_stream(
     yahoo_count = len(yahoo_symbols)
 
     yield f"data: {json.dumps({'type': 'log', 'message': f'Loading {feed_count} feeds ({configured_count} configured RSS + {yahoo_count} Yahoo Finance symbols)...'}, default=str)}\n\n"
+    yield f"data: {json.dumps({'type': 'phase', 'phase': 0, 'label': 'Pulling RSS feeds and market context'}, default=str)}\n\n"
 
     # 2. Parse feeds
     articles = []
@@ -1111,8 +1120,14 @@ async def _pre_ingest_stream(
         if yahoo_symbols:
             yahoo_articles = await _asyncio.to_thread(parser.fetch_yahoo_finance_news, yahoo_symbols)
             articles.extend(yahoo_articles)
-        
+
         yield f"data: {json.dumps({'type': 'log', 'message': f'Fetched {len(articles)} raw articles ({len(rss_articles)} RSS + {len(yahoo_articles) if yahoo_symbols else 0} Yahoo Finance)'}, default=str)}\n\n"
+        for article in articles:
+            source = str(getattr(article, "source", "") or "Unknown").strip() or "Unknown"
+            title = str(getattr(article, "title", "") or "").strip()
+            summary = str(getattr(article, "summary", "") or getattr(article, "content", "") or "").strip()
+            keywords = list(getattr(article, "keywords", None) or [])
+            yield f"data: {json.dumps({'type': 'article', 'source': source, 'title': title, 'description': summary[:500], 'keywords': keywords}, default=str)}\n\n"
     except Exception as exc:
         yield f"data: {json.dumps({'type': 'log', 'message': f'Feed parse error: {exc}'}, default=str)}\n\n"
         articles = []
@@ -1264,6 +1279,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             symbols_label = ", ".join(effective_request.symbols)
             yield f"data: {json.dumps({'type': 'log', 'message': f'Fetching real-time price data for {symbols_label}...'}, default=str)}\n\n"
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 0/4: Pulling RSS feeds and market context...'}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 0, 'label': 'Pulling RSS feeds and market context'}, default=str)}\n\n"
 
             # Pre-analysis RSS ingestion — ensures we always have fresh articles even after DB reset
             ingestion_result: Dict[str, Any] = {}
@@ -1273,6 +1289,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             except Exception:
                 pass
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 1/4: Ingesting queued articles and market context...'}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 1, 'label': 'Ingesting queued articles and market context'}, default=str)}\n\n"
 
             selected_article_ids = ingestion_result.get("new_article_ids")
             if selected_article_ids:
@@ -1311,13 +1328,13 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                     heartbeat_count += 1
                     if heartbeat_count == 1:
                         yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 2/4: Running symbol specialists...'}, default=str)}\n\n"
-                    elif heartbeat_count == 2:
-                        yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 3/4: Building signal and red-team review...'}, default=str)}\n\n"
+                        yield f"data: {json.dumps({'type': 'phase', 'phase': 2, 'label': 'Running symbol specialists'}, default=str)}\n\n"
                     elif heartbeat_count % 3 == 0:
                         yield f"data: {json.dumps({'type': 'log', 'message': f'Still analyzing ({elapsed}s elapsed)...'}, default=str)}\n\n"
                     yield ": stage2-heartbeat\n\n"
             response = task.result()
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 4/4: Persisting results and snapshots...'}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 4, 'label': 'Persisting results and snapshots'}, default=str)}\n\n"
 
             # ── Verbose diagnostics ─────────────────────────────────────────
             # Articles that were ingested and passed Stage 0

@@ -801,6 +801,7 @@ class SentimentEngine:
         self,
         symbol: str,
         model: str,
+        persisted_terms: Optional[List[str]] = None,
     ) -> List[str]:
         """Return proxy keywords for a symbol.
 
@@ -829,6 +830,31 @@ class SentimentEngine:
                 "error": None,
             }
             return terms
+
+        normalized_persisted = [
+            str(term or "").strip().lower()
+            for term in (persisted_terms or [])
+            if str(term or "").strip()
+        ]
+        if normalized_persisted:
+            deduped: List[str] = []
+            for term in normalized_persisted:
+                if term not in deduped:
+                    deduped.append(term)
+                if len(deduped) >= 50:
+                    break
+            _keyword_cache[sym] = deduped
+            _keyword_trace_cache[sym] = {
+                "symbol": sym,
+                "mode": "persisted",
+                "model": "",
+                "cache_hit": False,
+                "prompt": "Loaded persisted proxy terms from app_config.symbol_proxy_terms.",
+                "raw_response": "No model response. Stage 1 used persisted proxy terms.",
+                "terms": deduped,
+                "error": None,
+            }
+            return deduped
 
         if sym in _keyword_cache:
             cached_trace = dict(_keyword_trace_cache.get(sym, {}))
@@ -897,6 +923,7 @@ class SentimentEngine:
         posts: List[Any],
         symbols: List[str],
         extraction_model: str,
+        persisted_proxy_terms_by_symbol: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
         """
         Stage 1 — keyword-based filtering using per-symbol proxy terms.
@@ -907,7 +934,15 @@ class SentimentEngine:
         No per-article LLM calls — fast regardless of article count.
         """
         # Fetch keywords for all symbols (parallel; built-ins return immediately)
-        tasks = [self._generate_symbol_keywords(sym, extraction_model) for sym in symbols]
+        persisted_proxy_terms_by_symbol = persisted_proxy_terms_by_symbol or {}
+        tasks = [
+            self._generate_symbol_keywords(
+                sym,
+                extraction_model,
+                persisted_terms=persisted_proxy_terms_by_symbol.get(str(sym).upper(), []),
+            )
+            for sym in symbols
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_terms: set = set()

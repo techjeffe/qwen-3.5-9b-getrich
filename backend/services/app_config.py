@@ -36,8 +36,12 @@ DEFAULT_RSS_FEEDS: List[Dict[str, str]] = [
 ]
 DEFAULT_EXTRACTION_MODEL = ""
 DEFAULT_REASONING_MODEL = ""
-DEFAULT_RISK_PROFILE = "moderate"
-VALID_RISK_PROFILES = {"conservative", "moderate", "aggressive", "crazy"}
+DEFAULT_RISK_PROFILE = "standard"
+VALID_RISK_PROFILES = {"conservative", "standard", "crazy", "custom"}
+LEGACY_RISK_PROFILE_ALIASES = {
+    "moderate": "standard",
+    "aggressive": "standard",
+}
 DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
 VALID_REMOTE_SNAPSHOT_MODES = {"telegram", "signed_link", "email"}
 DEFAULT_ALPACA_EXECUTION_MODE = "off"
@@ -48,6 +52,20 @@ MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
 DEFAULT_ESTIMATED_ANALYSIS_SECONDS = 82
 DEFAULT_SNAPSHOT_RETENTION_LIMIT = 12
 DEFAULT_RSS_FEED_URLS = [feed["url"] for feed in DEFAULT_RSS_FEEDS]
+DEFAULT_RISK_POLICY: Dict[str, Any] = {
+    "crazy_ramp": {
+        "threshold_source": "calibrated_bucket",
+        "bucket_thresholds": {
+            "high_liquidity": {"breakout_atr_fraction": 0.25, "volume_multiplier": 1.35, "retrace_guard": 0.35},
+            "mid_liquidity": {"breakout_atr_fraction": 0.30, "volume_multiplier": 1.50, "retrace_guard": 0.30},
+            "low_liquidity": {"breakout_atr_fraction": 0.40, "volume_multiplier": 1.80, "retrace_guard": 0.25},
+        },
+        "fallback": {"breakout_atr_fraction": 0.45, "volume_multiplier": 2.00, "retrace_guard": 0.20},
+        "fetch_timeout_ms": 2500,
+        "eval_timeout_ms": 15000,
+        "stale_ms": 120000,
+    }
+}
 
 # Snapshots of historical DEFAULT_RSS_FEED_URLS sets. Used to detect existing
 # configs whose enabled_rss_feeds list still matches an older default set
@@ -203,6 +221,28 @@ def _normalize_symbol_company_aliases(data: Any, allowed_symbols: List[str]) -> 
     return normalized
 
 
+def _normalize_symbol_proxy_terms(data: Any, allowed_symbols: List[str]) -> Dict[str, List[str]]:
+    if not isinstance(data, dict):
+        return {}
+    allowed = set(allowed_symbols)
+    normalized: Dict[str, List[str]] = {}
+    for symbol, terms in data.items():
+        sym = _normalize_symbol(symbol)
+        if sym not in allowed:
+            continue
+        cleaned: List[str] = []
+        if isinstance(terms, list):
+            for term in terms:
+                value = str(term or "").strip().lower()
+                if value and value not in cleaned:
+                    cleaned.append(value)
+                if len(cleaned) >= 50:
+                    break
+        if cleaned:
+            normalized[sym] = cleaned
+    return normalized
+
+
 def _normalize_rss_article_limits(data: Any) -> Dict[str, int]:
     limits = dict(DEFAULT_RSS_ARTICLE_LIMITS)
     if isinstance(data, dict):
@@ -266,7 +306,27 @@ def _normalize_trading_logic_int(value: Any, min_val: int, max_val: int) -> Opti
 
 def _normalize_risk_profile(value: Any) -> str:
     profile = str(value or "").strip().lower()
+    profile = LEGACY_RISK_PROFILE_ALIASES.get(profile, profile)
     return profile if profile in VALID_RISK_PROFILES else DEFAULT_RISK_PROFILE
+
+
+def _normalize_risk_policy(value: Any) -> Dict[str, Any]:
+    policy = dict(DEFAULT_RISK_POLICY)
+    if not isinstance(value, dict):
+        return policy
+    crazy = value.get("crazy_ramp")
+    if not isinstance(crazy, dict):
+        return policy
+    merged = dict(policy.get("crazy_ramp", {}))
+    for key in ("threshold_source", "fetch_timeout_ms", "eval_timeout_ms", "stale_ms"):
+        if key in crazy:
+            merged[key] = crazy.get(key)
+    if isinstance(crazy.get("bucket_thresholds"), dict):
+        merged["bucket_thresholds"] = crazy.get("bucket_thresholds")
+    if isinstance(crazy.get("fallback"), dict):
+        merged["fallback"] = crazy.get("fallback")
+    policy["crazy_ramp"] = merged
+    return policy
 
 
 def _normalize_remote_snapshot_mode(value: Any) -> str:
@@ -403,6 +463,10 @@ def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
             parse_json(row_value("symbol_company_aliases", {}), {}),
             build_supported_symbols(legacy_custom_symbols),
         ),
+        symbol_proxy_terms=_normalize_symbol_proxy_terms(
+            parse_json(row_value("symbol_proxy_terms", {}), {}),
+            build_supported_symbols(legacy_custom_symbols),
+        ),
         display_timezone=_normalize_display_timezone(row_value("display_timezone", "")),
         enabled_rss_feeds=_normalize_enabled_rss_feeds(parse_json(row_value("enabled_rss_feeds", []), []), legacy_custom_rss_feeds),
         custom_rss_feeds=legacy_custom_rss_feeds,
@@ -424,6 +488,7 @@ def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
         remote_snapshot_send_on_position_change=bool(row_value("remote_snapshot_send_on_position_change", True)),
         remote_snapshot_include_closed_trades=bool(row_value("remote_snapshot_include_closed_trades", False)),
         remote_snapshot_max_recommendations=int(row_value("remote_snapshot_max_recommendations", 4) or 4),
+        risk_policy=_normalize_risk_policy(parse_json(row_value("risk_policy", {}), {})),
         last_analysis_started_at=datetime.fromisoformat(row_value("last_analysis_started_at")) if row_value("last_analysis_started_at") else None,
         last_analysis_completed_at=datetime.fromisoformat(row_value("last_analysis_completed_at")) if row_value("last_analysis_completed_at") else None,
         last_analysis_request_id=row_value("last_analysis_request_id"),
@@ -501,6 +566,16 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         if getattr(config, "symbol_company_aliases", None) != normalized_symbol_company_aliases:
             config.symbol_company_aliases = normalized_symbol_company_aliases
             changed = True
+        if getattr(config, "symbol_proxy_terms", None) is None:
+            config.symbol_proxy_terms = {}
+            changed = True
+        normalized_symbol_proxy_terms = _normalize_symbol_proxy_terms(
+            getattr(config, "symbol_proxy_terms", {}),
+            supported_symbols,
+        )
+        if getattr(config, "symbol_proxy_terms", None) != normalized_symbol_proxy_terms:
+            config.symbol_proxy_terms = normalized_symbol_proxy_terms
+            changed = True
         normalized_display_timezone = _normalize_display_timezone(getattr(config, "display_timezone", ""))
         if getattr(config, "display_timezone", "") != normalized_display_timezone:
             config.display_timezone = normalized_display_timezone
@@ -553,6 +628,13 @@ def get_or_create_app_config(db: Session) -> AppConfig:
             changed = True
         if getattr(config, "allow_extended_hours_trading", None) is None:
             config.allow_extended_hours_trading = True
+            changed = True
+        if getattr(config, "risk_policy", None) is None:
+            config.risk_policy = dict(DEFAULT_RISK_POLICY)
+            changed = True
+        normalized_risk_policy = _normalize_risk_policy(getattr(config, "risk_policy", {}))
+        if getattr(config, "risk_policy", None) != normalized_risk_policy:
+            config.risk_policy = normalized_risk_policy
             changed = True
         normalized_execution_mode = _normalize_alpaca_execution_mode(
             getattr(config, "alpaca_execution_mode", DEFAULT_ALPACA_EXECUTION_MODE)
@@ -633,6 +715,7 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         lookback_days=14,
         symbol_prompt_overrides={},
         symbol_company_aliases={},
+        symbol_proxy_terms={},
         display_timezone="",
         enabled_rss_feeds=DEFAULT_RSS_FEED_URLS.copy(),
         custom_rss_feeds=[],
@@ -652,6 +735,7 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         remote_snapshot_send_on_position_change=True,
         remote_snapshot_include_closed_trades=False,
         remote_snapshot_max_recommendations=4,
+        risk_policy=dict(DEFAULT_RISK_POLICY),
     )
     db.add(config)
     db.commit()
@@ -723,6 +807,16 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
             payload.get("symbol_company_aliases"),
             build_supported_symbols(custom_symbols),
         )
+    if "symbol_proxy_terms" in payload:
+        config.symbol_proxy_terms = _normalize_symbol_proxy_terms(
+            payload.get("symbol_proxy_terms"),
+            build_supported_symbols(custom_symbols),
+        )
+    else:
+        config.symbol_proxy_terms = _normalize_symbol_proxy_terms(
+            getattr(config, "symbol_proxy_terms", {}),
+            build_supported_symbols(custom_symbols),
+        )
     if "enabled_rss_feeds" in payload or "custom_rss_feeds" in payload or "custom_rss_feed_labels" in payload:
         config.custom_rss_feeds = custom_rss_feeds
         config.custom_rss_feed_labels = custom_rss_feed_labels
@@ -757,6 +851,10 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.red_team_enabled = bool(payload.get("red_team_enabled"))
     if "risk_profile" in payload:
         config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
+    if "risk_policy" in payload:
+        config.risk_policy = _normalize_risk_policy(payload.get("risk_policy"))
+    else:
+        config.risk_policy = _normalize_risk_policy(getattr(config, "risk_policy", {}))
     if "web_research_enabled" in payload:
         config.web_research_enabled = bool(payload.get("web_research_enabled"))
     if "allow_extended_hours_trading" in payload:
@@ -826,6 +924,12 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.alpaca_live_trading_enabled = config.alpaca_execution_mode == "live"
     if "alpaca_allow_short_selling" in payload:
         config.alpaca_allow_short_selling = _coerce_bool(payload.get("alpaca_allow_short_selling"), False)
+    if "alpaca_fixed_order_size" in payload:
+        config.alpaca_fixed_order_size = _coerce_bool(payload.get("alpaca_fixed_order_size"), False)
+    if "alpaca_paper_trade_amount_usd" in payload:
+        config.alpaca_paper_trade_amount_usd = _normalize_trading_logic_float(payload.get("alpaca_paper_trade_amount_usd"), 1.0, 1_000_000.0)
+    if "alpaca_live_trade_amount_usd" in payload:
+        config.alpaca_live_trade_amount_usd = _normalize_trading_logic_float(payload.get("alpaca_live_trade_amount_usd"), 1.0, 1_000_000.0)
     if "alpaca_max_position_usd" in payload:
         config.alpaca_max_position_usd = _normalize_trading_logic_float(payload.get("alpaca_max_position_usd"), 1.0, 1_000_000.0)
     if "alpaca_max_total_exposure_usd" in payload:
@@ -1005,6 +1109,10 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
             getattr(config, "symbol_company_aliases", {}),
             build_supported_symbols(custom_symbols),
         ),
+        "symbol_proxy_terms": _normalize_symbol_proxy_terms(
+            getattr(config, "symbol_proxy_terms", {}),
+            build_supported_symbols(custom_symbols),
+        ),
         "display_timezone": _normalize_display_timezone(getattr(config, "display_timezone", "")),
         "default_rss_feeds": DEFAULT_RSS_FEEDS,
         "custom_rss_feeds": custom_rss_feeds,
@@ -1024,6 +1132,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "ollama_parallel_slots": int(getattr(config, "ollama_parallel_slots", 1) or 1),
         "red_team_enabled": bool(getattr(config, "red_team_enabled", True)),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
+        "risk_policy": _normalize_risk_policy(getattr(config, "risk_policy", {})),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
         "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),
         "remote_snapshot_enabled": bool(getattr(config, "remote_snapshot_enabled", False)),
@@ -1050,6 +1159,9 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         ),
         "alpaca_live_trading_enabled":   bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "alpaca_allow_short_selling":    bool(getattr(config, "alpaca_allow_short_selling",    False)),
+        "alpaca_fixed_order_size":       bool(getattr(config, "alpaca_fixed_order_size",       False)),
+        "alpaca_paper_trade_amount_usd": getattr(config, "alpaca_paper_trade_amount_usd",      None),
+        "alpaca_live_trade_amount_usd":  getattr(config, "alpaca_live_trade_amount_usd",       None),
         "alpaca_max_position_usd":       getattr(config, "alpaca_max_position_usd",            None),
         "alpaca_max_total_exposure_usd": getattr(config, "alpaca_max_total_exposure_usd",      None),
         "alpaca_order_type":             str(getattr(config,  "alpaca_order_type",             "market") or "market"),

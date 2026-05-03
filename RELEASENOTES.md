@@ -1,3 +1,67 @@
+# Release Notes — May 3, 2026
+
+## Admin UI Redesign, Order Sizing Toggle, and Domain Cookie Injection
+
+### Admin UI redesign
+
+The admin page was rewritten from a single long scroll into a section-based layout with a persistent left sidebar for navigation. Sections are: Overview, Models, Trading Logic, Symbols, RSS Feeds, Prompt Overrides, Scheduling & System, Remote Snapshot, Price History, and Execution & Brokerage.
+
+**Layout and navigation:**
+- Sidebar shows all sections; clicking jumps to the selected panel — no more page-length scrolling
+- Advanced Mode toggle in the sidebar cleanly separates the mode indicator ("✓ Advanced mode") from the switch action; previously these concatenated into an unreadable "✓ Advanced ModeSwitch to Basic" string
+- Broken "Jump to section" dropdown that called `scrollIntoView` on non-existent DOM IDs was removed entirely
+
+**Execution & Brokerage section reorganized:**
+- Execution destination (Off / Alpaca Paper / Alpaca Live) at the top
+- Live order limits appear immediately below — and only when live trading is active, so paper traders never see them
+- "Dollar size of each live order placed" was renamed to **Live order baseline ($)** with a description clarifying it scales ×0.25–×5; a computed range hint ("Actual range: $X – $Y") appears live as you type
+- Paper order sizes moved to their own section (Strategy paper trade amount, Portfolio cap, Alpaca paper order size)
+- Order execution (order type, slippage, short selling, sizing mode) is its own section
+- Alpaca credentials moved to full-width at the bottom
+
+**Prompt Overrides section rewritten:**
+- Per-symbol textareas now show meaningful placeholder examples matching the style of the actual backend prompts (EIA inventory signals for USO, BTC ETF inflow tracking for IBIT, etc.)
+- Custom symbols (not in the built-in set) get an amber "no built-in context — fill this in" badge — their override is the model's only guidance
+- Default symbols get a gray "supplements built-in guidance" badge
+- Header explains exactly where the text is injected: appended as `Additional admin guidance for {symbol}:` in the stage-2 specialist prompt
+
+**Bug fixes:**
+- `PromptOverridesSection` was imported but never rendered; added to the symbols section under Advanced Mode
+- `SystemSection` received five unused props (`isDirty`, `isSaving`, `status`, `handleSaveAndExit`, `save`) that were removed from both the type definition and call site
+
+**Files changed:** `frontend/src/app/admin/page.tsx`, `frontend/src/components/admin/sections/BrokerageSection.tsx`, `frontend/src/components/admin/sections/OverviewSection.tsx`, `frontend/src/components/admin/sections/PromptOverridesSection.tsx`, `frontend/src/components/admin/sections/SystemSection.tsx`
+
+---
+
+### Fixed vs. vol-normalized order sizing
+
+### Fixed vs. vol-normalized order sizing
+
+A new **Order sizing mode** toggle in Admin › Execution & Brokerage lets you choose how trade sizes are calculated:
+
+- **Scale by vol & conviction** (default) — each trade is sized by the vol-normalization formula: `(1% × base) / ATR_14d_pct`, then scaled ×0.25–×5 by conviction. Applies to both paper simulation trades and live Alpaca orders.
+- **Fixed amount** — every trade uses exactly the configured baseline dollar amount. Vol-scaling and conviction scaling are both skipped. Applies to paper and live equally.
+
+Previously, live Alpaca orders always used the raw configured amount regardless of this setting, meaning vol-scaling never actually reached live orders. This is now corrected — when scaling is enabled, the vol-sized `paper_trade.amount` flows through to Alpaca notional unchanged.
+
+**Files changed:** `backend/database/models.py`, `backend/database/migrate.py`, `backend/services/app_config.py`, `backend/services/paper_trading.py`, `backend/services/alpaca_broker.py`, `frontend/src/lib/utils/config-normalizer.ts`, `frontend/src/components/admin/sections/BrokerageSection.tsx`
+
+**DB migration:** `alpaca_fixed_order_size` column added to `app_config` automatically on next backend restart (default `false` = scaling enabled).
+
+### Domain cookie injection for paywalled sites
+
+A new `backend/domain_cookies.json` file (never committed — added to `.gitignore`) lets you inject browser session cookies so Trafilatura can extract full article text from sites you have a personal subscription to (e.g. New York Times).
+
+- Drop a Cookie-Editor JSON export directly into `backend/domain_cookies.json` — no conversion needed
+- Also supports a manual dict format keyed by domain for multi-site use
+- Cookies are matched by hostname suffix and injected into both the initial `requests` fetch and the Playwright fallback render
+- File is re-read on every ingestion cycle so updates take effect without restarting the server
+- Full setup instructions added to README under **Domain Cookies (Paywalled Sites)**
+
+**Files changed:** `backend/services/data_ingestion/worker.py`, `.gitignore`, `README.md`
+
+---
+
 # Release Notes — May 2, 2026
 
 ## Quant-Quality Signal Improvements: Volatility-Normalized Sizing, Sentiment Decay, and Portfolio Cap

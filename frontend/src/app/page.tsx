@@ -158,6 +158,7 @@ export default function Home() {
     const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
     const [elapsedSeconds, setElapsedSeconds] = useState(0);
     const [latestLogMessage, setLatestLogMessage] = useState("");
+    const [backendPhaseLabel, setBackendPhaseLabel] = useState("");
     const [selectedRecommendation, setSelectedRecommendation] = useState<Recommendation | null>(null);
     const [advancedMode, setAdvancedMode] = useState(false);
     const [activeTab, setActiveTab] = useState<"current" | "history" | "compare" | "debug">("current");
@@ -249,6 +250,7 @@ export default function Home() {
         setStreamStartedAt(null);
         setElapsedSeconds(0);
         setLatestLogMessage("Connecting to backend...");
+        setBackendPhaseLabel("");
         setComparisonResult(null);
         setComparisonError(null);
         setSavedComparisonBaseline(null);
@@ -290,6 +292,10 @@ export default function Home() {
                         if (event.type === "log") {
                             setLatestLogMessage(event.message);
                             setFeed((p) => [...p, { kind: "log", message: event.message }]);
+                        } else if (event.type === "phase") {
+                            const label = String(event.label || "Running analysis");
+                            setBackendPhaseLabel(label);
+                            setLatestLogMessage(label);
                         } else if (event.type === "article") {
                             const idx = articleCounter.current++;
                             setFeed((p) => [...p, { kind: "article", idx, source: event.source, title: event.title, description: event.description ?? "", keywords: event.keywords ?? [] }]);
@@ -319,6 +325,7 @@ export default function Home() {
                         } else if (event.type === "error") {
                             lastRunFailedRef.current = true;
                             setLatestLogMessage("Analysis failed");
+                            setBackendPhaseLabel("");
                             setError(event.message);
                         } else if (event.type === "done") {
                             shouldStop = true;
@@ -671,7 +678,7 @@ export default function Home() {
         });
         return best;
     })();
-    const stageLabel = ANALYSIS_STAGES[stageIndex]?.label ?? "Running analysis";
+    const stageLabel = backendPhaseLabel || ANALYSIS_STAGES[stageIndex]?.label || "Running analysis";
     const recentAnalysisTimes = config.recent_analysis_seconds || [];
     const timing = estimateRunTiming(recentAnalysisTimes, config.estimated_analysis_seconds || 82);
     const hasReliableHistory = timing.reliable;
@@ -800,22 +807,22 @@ export default function Home() {
                                         { label: "Feeds", val: feedCountLabel, cls: "font-mono text-xs" },
                                         { label: "Symbols", val: trackedSymbols.join(", "), cls: "font-mono text-xs" },
                                         (() => {
-                                            const profile = config.risk_profile || "aggressive";
+                                            const profile = config.risk_profile || "standard";
                                             const leverageMap: Record<string, string> = {
                                                 conservative: "1x+inv",
-                                                moderate: "≤2x",
-                                                aggressive: "≤3x",
+                                                standard: "≤2x",
                                                 crazy: "3x",
+                                                custom: "custom",
                                             };
                                             const profileLabel = profile.charAt(0).toUpperCase() + profile.slice(1);
                                             const leverageLabel = leverageMap[profile] ?? "3x";
                                             const clsMap: Record<string, string> = {
                                                 conservative: "text-blue-400",
-                                                moderate: "text-teal-400",
-                                                aggressive: "text-orange-400",
+                                                standard: "text-teal-400",
                                                 crazy: "text-rose-400",
+                                                custom: "text-amber-400",
                                             };
-                                            return { label: "Risk", val: `${profileLabel} (${leverageLabel})`, cls: `font-mono text-xs font-bold ${clsMap[profile] ?? "text-orange-400"}` };
+                                            return { label: "Risk", val: `${profileLabel} (${leverageLabel})`, cls: `font-mono text-xs font-bold ${clsMap[profile] ?? "text-teal-400"}` };
                                         })(),
                                     ].map(({ label, val, cls }) => (
                                         <div key={label} className="flex justify-between border-b border-slate-700/40 pb-2 last:border-0">

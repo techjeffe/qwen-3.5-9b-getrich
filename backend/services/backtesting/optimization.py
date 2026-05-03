@@ -142,11 +142,13 @@ class RollingWindowOptimizer:
             all_sharpe.append(result['sharpe_ratio'])
             all_drawdowns.append(result['max_drawdown'])
         
+        regime_validation = self.evaluate_regime_mix(prices)
         if not results:
             return {
                 'results': [],
                 'best_parameters': None,
-                'summary': {}
+                'summary': {},
+                'regime_validation': regime_validation,
             }
         
         # Find best parameters (highest Sharpe ratio)
@@ -172,7 +174,45 @@ class RollingWindowOptimizer:
                 'std_sharpe_ratio': float(np.std(all_sharpe)),
                 'best_threshold': best_result.threshold,
                 'total_data_points': len(prices)
-            }
+            },
+            'regime_validation': regime_validation,
+        }
+
+    def evaluate_regime_mix(self, prices: pd.Series) -> Dict[str, Any]:
+        """Classify recent history into coarse regimes and verify minimum mix coverage."""
+        if prices is None or len(prices) < 30:
+            return {"ok": False, "reason": "insufficient_prices", "counts": {}}
+        returns = prices.pct_change().dropna()
+        if returns.empty:
+            return {"ok": False, "reason": "no_returns", "counts": {}}
+        roll = returns.rolling(20).mean().dropna()
+        vol = returns.rolling(20).std().dropna()
+        common_idx = roll.index.intersection(vol.index)
+        if len(common_idx) == 0:
+            return {"ok": False, "reason": "insufficient_window", "counts": {}}
+        trend_up = 0
+        trend_down_high_vol = 0
+        chop = 0
+        for idx in common_idx:
+            mu = float(roll.loc[idx])
+            sigma = float(vol.loc[idx])
+            if mu > 0.001:
+                trend_up += 1
+            elif mu < -0.001 and sigma > 0.015:
+                trend_down_high_vol += 1
+            elif abs(mu) <= 0.0007:
+                chop += 1
+        counts = {
+            "trending_up": trend_up,
+            "trending_down_high_vol": trend_down_high_vol,
+            "range_chop": chop,
+        }
+        min_required = 5
+        ok = all(v >= min_required for v in counts.values())
+        return {
+            "ok": ok,
+            "min_required": min_required,
+            "counts": counts,
         }
     
     def _optimize_on_training_data(

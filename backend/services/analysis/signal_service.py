@@ -36,6 +36,7 @@ class SignalService:
         entry_threshold_override: Optional[float] = None,
         price_context: Optional[Dict[str, Any]] = None,
         signal_age_hours: float = 0.0,
+        crazy_ramp_context: Optional[Dict[str, Any]] = None,
     ) -> TradingSignal:
         """Generate a blue-team TradingSignal from sentiment results."""
         if not sentiment_results:
@@ -110,6 +111,14 @@ class SignalService:
             recommendation = None
             if action:
                 recommendation = build_execution_recommendation(sym, action, leverage)
+                if str(risk_profile or "").lower().strip() == "crazy":
+                    sym_ctx = ((crazy_ramp_context or {}).get("symbols") or {}).get(sym.upper(), {})
+                    recommendation["ramp_stage"] = "probe"
+                    recommendation["ramp_threshold_bucket"] = str(sym_ctx.get("ramp_threshold_bucket", "") or "")
+                    recommendation["threshold_source"] = str(sym_ctx.get("threshold_source", "fallback") or "fallback")
+                    recommendation["fetch_latency_ms"] = str(sym_ctx.get("fetch_latency_ms", 0))
+                    recommendation["fetch_timeout_hit"] = str(bool(sym_ctx.get("fetch_timeout_hit", False))).lower()
+                    recommendation["ramp_promotion_enabled"] = str(bool(sym_ctx.get("promotion_allowed", False))).lower()
                 recommendations.append(recommendation)
 
             conviction = abs(directional) * confidence
@@ -569,11 +578,13 @@ class SignalService:
         return " ".join(parts)
 
     def _resolve_leverage(self, confidence: float, risk_profile: str, action: str = "", atr_pct: float = 0.0) -> str:
-        profile = str(risk_profile or "moderate").lower().strip()
+        profile = str(risk_profile or "standard").lower().strip()
+        if profile in {"moderate", "aggressive"}:
+            profile = "standard"
         if profile == "conservative":
             return "inverse" if str(action).upper() == "SELL" else "1x"
 
-        if profile == "moderate":
+        if profile in {"standard", "custom"}:
             raw = 2 if confidence > 0.75 else 1
         elif profile == "crazy":
             raw = 3

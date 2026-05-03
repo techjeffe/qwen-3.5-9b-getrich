@@ -9,14 +9,9 @@ type SystemSectionProps = {
     timeZone: string;
     setTimeZone: (tz: string) => void;
     isAdvancedMode: boolean;
-    isDirty: boolean;
-    isSaving: boolean;
-    status: string;
-    handleSaveAndExit: () => Promise<void>;
-    save: () => Promise<void>;
 };
 
-export function SystemSection({ config, setConfig, timeZone, setTimeZone, isAdvancedMode, isDirty, isSaving, status, handleSaveAndExit, save }: SystemSectionProps) {
+export function SystemSection({ config, setConfig, timeZone, setTimeZone, isAdvancedMode }: SystemSectionProps) {
     return (
         <section id="system" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
             <h2 className="text-sm font-semibold text-slate-200">Scheduling & System</h2>

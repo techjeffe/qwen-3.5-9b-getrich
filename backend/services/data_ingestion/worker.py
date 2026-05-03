@@ -5,10 +5,13 @@ Background ingestion worker for the article producer/consumer pipeline.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import trafilatura
@@ -145,28 +148,117 @@ def _clean_extracted_text(text: str, fallback: str) -> str:
     return " ".join(str(fallback or "").split()).strip()[:20000]
 
 
-def _fetch_with_requests(url: str, timeout: int = 15) -> str:
+# ── Domain cookie injection ──────────────────────────────────────────────────
+# Drop a domain_cookies.json file in the backend/ directory to inject
+# authentication cookies for paywalled sites (e.g. NYT). Two formats:
+#
+#   Array format  — paste a Cookie-Editor / EditThisCookie browser export directly
+#   Dict format   — {"nytimes.com": [{"name": "NYT-S", "value": "..."}, ...]}
+#
+# Cookies are matched by URL hostname suffix. Re-read on every ingestion cycle
+# so updates take effect without restarting the server.
+
+_COOKIE_FILE = Path(__file__).parent.parent.parent / "domain_cookies.json"
+
+_SAMESITE_MAP = {
+    "no_restriction": "None",
+    "unspecified": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+    "none": "None",
+}
+
+
+def _load_domain_cookies() -> Dict[str, List[Dict]]:
+    if not _COOKIE_FILE.exists():
+        return {}
+    try:
+        with open(_COOKIE_FILE) as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            grouped: Dict[str, List[Dict]] = {}
+            for cookie in data:
+                domain = str(cookie.get("domain", "")).lstrip(".")
+                if domain:
+                    grouped.setdefault(domain, []).append(cookie)
+            return grouped
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        logger.warning("domain_cookies.json load failed: %s", exc)
+    return {}
+
+
+def _cookies_for_url(url: str, domain_cookies: Dict[str, List[Dict]]) -> Dict[str, str]:
+    """Return name→value dict of cookies whose domain suffix matches the URL."""
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return {}
+    result: Dict[str, str] = {}
+    for domain, cookies in domain_cookies.items():
+        if host == domain or host.endswith("." + domain):
+            for c in cookies:
+                name = c.get("name", "")
+                value = c.get("value", "")
+                if name:
+                    result[name] = value
+    return result
+
+
+def _to_playwright_cookies(url: str, domain_cookies: Dict[str, List[Dict]]) -> List[Dict]:
+    """Convert matching cookies into the format Playwright's add_cookies() expects."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except Exception:
+        return []
+    result = []
+    for domain, cookies in domain_cookies.items():
+        if host == domain or host.endswith("." + domain):
+            for c in cookies:
+                name = c.get("name", "")
+                value = c.get("value", "")
+                if not name:
+                    continue
+                entry: Dict = {
+                    "name": name,
+                    "value": value,
+                    "domain": c.get("domain") or f".{domain}",
+                    "path": c.get("path", "/"),
+                }
+                raw_ss = str(c.get("sameSite", c.get("same_site", "no_restriction"))).lower()
+                entry["sameSite"] = _SAMESITE_MAP.get(raw_ss, "None")
+                if c.get("secure"):
+                    entry["secure"] = True
+                if c.get("httpOnly"):
+                    entry["httpOnly"] = True
+                exp = c.get("expirationDate") or c.get("expiry")
+                if exp:
+                    entry["expires"] = int(exp)
+                result.append(entry)
+    return result
+
+
+def _fetch_with_requests(url: str, timeout: int = 15, extra_cookies: Optional[Dict[str, str]] = None) -> str:
     response = requests.get(
         url,
         timeout=timeout,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         },
+        cookies=extra_cookies or {},
     )
     response.raise_for_status()
     return response.text
 
 
-async def _fetch_with_playwright(url: str, timeout_ms: int = 30000) -> str:
-    """Fetch rendered HTML from a URL using Playwright headless Chromium.
-
-    Improvements over the original:
-    - Uses networkidle wait instead of a fixed timeout for dynamic content
-    - Scrolls the page to trigger lazy-loaded content
-    - Attempts to dismiss cookie consent modals
-    - Rotates User-Agent strings for basic anti-detection
-    - Uses stealth-like settings to reduce bot detection
-    """
+async def _fetch_with_playwright(
+    url: str,
+    timeout_ms: int = 30000,
+    inject_cookies: Optional[List[Dict]] = None,
+) -> str:
+    """Fetch rendered HTML from a URL using Playwright headless Chromium."""
     if not _playwright_available:
         return ""
 
@@ -213,6 +305,11 @@ async def _fetch_with_playwright(url: str, timeout_ms: int = 30000) -> str:
                         screen={"width": 1920, "height": 1080},
                         has_touch=False,
                     )
+                    if inject_cookies:
+                        try:
+                            context.add_cookies(inject_cookies)
+                        except Exception as exc:
+                            logger.warning("Cookie injection failed for %s: %s", url, exc)
                     try:
                         page = context.new_page()
                         try:
@@ -326,9 +423,13 @@ def _dismiss_cookie_consent(page) -> None:
 
 
 async def fetch_article_text(url: str, fallback_text: str = "") -> str:
+    domain_cookies = _load_domain_cookies()
+    req_cookies = _cookies_for_url(url, domain_cookies)
+    pw_cookies = _to_playwright_cookies(url, domain_cookies)
+
     html = ""
     try:
-        html = await asyncio.to_thread(_fetch_with_requests, url)
+        html = await asyncio.to_thread(_fetch_with_requests, url, 15, req_cookies or None)
     except Exception:
         html = ""
 
@@ -346,7 +447,7 @@ async def fetch_article_text(url: str, fallback_text: str = "") -> str:
         return _clean_extracted_text(extracted, fallback_text)
 
     try:
-        rendered_html = await _fetch_with_playwright(url)
+        rendered_html = await _fetch_with_playwright(url, inject_cookies=pw_cookies or None)
     except Exception:
         rendered_html = ""
 

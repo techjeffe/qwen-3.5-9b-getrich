@@ -22,6 +22,7 @@ from services.app_config import (
 from services.ollama import get_ollama_status
 from services.paper_trading import close_positions_for_removed_symbols
 from services.remote_snapshot import trigger_remote_snapshot_delivery
+from services.symbol_proxy_terms import generate_proxy_terms_for_symbol
 from services.secret_store import (
     get_telegram_credentials,
     clear_telegram_secrets,
@@ -61,6 +62,32 @@ def _pull_history_background(symbols: List[str]) -> None:
     finally:
         db.close()
 
+async def _generate_symbol_keywords_background(symbols: List[str], model_name: str) -> None:
+    """Generate/persist symbol proxy terms in a fresh DB session."""
+    from database.engine import SessionLocal
+
+    db = SessionLocal()
+    try:
+        config = get_or_create_app_config(db)
+        symbol_proxy_terms = dict(getattr(config, "symbol_proxy_terms", {}) or {})
+        for symbol in symbols:
+            result = await generate_proxy_terms_for_symbol(
+                symbol=symbol,
+                model_name=model_name,
+                force_refresh=False,
+            )
+            normalized_symbol = str(result.get("symbol") or symbol).upper().strip()
+            terms = list(result.get("terms") or [])
+            if normalized_symbol and terms:
+                symbol_proxy_terms[normalized_symbol] = terms
+        config.symbol_proxy_terms = symbol_proxy_terms
+        db.add(config)
+        db.commit()
+    except Exception as exc:
+        print(f"Background symbol keyword generation error: {exc}")
+    finally:
+        db.close()
+
 
 @router.put("/config", tags=["Config"])
 async def put_config(
@@ -94,10 +121,72 @@ async def put_config(
     if added_custom_symbols:
         background_tasks.add_task(_pull_history_background, added_custom_symbols)
         notices.append(f"Pulling price history for {', '.join(added_custom_symbols)} in the background.")
+        model_name = str(getattr(config, "extraction_model", "") or "").strip()
+        if model_name:
+            background_tasks.add_task(_generate_symbol_keywords_background, added_custom_symbols, model_name)
+            notices.append(f"Generating symbol proxy terms for {', '.join(added_custom_symbols)} in the background.")
+        else:
+            notices.append("Skipped symbol keyword generation because extraction model is not configured.")
     response = config_to_dict_with_stats(db, config)
     if notices:
         response["notices"] = notices
     return response
+
+
+@router.post("/config/custom-symbol-keywords/refresh", tags=["Config"])
+async def refresh_custom_symbol_keywords(
+    payload: Dict[str, Any],
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    config = get_or_create_app_config(db)
+    extraction_model = str(getattr(config, "extraction_model", "") or "").strip()
+    if not extraction_model:
+        raise HTTPException(status_code=400, detail="Configure extraction_model before refreshing symbol keywords.")
+
+    custom_symbols = {
+        str(symbol or "").upper().strip()
+        for symbol in (getattr(config, "custom_symbols", []) or [])
+        if str(symbol or "").strip()
+    }
+    requested_symbols = [
+        str(symbol or "").upper().strip()
+        for symbol in (payload.get("symbols") or [])
+        if str(symbol or "").strip()
+    ]
+    symbols = sorted(set(requested_symbols or list(custom_symbols)))
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No custom symbols available to refresh.")
+
+    invalid = [symbol for symbol in symbols if symbol not in custom_symbols]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Symbols are not configured as custom: {', '.join(invalid)}")
+
+    symbol_proxy_terms = dict(getattr(config, "symbol_proxy_terms", {}) or {})
+    traces: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        result = await generate_proxy_terms_for_symbol(
+            symbol=symbol,
+            model_name=extraction_model,
+            force_refresh=True,
+        )
+        normalized_symbol = str(result.get("symbol") or symbol).upper().strip()
+        terms = list(result.get("terms") or [])
+        if normalized_symbol and terms:
+            symbol_proxy_terms[normalized_symbol] = terms
+        traces[normalized_symbol] = dict(result.get("trace") or {})
+
+    config.symbol_proxy_terms = symbol_proxy_terms
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+
+    return {
+        "ok": True,
+        "refreshed_symbols": symbols,
+        "symbol_proxy_terms": {symbol: symbol_proxy_terms.get(symbol, []) for symbol in symbols},
+        "trace": traces,
+    }
 
 
 @router.get("/admin/remote-snapshot-secrets", tags=["Admin"])

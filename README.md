@@ -231,6 +231,68 @@ Alpaca live trading can be configured from Admin (Live Trading section):
 - enable live trading with a "type LIVE to confirm" modal; one-click disable at any time
 - the circuit breaker auto-disables live trading if a limit is breached between runs
 
+## Domain Cookies (Paywalled Sites)
+
+Some RSS sources (e.g. New York Times) are in the feed but are paywalled — Trafilatura extracts only the short RSS blurb instead of the full article. If you have a personal subscription you can inject your login cookies so the scraper fetches the full text.
+
+**This is for personal use against your own subscription only.**
+
+### Step 1 — Export cookies from your browser
+
+Install a cookie export extension such as [Cookie-Editor](https://cookie-editor.com/) (Chrome/Firefox/Safari). Navigate to the site while logged in, open the extension, and export as **JSON**. Save the file.
+
+### Step 2 — Drop the file in the backend directory
+
+```bash
+# macOS / Linux
+cp ~/Downloads/cookies.json backend/domain_cookies.json
+
+# Windows (PowerShell)
+Copy-Item "$env:USERPROFILE\Downloads\cookies.json" backend\domain_cookies.json
+```
+
+The file is read fresh on every ingestion cycle — no restart needed. The filename is in `.gitignore` so it will never be committed.
+
+### Supported formats
+
+**Array format** (Cookie-Editor / EditThisCookie export — paste as-is):
+```json
+[
+  { "domain": ".nytimes.com", "name": "NYT-S", "value": "…", "path": "/", "secure": true },
+  { "domain": ".nytimes.com", "name": "nyt-a",  "value": "…", "path": "/" }
+]
+```
+
+**Dict format** (manual / multi-site):
+```json
+{
+  "nytimes.com": [
+    { "name": "NYT-S", "value": "…" },
+    { "name": "nyt-a",  "value": "…" }
+  ],
+  "wsj.com": [
+    { "name": "wsjregion", "value": "…" }
+  ]
+}
+```
+
+Cookies are matched by hostname suffix, so `.nytimes.com` and `nytimes.com` both match `www.nytimes.com`. They are injected into both the initial `requests` fetch and the Playwright fallback render.
+
+### Checking it works
+
+After the next ingestion cycle, query the database:
+
+```bash
+sqlite3 trading_system.db \
+  "SELECT url, length(full_content) FROM scraped_articles WHERE url LIKE '%nytimes%' ORDER BY id DESC LIMIT 5;"
+```
+
+A `length(full_content)` above ~1000 means the full article was extracted. If it stays at a few hundred, the session may have expired — re-export and replace the file.
+
+### Session expiry
+
+NYT sessions typically last 30 days. When articles start showing short lengths again, re-export cookies from your browser and replace `backend/domain_cookies.json`.
+
 ## Testing Your Extraction Model (Stage 1)
 
 Before committing to a model for Stage 1 entity extraction, run the smoke test:

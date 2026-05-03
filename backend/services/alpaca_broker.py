@@ -819,6 +819,19 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
 
     # ── Determine Alpaca side ────────────────────────────────────────────────
     if event == "open":
+        configured_notional = None
+        if broker.mode == "paper":
+            configured_notional = getattr(config, "alpaca_paper_trade_amount_usd", None)
+        elif broker.mode == "live":
+            configured_notional = getattr(config, "alpaca_live_trade_amount_usd", None)
+        try:
+            configured_notional_value = float(configured_notional) if configured_notional is not None else 0.0
+        except (TypeError, ValueError):
+            configured_notional_value = 0.0
+        is_fixed = bool(getattr(config, "alpaca_fixed_order_size", False))
+        if is_fixed and configured_notional_value > 0:
+            notional = configured_notional_value
+
         if direct_short:
             if not allow_short:
                 print(f"[alpaca] skipping direct short on {symbol}: alpaca_allow_short_selling disabled")

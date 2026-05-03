@@ -279,6 +279,17 @@ class PersistenceService:
                     "dataset_snapshot": frozen_snapshot,
                     "secret_trace": secret_trace or frozen_snapshot.get("secret_trace") or {},
                     "per_symbol_article_counts": per_symbol_counts or {},
+                    "ramp_metadata": {
+                        str(r.get("underlying_symbol") or r.get("symbol") or "").upper(): {
+                            "ramp_threshold_bucket": r.get("ramp_threshold_bucket"),
+                            "threshold_source": r.get("threshold_source"),
+                            "fetch_latency_ms": r.get("fetch_latency_ms"),
+                            "fetch_timeout_hit": r.get("fetch_timeout_hit"),
+                            "ramp_promotion_enabled": r.get("ramp_promotion_enabled"),
+                        }
+                        for r in (response.trading_signal.recommendations or [])
+                        if str(r.get("underlying_symbol") or r.get("symbol") or "").strip()
+                    },
                 }
             )
             db.add(analysis)

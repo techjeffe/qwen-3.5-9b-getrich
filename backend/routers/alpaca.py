@@ -32,6 +32,8 @@ class AlpacaSettingsPayload(BaseModel):
     alpaca_execution_mode:         Optional[str]   = None
     alpaca_live_trading_enabled:   Optional[bool]  = None
     alpaca_allow_short_selling:    Optional[bool]  = None
+    alpaca_paper_trade_amount_usd: Optional[float] = None
+    alpaca_live_trade_amount_usd:  Optional[float] = None
     alpaca_max_position_usd:       Optional[float] = None
     alpaca_max_total_exposure_usd: Optional[float] = None
     alpaca_order_type:             Optional[str]   = None
@@ -72,6 +74,8 @@ async def get_alpaca_status(
         "execution_mode":            str(getattr(config, "alpaca_execution_mode", "off") or "off"),
         "live_trading_enabled":      bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "allow_short_selling":       bool(getattr(config, "alpaca_allow_short_selling",    False)),
+        "paper_trade_amount_usd":    getattr(config, "alpaca_paper_trade_amount_usd",      None),
+        "live_trade_amount_usd":     getattr(config, "alpaca_live_trade_amount_usd",       None),
         "max_position_usd":          getattr(config, "alpaca_max_position_usd",            None),
         "max_total_exposure_usd":    getattr(config, "alpaca_max_total_exposure_usd",      None),
         "order_type":                str(getattr(config,  "alpaca_order_type",             "market") or "market"),
@@ -232,6 +236,8 @@ async def update_alpaca_settings(
         "execution_mode":            str(getattr(config, "alpaca_execution_mode", "off") or "off"),
         "live_trading_enabled":      bool(getattr(config, "alpaca_live_trading_enabled",   False)),
         "allow_short_selling":       bool(getattr(config, "alpaca_allow_short_selling",    False)),
+        "paper_trade_amount_usd":    getattr(config, "alpaca_paper_trade_amount_usd",      None),
+        "live_trade_amount_usd":     getattr(config, "alpaca_live_trade_amount_usd",       None),
         "max_position_usd":          getattr(config, "alpaca_max_position_usd",            None),
         "max_total_exposure_usd":    getattr(config, "alpaca_max_total_exposure_usd",      None),
         "order_type":                str(getattr(config,  "alpaca_order_type",             "market") or "market"),

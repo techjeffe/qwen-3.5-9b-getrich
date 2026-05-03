@@ -29,6 +29,7 @@ from services.analysis.materiality_service import MaterialityService
 from services.analysis.hysteresis_service import HysteresisService
 from services.analysis.persistence_service import PersistenceService
 from services.analysis.backtest_service import BacktestService
+from services.risk_policy_runtime import build_crazy_ramp_context
 from database.models import ScrapedArticle
 
 
@@ -245,6 +246,7 @@ class PipelineService:
                     extraction_model=extraction_model,
                     reasoning_model=reasoning_model,
                     web_context_by_symbol=web_context_by_symbol,
+                    symbol_proxy_terms_by_symbol=dict(getattr(config, "symbol_proxy_terms", {}) or {}),
                 ),
                 timeout=stage2_timeout_seconds,
             )
@@ -271,6 +273,12 @@ class PipelineService:
             entry_threshold_override=entry_threshold_override,
             price_context=price_context,
             signal_age_hours=signal_age_hours,
+            crazy_ramp_context=await build_crazy_ramp_context(
+                symbols=self.symbols,
+                risk_profile=getattr(config, "risk_profile", "moderate"),
+                risk_policy=dict(getattr(config, "risk_policy", {}) or {}),
+                price_context=price_context,
+            ),
         )
 
         # ── Materiality gate ──────────────────────────────────────────────
@@ -364,6 +372,7 @@ class PipelineService:
             backtest_results = await self._backtest.run_backtest(
                 symbols=self.symbols,
                 sentiment_results=sentiment_results,
+                risk_profile=getattr(config, "risk_profile", "moderate"),
             )
         except Exception as exc:
             backtest_status = "skipped"

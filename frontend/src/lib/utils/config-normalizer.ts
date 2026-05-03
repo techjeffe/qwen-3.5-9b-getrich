@@ -32,6 +32,19 @@ export type AppConfig = {
     ollama_parallel_slots: number;
     red_team_enabled: boolean;
     risk_profile: string;
+    risk_policy?: {
+        crazy_ramp?: {
+            threshold_source?: string;
+            fetch_timeout_ms?: number;
+            eval_timeout_ms?: number;
+            stale_ms?: number;
+            fallback?: {
+                breakout_atr_fraction?: number;
+                volume_multiplier?: number;
+                retrace_guard?: number;
+            };
+        };
+    };
     web_research_enabled: boolean;
     allow_extended_hours_trading: boolean;
     hold_overnight: boolean;
@@ -87,6 +100,9 @@ export type AppConfig = {
     alpaca_execution_mode: "off" | "paper" | "live";
     alpaca_live_trading_enabled: boolean;
     alpaca_allow_short_selling: boolean;
+    alpaca_fixed_order_size: boolean;
+    alpaca_paper_trade_amount_usd: number | null;
+    alpaca_live_trade_amount_usd: number | null;
     alpaca_max_position_usd: number | null;
     alpaca_max_total_exposure_usd: number | null;
     alpaca_order_type: string;
@@ -94,6 +110,15 @@ export type AppConfig = {
     alpaca_daily_loss_limit_usd: number | null;
     alpaca_max_consecutive_losses: number | null;
 };
+
+function normalizeRiskProfile(value: unknown): string {
+    const profile = String(value ?? "").trim().toLowerCase();
+    if (profile === "moderate" || profile === "aggressive") return "standard";
+    if (profile === "conservative" || profile === "standard" || profile === "crazy" || profile === "custom") {
+        return profile;
+    }
+    return "standard";
+}
 
 // ─── Empty / Default Config ─────────────────────────────────────────
 
@@ -115,7 +140,20 @@ export const EMPTY_CONFIG: AppConfig = {
     reasoning_model: "",
     ollama_parallel_slots: 1,
     red_team_enabled: true,
-    risk_profile: "moderate",
+    risk_profile: "standard",
+    risk_policy: {
+        crazy_ramp: {
+            threshold_source: "calibrated_bucket",
+            fetch_timeout_ms: 2500,
+            eval_timeout_ms: 15000,
+            stale_ms: 120000,
+            fallback: {
+                breakout_atr_fraction: 0.45,
+                volume_multiplier: 2.0,
+                retrace_guard: 0.2,
+            },
+        },
+    },
     web_research_enabled: false,
     allow_extended_hours_trading: true,
     hold_overnight: false,
@@ -166,6 +204,9 @@ export const EMPTY_CONFIG: AppConfig = {
     alpaca_execution_mode: "off",
     alpaca_live_trading_enabled: false,
     alpaca_allow_short_selling: false,
+    alpaca_fixed_order_size: false,
+    alpaca_paper_trade_amount_usd: null,
+    alpaca_live_trade_amount_usd: null,
     alpaca_max_position_usd: null,
     alpaca_max_total_exposure_usd: null,
     alpaca_order_type: "market",
@@ -216,6 +257,7 @@ export function normalizeConfigPayload(payload: Partial<AppConfig> | null | unde
 
     return {
         ...next,
+        risk_profile: normalizeRiskProfile(next.risk_profile),
         alpaca_execution_mode: executionMode,
         alpaca_live_trading_enabled: executionMode === "live",
         tracked_symbols: Array.isArray(next.tracked_symbols) ? next.tracked_symbols : EMPTY_CONFIG.tracked_symbols,
@@ -227,6 +269,7 @@ export function normalizeConfigPayload(payload: Partial<AppConfig> | null | unde
             ...EMPTY_CONFIG.logic_defaults,
             ...(next.logic_defaults ?? {}),
         },
+        risk_policy: next.risk_policy ?? EMPTY_CONFIG.risk_policy,
         available_models: Array.isArray(next.available_models) ? next.available_models : [],
         supported_symbols: Array.isArray(next.supported_symbols) ? next.supported_symbols : EMPTY_CONFIG.supported_symbols,
         default_rss_feeds: Array.isArray(next.default_rss_feeds) ? next.default_rss_feeds : [],

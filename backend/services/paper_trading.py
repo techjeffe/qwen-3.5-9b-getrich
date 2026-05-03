@@ -710,7 +710,10 @@ def process_signals(
         # Open new position — size using volatility targeting, then apply portfolio cap
         _base_amount = trade_amount if trade_amount and trade_amount > 0 else _L["paper_trade_amount"]
         _atr_pct = float(rec.get("atr_pct") or 0.0)
-        _amount = _compute_vol_normalized_amount(_base_amount, conviction_level, _atr_pct)
+        if getattr(_app_config, "alpaca_fixed_order_size", False):
+            _amount = _base_amount
+        else:
+            _amount = _compute_vol_normalized_amount(_base_amount, conviction_level, _atr_pct)
 
         if _portfolio_cap is not None:
             _remaining = max(0.0, _portfolio_cap - _open_exposure)

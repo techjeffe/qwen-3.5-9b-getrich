@@ -27,6 +27,7 @@ from services.analysis.hysteresis_service import HysteresisService
 from services.analysis.persistence_service import PersistenceService
 from services.analysis.backtest_service import BacktestService
 from services.analysis.cache_service import PriceCacheService
+from services.risk_policy_runtime import build_crazy_ramp_context
 
 
 class StreamService:
@@ -179,6 +180,7 @@ class StreamService:
                 extraction_model=extraction_model,
                 reasoning_model=reasoning_model,
                 web_context_by_symbol=web_context_by_symbol,
+                symbol_proxy_terms_by_symbol=dict(getattr(config, "symbol_proxy_terms", {}) or {}),
             )
         )
         while True:
@@ -213,6 +215,12 @@ class StreamService:
             entry_threshold_override=entry_threshold_override,
             price_context=price_context,
             signal_age_hours=signal_age_hours,
+            crazy_ramp_context=await build_crazy_ramp_context(
+                symbols=symbols,
+                risk_profile=getattr(config, "risk_profile", "moderate"),
+                risk_policy=dict(getattr(config, "risk_policy", {}) or {}),
+                price_context=price_context,
+            ),
         )
         per_symbol_counts = self._materiality._count_symbol_articles(
             posts, list(sentiment_results.keys()),
@@ -285,6 +293,7 @@ class StreamService:
             backtest_results = await self._backtest.run_backtest(
                 symbols=list(sentiment_results.keys()),
                 sentiment_results=sentiment_results,
+                risk_profile=getattr(config, "risk_profile", "moderate"),
             )
         except Exception as e:
             backtest_results = {

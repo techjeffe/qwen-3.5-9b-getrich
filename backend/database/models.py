@@ -325,6 +325,7 @@ class AppConfig(Base):
     lookback_days = Column(Integer, nullable=False, default=14)
     symbol_prompt_overrides = Column(JSON, nullable=False, default={})
     symbol_company_aliases = Column(JSON, nullable=False, default={})
+    symbol_proxy_terms = Column(JSON, nullable=False, default={})
     display_timezone = Column(String(64), nullable=False, default="")
     enabled_rss_feeds = Column(JSON, nullable=False, default=[])
     custom_rss_feeds = Column(JSON, nullable=False, default=[])
@@ -342,7 +343,8 @@ class AppConfig(Base):
     # Toggle the red-team adversarial review pass. Off saves ~one Ollama call
     # per analysis at the cost of losing the bias/risk countercheck.
     red_team_enabled = Column(Boolean, nullable=False, default=True)
-    risk_profile = Column(String(20), nullable=False, default="moderate")
+    risk_profile = Column(String(20), nullable=False, default="standard")
+    risk_policy = Column(JSON, nullable=False, default={})
     web_research_enabled = Column(Boolean, nullable=False, default=False)
     allow_extended_hours_trading = Column(Boolean, nullable=False, default=True)
     remote_snapshot_enabled = Column(Boolean, nullable=False, default=False)
@@ -371,6 +373,9 @@ class AppConfig(Base):
     alpaca_execution_mode         = Column(String(10),  nullable=False, default="off")  # off | paper | live
     alpaca_live_trading_enabled   = Column(Boolean,     nullable=False, default=False)
     alpaca_allow_short_selling    = Column(Boolean,     nullable=False, default=False)
+    alpaca_fixed_order_size       = Column(Boolean,     nullable=False, default=False)
+    alpaca_paper_trade_amount_usd = Column(Float,       nullable=True,  default=None)
+    alpaca_live_trade_amount_usd  = Column(Float,       nullable=True,  default=None)
     alpaca_max_position_usd       = Column(Float,       nullable=True,  default=None)
     alpaca_max_total_exposure_usd = Column(Float,       nullable=True,  default=None)
     alpaca_order_type             = Column(String(20),  nullable=False, default="market")

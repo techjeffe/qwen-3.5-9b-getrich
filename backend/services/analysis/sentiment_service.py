@@ -58,6 +58,7 @@ class SentimentService:
         extraction_model: Optional[str] = None,
         reasoning_model: Optional[str] = None,
         web_context_by_symbol: Optional[Dict[str, str]] = None,
+        symbol_proxy_terms_by_symbol: Optional[Dict[str, List[str]]] = None,
     ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         """
         Two-stage analysis pipeline.
@@ -69,6 +70,10 @@ class SentimentService:
         engine = SentimentEngine(model_name=model_name)
         engine.clear_cache()
         web_context_by_symbol = web_context_by_symbol or {}
+        symbol_proxy_terms_by_symbol = {
+            str(sym).upper(): list(terms or [])
+            for sym, terms in (symbol_proxy_terms_by_symbol or {}).items()
+        }
 
         # ── Stage 1: entity extraction (optional) ────────────────────────────────
         stage1_result: Optional[Dict[str, Any]] = None
@@ -79,7 +84,12 @@ class SentimentService:
         stage1_model = extraction_model or model_name
         if stage1_model:
             stage1_started = time.time()
-            stage1_result = await engine.extract_relevant_articles(posts, symbols, stage1_model)
+            stage1_result = await engine.extract_relevant_articles(
+                posts,
+                symbols,
+                stage1_model,
+                persisted_proxy_terms_by_symbol=symbol_proxy_terms_by_symbol,
+            )
             stage1_duration_ms = (time.time() - stage1_started) * 1000
             analysis_posts = stage1_result["filtered_posts"]
             proxy_terms_by_symbol = stage1_result["proxy_terms_by_symbol"]

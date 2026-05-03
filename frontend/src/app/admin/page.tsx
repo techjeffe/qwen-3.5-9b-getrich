@@ -10,8 +10,8 @@ import { normalizeSymbolInput, normalizeFeedUrl, normalizeArticleLimit } from "@
 
 // Sections
 import { OverviewSection } from "@/components/admin/sections/OverviewSection";
-import { ModelsSection } from "@/components/admin/sections/ModelsSection";
 import { TradingLogicSection } from "@/components/admin/sections/TradingLogicSection";
+import { TradingBehaviorSection } from "@/components/admin/sections/TradingBehaviorSection";
 import { SymbolsSection } from "@/components/admin/sections/SymbolsSection";
 import { RssSection } from "@/components/admin/sections/RssSection";
 import { PromptOverridesSection } from "@/components/admin/sections/PromptOverridesSection";
@@ -27,6 +27,7 @@ import { DirtyModal } from "@/components/admin/modals/DirtyModal";
 import { BasicModeModal } from "@/components/admin/modals/BasicModeModal";
 import { RemoteSnapshotSetupModal } from "@/components/admin/modals/RemoteSnapshotSetupModal";
 import { LiveConfirmModal } from "@/components/admin/modals/LiveConfirmModal";
+import { CustomRiskModal } from "@/components/admin/modals/CustomRiskModal";
 
 // Re-export types needed by components
 type RssFeedOption = {
@@ -45,6 +46,8 @@ type AlpacaStatus = {
     execution_mode: "off" | "paper" | "live";
     live_trading_enabled: boolean;
     allow_short_selling: boolean;
+    paper_trade_amount_usd: number | null;
+    live_trade_amount_usd: number | null;
     max_position_usd: number | null;
     max_total_exposure_usd: number | null;
     order_type: string;
@@ -87,6 +90,7 @@ export default function AdminPage() {
     const [pendingNav, setPendingNav] = useState<string | null>(null);
     const [showResetModal, setShowResetModal] = useState(false);
     const [showRemoteSnapshotSetupModal, setShowRemoteSnapshotSetupModal] = useState(false);
+    const [selectedSection, setSelectedSection] = useState<string>("overview");
     const [remoteSecrets, setRemoteSecrets] = useState<RemoteSnapshotSecretsStatus>({
         available: false,
         configured: false,
@@ -123,6 +127,7 @@ export default function AdminPage() {
     const [isTestingAlpacaConnection, setIsTestingAlpacaConnection] = useState(false);
     const [alpacaTestResult, setAlpacaTestResult] = useState<{ ok: boolean; message: string } | null>(null);
     const [showLiveConfirmModal, setShowLiveConfirmModal] = useState(false);
+    const [showCustomRiskModal, setShowCustomRiskModal] = useState(false);
     const [liveConfirmText, setLiveConfirmText] = useState("");
     const [isEnablingLive, setIsEnablingLive] = useState(false);
     const [alpacaAccountConfigurations, setAlpacaAccountConfigurations] = useState<Record<string, unknown> | null>(null);
@@ -168,19 +173,11 @@ export default function AdminPage() {
             pipeline: "Always runs Stage 1 entity mapping then Stage 2 reasoning. Requires both models to be set.",
         },
     ];
-    const jumpOptions = [
-        { value: "overview", label: "Overview", description: "Depth, leverage, and overall runtime posture." },
-        { value: "models", label: "Models", description: "Pipeline mode, research, and Ollama model selection." },
-        { value: "trading-logic", label: "Trading Logic", description: "Session hours, thresholds, and logic overrides." },
-        { value: "symbols", label: "Symbols", description: "Tracked defaults, custom symbols, and aliases." },
-        { value: "rss", label: "RSS Sources", description: "Feed universe and article depth controls." },
-        { value: "prompts", label: "Prompt Overrides", description: "Per-symbol specialist guidance." },
-        { value: "executions", label: "Executions", description: "Manual execution cleanup and review." },
-        { value: "system", label: "System", description: "Scheduling, timezone, and run status." },
-        { value: "remote-snapshot", label: "Remote Snapshot", description: "Outbound delivery, Telegram setup, and manual sends." },
-        { value: "price-history", label: "Price History", description: "Indicator data readiness and pulls." },
-        { value: "alpaca-live-trading", label: "Brokerage", description: "Alpaca paper/live routing and broker guardrails." },
-        { value: "danger-zone", label: "Danger Zone", description: "Destructive reset actions." },
+    const sectionOptions = [
+        { value: "overview", label: "Overview", description: "Risk profile, depth, models, and pipeline posture." },
+        { value: "trading", label: "Trading + Execution", description: "Guardrails and Alpaca routing." },
+        { value: "symbols", label: "Symbols + RSS", description: "Tracked symbols, custom names, and feed sources." },
+        { value: "system", label: "System / Scheduling", description: "Auto-run, snapshots, and price-history status." },
     ];
     const riskOptions: Array<{
         key: string;
@@ -199,20 +196,12 @@ export default function AdminPage() {
             color: "blue",
         },
         {
-            key: "moderate",
-            label: "Moderate",
-            tagline: "2x when confident",
-            description: "Use 2x leverage when model confidence exceeds 75%, otherwise 1x. Default setting.",
+            key: "standard",
+            label: "Standard",
+            tagline: "Balanced default",
+            description: "The baseline profile tuned for broad conditions with controlled leverage and defaults.",
             maxLeverage: "2x at >75% confidence",
             color: "teal",
-        },
-        {
-            key: "aggressive",
-            label: "Aggressive",
-            tagline: "3x when confident",
-            description: "Use 3x leverage when model confidence exceeds 75%, otherwise 1x.",
-            maxLeverage: "3x at >75% confidence",
-            color: "amber",
         },
         {
             key: "crazy",
@@ -222,7 +211,21 @@ export default function AdminPage() {
             maxLeverage: "3x always",
             color: "rose",
         },
+        {
+            key: "custom",
+            label: "Custom",
+            tagline: "Tune everything",
+            description: "Unlocks strategy and Alpaca guardrail controls in one modal.",
+            maxLeverage: "User-defined overrides",
+            color: "amber",
+        },
     ];
+    const handleSelectRiskProfile = useCallback((profile: string) => {
+        setConfig((current) => ({ ...current, risk_profile: profile }));
+        if (profile === "custom") {
+            setShowCustomRiskModal(true);
+        }
+    }, []);
 
     const hasAdvancedCustomizations = useMemo(() => {
         const d = BASIC_MODE_DEFAULTS;
@@ -256,9 +259,7 @@ export default function AdminPage() {
     }, [config]);
 
     const advancedOnlySections = new Set(["trading-logic", "rss", "prompts", "executions", "price-history"]);
-    const visibleJumpOptions = isAdvancedMode
-        ? jumpOptions
-        : jumpOptions.filter((opt) => !advancedOnlySections.has(opt.value));
+    const visibleSectionOptions = sectionOptions;
 
     const handleSwitchToBasic = () => {
         if (hasAdvancedCustomizations) {
@@ -696,11 +697,10 @@ export default function AdminPage() {
         }
     };
 
-    const jumpToSection = (sectionId: string) => {
+    const selectSection = (sectionId: string) => {
         if (!sectionId) return;
-        const el = document.getElementById(sectionId);
-        if (!el) return;
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        setSelectedSection(sectionId);
+        window.scrollTo({ top: 0, behavior: "smooth" });
     };
 
     const handleNavigate = (target: string) => {
@@ -875,33 +875,43 @@ export default function AdminPage() {
                         <span className="text-lg font-semibold text-slate-100">Admin</span>
                     </div>
                     <div className="space-y-1">
-                        {visibleJumpOptions.map((opt) => (
+                        {visibleSectionOptions.map((opt) => (
                             <button
                                 key={opt.value}
                                 type="button"
-                                onClick={() => jumpToSection(opt.value)}
-                                className="block w-full text-left py-2 px-3 rounded-lg text-sm text-slate-300 hover:bg-slate-800/80 hover:text-white"
+                                onClick={() => selectSection(opt.value)}
+                                className={`block w-full text-left py-3 px-3 rounded-xl text-sm transition-colors ${
+                                    selectedSection === opt.value
+                                        ? "bg-slate-800 text-white shadow-inner"
+                                        : "text-slate-300 hover:bg-slate-800/80 hover:text-white"
+                                }`}
+                                aria-current={selectedSection === opt.value ? "page" : undefined}
                             >
-                                {opt.label}
+                                <div className="font-medium">{opt.label}</div>
+                                <div className="text-[11px] text-slate-500 mt-0.5">{opt.description}</div>
                             </button>
                         ))}
                     </div>
                     <div className="mt-6 space-y-2">
-                        <button
-                            type="button"
-                            onClick={handleSwitchToAdvanced}
-                            className="text-xs text-slate-500 hover:text-slate-300"
-                        >
-                            {isAdvancedMode ? "✓ Advanced Mode" : "Switch to Advanced"}
-                        </button>
-                        {isAdvancedMode && (
+                        {!isAdvancedMode ? (
                             <button
                                 type="button"
-                                onClick={handleSwitchToBasic}
+                                onClick={handleSwitchToAdvanced}
                                 className="text-xs text-slate-500 hover:text-slate-300"
                             >
-                                {hasAdvancedCustomizations ? "Reset to Basic" : "Switch to Basic"}
+                                Switch to Advanced
                             </button>
+                        ) : (
+                            <>
+                                <p className="text-xs text-slate-400">✓ Advanced mode</p>
+                                <button
+                                    type="button"
+                                    onClick={handleSwitchToBasic}
+                                    className="text-xs text-slate-500 hover:text-slate-300"
+                                >
+                                    {hasAdvancedCustomizations ? "Reset to Basic" : "Switch to Basic"}
+                                </button>
+                            </>
                         )}
                     </div>
                 </nav>
@@ -910,12 +920,16 @@ export default function AdminPage() {
                 <div className="flex-1 min-w-0">
                     {/* Mobile nav */}
                     <div className="md:hidden flex gap-2 mb-6 overflow-x-auto pb-2">
-                        {visibleJumpOptions.map((opt) => (
+                        {visibleSectionOptions.map((opt) => (
                             <button
                                 key={opt.value}
                                 type="button"
-                                onClick={() => jumpToSection(opt.value)}
-                                className="flex-shrink-0 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+                                onClick={() => selectSection(opt.value)}
+                                className={`flex-shrink-0 rounded-lg border px-3 py-1.5 text-xs transition-colors ${
+                                    selectedSection === opt.value
+                                        ? "border-blue-500 bg-blue-500/10 text-blue-200"
+                                        : "border-slate-800 bg-slate-900 text-slate-300 hover:bg-slate-800"
+                                }`}
                             >
                                 {opt.label}
                             </button>
@@ -965,127 +979,134 @@ export default function AdminPage() {
 
                     {/* Extracted sections */}
                     <div className="space-y-6">
-                        <OverviewSection
-                            config={config} setConfig={setConfig}
-                            isAdvancedMode={isAdvancedMode}
-                            riskOptions={riskOptions} depthOptions={depthOptions}
-                        />
-                        <ModelsSection
-                            config={config} setConfig={setConfig}
-                            hasAdvancedCustomizations={hasAdvancedCustomizations}
-                            depthOptions={depthOptions}
-                        />
-                        {isAdvancedMode && (
-                            <TradingLogicSection
+                        {selectedSection === "overview" && (
+                            <OverviewSection
                                 config={config} setConfig={setConfig}
+                                isAdvancedMode={isAdvancedMode}
+                                riskOptions={riskOptions} depthOptions={depthOptions}
+                                onSelectRiskProfile={handleSelectRiskProfile}
                             />
                         )}
-                        <SymbolsSection
-                            config={config} setConfig={setConfig}
-                            trackedSet={trackedSet}
-                            customSymbolSlots={customSymbolSlots}
-                            updateCustomSymbol={updateCustomSymbol}
-                            updateCustomSymbolAlias={updateCustomSymbolAlias}
-                            toggleCustomSymbolTracked={toggleCustomSymbolTracked}
-                            toggleTrackedSymbol={toggleTrackedSymbol}
-                        />
-                        {isAdvancedMode && (
-                            <RssSection
-                                config={config} setConfig={setConfig}
-                                depthOptions={depthOptions}
-                                enabledFeeds={enabledFeeds}
-                                toggleFeed={toggleFeed}
-                                customFeedSlots={customFeedSlots}
-                                updateCustomFeed={updateCustomFeed}
-                                updateCustomFeedLabel={updateCustomFeedLabel}
-                                toggleCustomFeedTracked={toggleCustomFeedTracked}
-                                updateArticleLimit={updateArticleLimit}
-                            />
+                        {selectedSection === "trading" && (
+                            <>
+                                <TradingBehaviorSection
+                                    config={config}
+                                    setConfig={setConfig}
+                                />
+                                {isAdvancedMode && config.risk_profile === "custom" && (
+                                    <TradingLogicSection
+                                        openCustomRiskModal={() => setShowCustomRiskModal(true)}
+                                    />
+                                )}
+                                <BrokerageSection
+                                    config={config} setConfig={setConfig}
+                                    isAdvancedMode={isAdvancedMode}
+                                    alpacaStatus={alpacaStatus}
+                                    alpacaAccountConfigurations={alpacaAccountConfigurations}
+                                    alpacaSecretForm={alpacaSecretForm}
+                                    setAlpacaSecretForm={setAlpacaSecretForm}
+                                    alpacaSecretStatus={alpacaSecretStatus}
+                                    alpacaTestResult={alpacaTestResult}
+                                    isSavingAlpacaSecrets={isSavingAlpacaSecrets}
+                                    isTestingAlpacaConnection={isTestingAlpacaConnection}
+                                    saveAlpacaSecrets={saveAlpacaSecrets}
+                                    clearAlpacaSecrets={clearAlpacaSecrets}
+                                    testAlpacaConnection={testAlpacaConnection}
+                                    openLiveConfirmModal={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
+                                    setAlpacaExecutionMode={setAlpacaExecutionMode}
+                                />
+                            </>
                         )}
-                        {isAdvancedMode && (
-                            <PromptOverridesSection
-                                config={config} setConfig={setConfig}
-                                updatePromptOverride={updatePromptOverride}
-                            />
+                        {selectedSection === "symbols" && (
+                            <>
+                                <SymbolsSection
+                                    config={config} setConfig={setConfig}
+                                    trackedSet={trackedSet}
+                                    customSymbolSlots={customSymbolSlots}
+                                    updateCustomSymbol={updateCustomSymbol}
+                                    updateCustomSymbolAlias={updateCustomSymbolAlias}
+                                    toggleCustomSymbolTracked={toggleCustomSymbolTracked}
+                                    toggleTrackedSymbol={toggleTrackedSymbol}
+                                />
+                                <RssSection
+                                    config={config} setConfig={setConfig}
+                                    depthOptions={depthOptions}
+                                    enabledFeeds={enabledFeeds}
+                                    toggleFeed={toggleFeed}
+                                    customFeedSlots={customFeedSlots}
+                                    updateCustomFeed={updateCustomFeed}
+                                    updateCustomFeedLabel={updateCustomFeedLabel}
+                                    toggleCustomFeedTracked={toggleCustomFeedTracked}
+                                    updateArticleLimit={updateArticleLimit}
+                                />
+                                {isAdvancedMode && (
+                                    <PromptOverridesSection
+                                        config={config}
+                                        setConfig={setConfig}
+                                        updatePromptOverride={updatePromptOverride}
+                                    />
+                                )}
+                            </>
                         )}
-                        {isAdvancedMode && (
-                            <ExecutionsSection
-                                unexecutedTrades={unexecutedTrades}
-                                deletingId={deletingId}
-                                deleteError={deleteError}
-                                timeZone={timeZone}
-                                deleteTrade={deleteTrade}
-                            />
+                        {selectedSection === "system" && (
+                            <>
+                                <SystemSection
+                                    config={config} setConfig={setConfig}
+                                    timeZone={timeZone} setTimeZone={setTimeZone}
+                                    isAdvancedMode={isAdvancedMode}
+                                />
+                                <RemoteSnapshotSection
+                                    config={config} setConfig={setConfig}
+                                    isAdvancedMode={isAdvancedMode}
+                                    timeZone={timeZone}
+                                    sendSnapshotStatus={sendSnapshotStatus}
+                                    isSendingSnapshotNow={isSendingSnapshotNow}
+                                    sendSnapshotNow={sendRemoteSnapshotNow}
+                                    toggleRemoteSnapshotEnabled={toggleRemoteSnapshotEnabled}
+                                    remoteSecrets={remoteSecrets}
+                                    setShowRemoteSnapshotSetupModal={setShowRemoteSnapshotSetupModal}
+                                />
+                                <PriceHistorySection
+                                    isAdvancedMode={isAdvancedMode}
+                                    isPulling={isPulling}
+                                    pullStatus={pullStatus}
+                                    priceHistoryStatus={priceHistoryStatus}
+                                    handlePullPriceHistory={handlePullPriceHistory}
+                                />
+                                {isAdvancedMode && (
+                                    <ExecutionsSection
+                                        unexecutedTrades={unexecutedTrades}
+                                        deletingId={deletingId}
+                                        deleteError={deleteError}
+                                        timeZone={timeZone}
+                                        deleteTrade={deleteTrade}
+                                    />
+                                )}
+                                <section id="danger-zone" className="scroll-mt-24 rounded-2xl border border-red-900/50 bg-red-950/20 p-5 space-y-4">
+                                    <div>
+                                        <h2 className="text-sm font-semibold text-red-400">Danger Zone</h2>
+                                        <p className="text-xs text-slate-500 mt-1">
+                                            Irreversible actions. Your config settings are not affected.
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center justify-between gap-4 rounded-xl border border-red-900/40 bg-slate-950/60 px-4 py-3">
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-200">Reset all data</p>
+                                            <p className="text-xs text-slate-500 mt-0.5">
+                                                Deletes all analysis results, trade recommendations, P&L snapshots, and execution records. Config is preserved.
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => { setResetStatus(null); setResetConfirmText(""); setShowResetModal(true); }}
+                                            className="flex-shrink-0 rounded-lg border border-red-800 px-4 py-2 text-sm font-medium text-red-400 hover:bg-red-900/30"
+                                        >
+                                            Reset Database
+                                        </button>
+                                    </div>
+                                </section>
+                            </>
                         )}
-                        <SystemSection
-                            config={config} setConfig={setConfig}
-                            timeZone={timeZone} setTimeZone={setTimeZone}
-                            isAdvancedMode={isAdvancedMode}
-                            isDirty={isDirty}
-                            isSaving={isSaving}
-                            status={status}
-                            handleSaveAndExit={handleSaveAndExit}
-                            save={save}
-                        />
-                        <RemoteSnapshotSection
-                            config={config} setConfig={setConfig}
-                            isAdvancedMode={isAdvancedMode}
-                            timeZone={timeZone}
-                            sendSnapshotStatus={sendSnapshotStatus}
-                            isSendingSnapshotNow={isSendingSnapshotNow}
-                            sendSnapshotNow={sendRemoteSnapshotNow}
-                            toggleRemoteSnapshotEnabled={toggleRemoteSnapshotEnabled}
-                            remoteSecrets={remoteSecrets}
-                            setShowRemoteSnapshotSetupModal={setShowRemoteSnapshotSetupModal}
-                        />
-                        <BrokerageSection
-                            config={config} setConfig={setConfig}
-                            isAdvancedMode={isAdvancedMode}
-                            alpacaStatus={alpacaStatus}
-                            alpacaAccountConfigurations={alpacaAccountConfigurations}
-                            alpacaSecretForm={alpacaSecretForm}
-                            setAlpacaSecretForm={setAlpacaSecretForm}
-                            alpacaSecretStatus={alpacaSecretStatus}
-                            alpacaTestResult={alpacaTestResult}
-                            isSavingAlpacaSecrets={isSavingAlpacaSecrets}
-                            isTestingAlpacaConnection={isTestingAlpacaConnection}
-                            saveAlpacaSecrets={saveAlpacaSecrets}
-                            clearAlpacaSecrets={clearAlpacaSecrets}
-                            testAlpacaConnection={testAlpacaConnection}
-                            openLiveConfirmModal={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
-                            setAlpacaExecutionMode={setAlpacaExecutionMode}
-                        />
-                        <PriceHistorySection
-                            isAdvancedMode={isAdvancedMode}
-                            isPulling={isPulling}
-                            pullStatus={pullStatus}
-                            priceHistoryStatus={priceHistoryStatus}
-                            handlePullPriceHistory={handlePullPriceHistory}
-                        />
-                        {/* Danger Zone (inline - keep minimal, not worth a component) */}
-                        <section id="danger-zone" className="scroll-mt-24 rounded-2xl border border-red-900/50 bg-red-950/20 p-5 space-y-4">
-                            <div>
-                                <h2 className="text-sm font-semibold text-red-400">Danger Zone</h2>
-                                <p className="text-xs text-slate-500 mt-1">
-                                    Irreversible actions. Your config settings are not affected.
-                                </p>
-                            </div>
-                            <div className="flex items-center justify-between gap-4 rounded-xl border border-red-900/40 bg-slate-950/60 px-4 py-3">
-                                <div>
-                                    <p className="text-sm font-medium text-slate-200">Reset all data</p>
-                                    <p className="text-xs text-slate-500 mt-0.5">
-                                        Deletes all analysis results, trade recommendations, P&L snapshots, and execution records. Config is preserved.
-                                    </p>
-                                </div>
-                                <button
-                                    type="button"
-                                    onClick={() => { setResetStatus(null); setResetConfirmText(""); setShowResetModal(true); }}
-                                    className="flex-shrink-0 rounded-lg border border-red-800 px-4 py-2 text-sm font-medium text-red-400 hover:bg-red-900/30"
-                                >
-                                    Reset Database
-                                </button>
-                            </div>
-                        </section>
                     </div>
                 </div>
             </div>
@@ -1159,6 +1180,12 @@ export default function AdminPage() {
                 setLiveConfirmText={setLiveConfirmText}
                 setShowLiveConfirmModal={setShowLiveConfirmModal}
                 handleSaveAndActivateLive={() => setAlpacaExecutionMode("live")}
+            />
+            <CustomRiskModal
+                show={showCustomRiskModal}
+                config={config}
+                setConfig={setConfig}
+                onClose={() => setShowCustomRiskModal(false)}
             />
         </main>
     );

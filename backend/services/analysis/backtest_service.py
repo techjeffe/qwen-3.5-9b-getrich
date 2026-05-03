@@ -25,6 +25,7 @@ class BacktestService:
         symbols: List[str],
         sentiment_results: Dict[str, Dict],
         lookback_days: int = 14,
+        risk_profile: str = "standard",
     ) -> Dict[str, Any]:
         """
         Run a rolling-window backtest for the current signal.
@@ -67,14 +68,29 @@ class BacktestService:
         )
 
         summary = result.get('summary', {})
+        regime_validation = result.get("regime_validation", {})
+        sharpe_target = 1.0 if str(risk_profile or "").lower().strip() in {"moderate", "aggressive", "standard", "custom"} else 0.0
+        sharpe_value = float(summary.get('avg_sharpe_ratio', 0.0) or 0.0)
+        standard_acceptance = {
+            "target_sharpe": sharpe_target,
+            "passed_sharpe": sharpe_value >= sharpe_target if sharpe_target > 0 else True,
+            "passed_regime_mix": bool(regime_validation.get("ok", False)),
+        }
+        standard_acceptance["passed"] = bool(
+            standard_acceptance["passed_sharpe"] and standard_acceptance["passed_regime_mix"]
+        ) if sharpe_target > 0 else bool(regime_validation.get("ok", False))
 
         return {
             "total_return": summary.get('avg_total_return', 0.0),
-            "annualized_return": summary.get('avg_sharpe_ratio', 0.0) * 10,
-            "sharpe_ratio": summary.get('avg_sharpe_ratio', 0.0),
+            "annualized_return": sharpe_value * 10,
+            "sharpe_ratio": sharpe_value,
             "max_drawdown": summary.get('avg_max_drawdown', 0.0),
             "win_rate": 0.0,
             "total_trades": 0,
             "lookback_days": lookback_days,
-            "walk_forward_steps": result.get('num_windows', 0)
+            "walk_forward_steps": int(summary.get("num_windows", 0) or 0),
+            "regime_validation": {
+                **dict(regime_validation or {}),
+                "standard_acceptance": standard_acceptance,
+            },
         }

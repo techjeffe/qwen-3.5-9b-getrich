@@ -32,6 +32,7 @@ def migrate():
                 ("custom_symbols", "JSON", "'[]'"),
                 ("display_timezone", "VARCHAR(64)", "''"),
                 ("symbol_company_aliases", "JSON", "'{}'"),
+                ("symbol_proxy_terms", "JSON", "'{}'"),
                 ("enabled_rss_feeds", "JSON", "'[]'"),
                 ("custom_rss_feeds", "JSON", "'[]'"),
                 ("custom_rss_feed_labels", "JSON", "'{}'"),
@@ -41,7 +42,8 @@ def migrate():
                 ("reasoning_model", "VARCHAR(128)", "''"),
                 ("ollama_parallel_slots", "INTEGER", "1"),
                 ("red_team_enabled", "BOOLEAN", "1"),
-                ("risk_profile", "VARCHAR(20)", "'moderate'"),
+                ("risk_profile", "VARCHAR(20)", "'standard'"),
+                ("risk_policy", "JSON", "'{}'"),
                 ("web_research_enabled", "BOOLEAN", "0"),
                 ("allow_extended_hours_trading", "BOOLEAN", "1"),
                 ("remote_snapshot_enabled", "BOOLEAN", "0"),
@@ -236,6 +238,7 @@ def migrate():
                 ("alpaca_execution_mode",         "VARCHAR(10)", "'off'"),
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "0"),
                 ("alpaca_allow_short_selling",    "BOOLEAN", "0"),
+                ("alpaca_fixed_order_size",       "BOOLEAN", "0"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
                 ("alpaca_limit_slippage_pct",     "REAL", "0.002"),
             ]:
@@ -244,6 +247,8 @@ def migrate():
                     conn.exec_driver_sql(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}")
                     conn.commit()
             for column_name, column_type in [
+                ("alpaca_paper_trade_amount_usd", "REAL"),
+                ("alpaca_live_trade_amount_usd",  "REAL"),
                 ("alpaca_max_position_usd",       "REAL"),
                 ("alpaca_max_total_exposure_usd", "REAL"),
                 ("alpaca_daily_loss_limit_usd",   "REAL"),
@@ -296,6 +301,7 @@ def migrate():
                 ("custom_symbols", "JSON", "'[]'"),
                 ("display_timezone", "VARCHAR(64)", "''"),
                 ("symbol_company_aliases", "JSON", "'{}'"),
+                ("symbol_proxy_terms", "JSON", "'{}'"),
                 ("enabled_rss_feeds", "JSON", "'[]'"),
                 ("custom_rss_feeds", "JSON", "'[]'"),
                 ("custom_rss_feed_labels", "JSON", "'{}'"),
@@ -305,7 +311,8 @@ def migrate():
                 ("reasoning_model", "VARCHAR(128)", "''"),
                 ("ollama_parallel_slots", "INTEGER", "1"),
                 ("red_team_enabled", "BOOLEAN", "TRUE"),
-                ("risk_profile", "VARCHAR(20)", "'moderate'"),
+                ("risk_profile", "VARCHAR(20)", "'standard'"),
+                ("risk_policy", "JSON", "'{}'"),
                 ("web_research_enabled", "BOOLEAN", "FALSE"),
                 ("allow_extended_hours_trading", "BOOLEAN", "TRUE"),
                 ("remote_snapshot_enabled", "BOOLEAN", "FALSE"),
@@ -478,6 +485,7 @@ def migrate():
                 ("alpaca_execution_mode",         "VARCHAR(10)", "'off'"),
                 ("alpaca_live_trading_enabled",   "BOOLEAN", "FALSE"),
                 ("alpaca_allow_short_selling",    "BOOLEAN", "FALSE"),
+                ("alpaca_fixed_order_size",       "BOOLEAN", "FALSE"),
                 ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
                 ("alpaca_limit_slippage_pct",     "FLOAT", "0.002"),
             ]:
@@ -490,6 +498,8 @@ def migrate():
                     conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_value}"))
                     conn.commit()
             for column_name, column_type in [
+                ("alpaca_paper_trade_amount_usd", "FLOAT"),
+                ("alpaca_live_trade_amount_usd",  "FLOAT"),
                 ("alpaca_max_position_usd",       "FLOAT"),
                 ("alpaca_max_total_exposure_usd", "FLOAT"),
                 ("alpaca_daily_loss_limit_usd",   "FLOAT"),

@@ -30,7 +30,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     extraction_model: "",
     reasoning_model: "",
     rss_article_detail_mode: "normal",
-    risk_profile: "moderate",
+    risk_profile: "standard",
 };
 
 export const LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY = "lastViewedAnalysisRequestId";

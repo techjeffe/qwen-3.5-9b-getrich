@@ -234,6 +234,7 @@ class BacktestResults(BaseModel):
     avg_win_pct: float = Field(default=0.0)
     avg_loss_pct: float = Field(default=0.0)
     profit_factor: float = Field(default=0.0)
+    regime_validation: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {
         "json_schema_extra": {
