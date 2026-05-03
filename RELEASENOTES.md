@@ -34,6 +34,14 @@ Three structural improvements to the signal generation and execution layer.
 - Tracked via a running in-memory counter within each analysis loop (open positions opened earlier in the same run count against the cap immediately, even before the DB is committed)
 - Configurable in `logic_config.json` under `vol_sizing.portfolio_cap_usd`; also overridable per-account from Admin › Trading Logic (`vol_sizing_portfolio_cap_usd`)
 
+**Sentiment scoring and Stage 1 coverage improvements:**
+
+- Strengthened Stage 1 keyword matching by scanning `title`, `summary`, `content`, and article `keywords`, reducing false negative coverage for custom tickers.
+- Recalibrated per-symbol policy scoring so values now reflect both event-type base strength and matched source/support, instead of collapsing many symbols to the same generic geopolitical bucket.
+- Added exposure-quality confidence adjustment for DIRECT/INDIRECT/BROAD/UNRELATED coverage, making confidence scores more meaningful by symbol.
+- Relaxed the no-match fallback path so symbols with zero symbol-specific keyword hits can still reason over the broader filtered batch instead of immediately returning a flat neutral fallback.
+- These changes improve custom-symbol coverage for names such as APLD, ORCL, SNOW, PEP, and WMT and make sentiment outputs less uniform.
+
 ---
 
 # Release Notes — May 1, 2026

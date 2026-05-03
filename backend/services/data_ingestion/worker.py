@@ -440,31 +440,32 @@ async def run_ingestion_cycle(db: Optional[Session] = None) -> Dict[str, Any]:
             if str(v).strip()
         }
 
-        # Auto-inject a Yahoo Finance RSS feed for every tracked symbol so custom
+        # Auto-inject Yahoo Finance news for every tracked symbol so custom
         # equities (NVDA, GPRO, etc.) have a dedicated per-ticker news stream without
         # requiring manual feed configuration.
-        yahoo_feeds = {
-            f"yahoo_finance_{sym.lower()}": f"https://finance.yahoo.com/rss/headline?s={sym}"
-            for sym in tracked_symbols
-            if sym
-        }
-        merged_feeds = {**build_enabled_rss_feed_map(config), **yahoo_feeds}
-        merged_labels = {
-            **build_enabled_rss_feed_labels(config),
-            **{f"yahoo_finance_{sym.lower()}": f"Yahoo Finance — {sym}" for sym in tracked_symbols},
-        }
+        yahoo_symbols = [sym for sym in tracked_symbols if sym]
+        merged_feeds = build_enabled_rss_feed_map(config)
+        merged_labels = build_enabled_rss_feed_labels(config)
         parser = RSSFeedParser(
             feeds=merged_feeds,
             feed_labels=merged_labels,
         )
+        
+        # Parse RSS feeds
         articles = await asyncio.to_thread(parser.parse_feeds)
-        print(f"Ingestion: {len(articles)} raw articles from {len(merged_feeds)} feeds "
-              f"({len(yahoo_feeds)} Yahoo Finance per-symbol, {len(merged_feeds)-len(yahoo_feeds)} configured)")
+        
+        # Fetch Yahoo Finance news
+        if yahoo_symbols:
+            yahoo_articles = await asyncio.to_thread(parser.fetch_yahoo_finance_news, yahoo_symbols)
+            articles.extend(yahoo_articles)
+        
+        print(f"Ingestion: {len(articles)} raw articles "
+              f"({len(articles) - len(yahoo_articles) if yahoo_symbols else len(articles)} RSS + {len(yahoo_articles) if yahoo_symbols else 0} Yahoo Finance)")
 
-        # Articles from per-symbol Yahoo Finance feeds are relevant by definition —
+        # Articles from Yahoo Finance are relevant by definition —
         # bypass Stage 0 for them so "Alphabet Reports Earnings" doesn't get dropped
         # because it doesn't contain the ticker "goog".
-        yahoo_source_labels: set = {merged_labels[k] for k in yahoo_feeds if k in merged_labels}
+        yahoo_source_labels: set = {"Yahoo Finance"}
 
         kept_articles = [
             article for article in articles

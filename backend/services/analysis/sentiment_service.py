@@ -129,31 +129,38 @@ class SentimentService:
             # Skip the LLM entirely when no articles matched this symbol —
             # saves tokens and produces a clear "no data" message instead of boilerplate.
             if sym_posts is not None and len(sym_posts) == 0:
-                msg = f"No {symbol}-relevant articles in current batch — holding until news arrives."
-                return SentimentAnalysisResponse(
-                    request_id="",
-                    timestamp=datetime.utcnow(),
-                    is_bluster=False,
-                    bluster_score=0.0,
-                    bluster_indicators=[],
-                    is_policy_change=False,
-                    policy_score=0.0,
-                    policy_indicators=[],
-                    impact_severity="low",
-                    confidence=0.05,
-                    reasoning=msg,
-                    directional_score=0.0,
-                    signal_type="HOLD",
-                    urgency="LOW",
-                    entry_symbol=symbol,
-                    analyst_writeup=msg,
-                    parsed_payload={
-                        "exposure_type": "UNRELATED",
-                        "event_type": "noise",
-                        "confirmed": False,
-                        "source_count": 0,
-                    },
-                )
+                # No symbol-specific matches were found, but there may still be broad
+                # macro or sector coverage in the shared analysis pool. Allow the
+                # specialist to review the full filtered batch instead of forcing an
+                # immediate 0/0/5 fallback.
+                if analysis_posts:
+                    sym_posts = analysis_posts
+                else:
+                    msg = f"No {symbol}-relevant articles in current batch — holding until news arrives."
+                    return SentimentAnalysisResponse(
+                        request_id="",
+                        timestamp=datetime.utcnow(),
+                        is_bluster=False,
+                        bluster_score=0.0,
+                        bluster_indicators=[],
+                        is_policy_change=False,
+                        policy_score=0.0,
+                        policy_indicators=[],
+                        impact_severity="low",
+                        confidence=0.05,
+                        reasoning=msg,
+                        directional_score=0.0,
+                        signal_type="HOLD",
+                        urgency="LOW",
+                        entry_symbol=symbol,
+                        analyst_writeup=msg,
+                        parsed_payload={
+                            "exposure_type": "UNRELATED",
+                            "event_type": "noise",
+                            "confirmed": False,
+                            "source_count": 0,
+                        },
+                    )
             return await engine.analyze(
                 text=self._build_symbol_specific_news_context(
                     sym_posts if sym_posts is not None else analysis_posts,

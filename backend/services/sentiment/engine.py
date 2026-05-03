@@ -438,6 +438,9 @@ class SentimentEngine:
         event_base: Dict[str, float] = dict(_ss["event_base_scores"])
         base_policy = event_base.get(event_type, event_base["default"])
         policy_score = base_policy * (1.0 if confirmed else _ss["unconfirmed_policy_multiplier"])
+        if source_count > 0:
+            source_factor = min(1.0, source_count / 3.0)
+            policy_score *= 0.65 + 0.35 * source_factor
         if not relevant:
             policy_score *= _ss["irrelevance_policy_multiplier"]
         policy_cap = float((_ss.get("exposure_policy_caps") or {}).get(exposure_type, 1.0))
@@ -446,6 +449,13 @@ class SentimentEngine:
 
         # ── Confidence: grows with source diversity and drops if irrelevant ───
         base_conf = _ss["confidence_base"] + (source_count / 10.0) * _ss["confidence_source_weight"]
+        exposure_bonus = {
+            "DIRECT": 0.08,
+            "INDIRECT": 0.04,
+            "BROAD": 0.00,
+            "UNRELATED": -0.04,
+        }
+        base_conf += exposure_bonus.get(exposure_type, 0.0)
         if not relevant:
             base_conf -= _ss["confidence_irrelevance_penalty"]
         if not confirmed:
@@ -913,8 +923,12 @@ class SentimentEngine:
         keyword_relevant: List[Any] = []
         for post in posts:
             blob = normalize_text_for_matching(
-                f"{getattr(post, 'title', '') or ''} "
-                f"{getattr(post, 'content', '') or ''}"
+                " ".join([
+                    str(getattr(post, 'title', '') or ''),
+                    str(getattr(post, 'summary', '') or ''),
+                    str(getattr(post, 'content', '') or ''),
+                    " ".join(getattr(post, 'keywords', None) or []),
+                ])
             )
             if any(term in blob for term in expanded_terms):
                 keyword_relevant.append(post)
@@ -942,8 +956,12 @@ class SentimentEngine:
                 post for post in filtered
                 if any(
                     t in normalize_text_for_matching(
-                        f"{getattr(post, 'title', '') or ''} "
-                        f"{getattr(post, 'content', '') or ''}"
+                        " ".join([
+                            str(getattr(post, 'title', '') or ''),
+                            str(getattr(post, 'summary', '') or ''),
+                            str(getattr(post, 'content', '') or ''),
+                            " ".join(getattr(post, 'keywords', None) or []),
+                        ])
                     )
                     for t in sym_expanded
                 )

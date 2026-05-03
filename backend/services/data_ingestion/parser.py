@@ -12,7 +12,19 @@ from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlparse
 
-from services.app_config import DEFAULT_RSS_FEEDS
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    yf = None
+
+try:
+    from services.app_config import DEFAULT_RSS_FEEDS
+    APP_CONFIG_AVAILABLE = True
+except ImportError:
+    APP_CONFIG_AVAILABLE = False
+    DEFAULT_RSS_FEEDS = []
 
 
 @dataclass
@@ -42,7 +54,7 @@ class RSSFeedParser:
     # Canonical built-in feeds come from app_config so the parser and settings stay aligned.
     GEOPOLITICAL_FEEDS = {
         feed["key"]: feed["url"]
-        for feed in DEFAULT_RSS_FEEDS
+        for feed in (DEFAULT_RSS_FEEDS if APP_CONFIG_AVAILABLE else [])
     }
     
     # Keywords used to tag articles with chips in the UI (not used for routing)
@@ -219,6 +231,132 @@ class RSSFeedParser:
                 matched.append(keyword)
         
         return list(set(matched))  # Remove duplicates
+    
+    def fetch_yahoo_finance_news(
+        self,
+        symbols: List[str],
+        date_from: Optional[datetime] = None
+    ) -> List[NewsArticle]:
+        """
+        Fetch news articles for symbols using yfinance.
+        
+        Args:
+            symbols: List of stock symbols to fetch news for
+            date_from: Only include articles published after this date
+            
+        Returns:
+            List of parsed news articles from Yahoo Finance
+        """
+        if not YFINANCE_AVAILABLE:
+            print("yfinance not available, skipping Yahoo Finance news fetch")
+            return []
+        
+        articles = []
+        
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol.upper())
+                news_data = ticker.news or []
+
+                for news_item in news_data:
+                    if not isinstance(news_item, dict):
+                        print(f"Skipping invalid Yahoo Finance news item for {symbol}: {type(news_item).__name__}")
+                        continue
+
+                    try:
+                        article = self._extract_yahoo_article(news_item, symbol)
+                        
+                        # Filter by date if specified
+                        if date_from and article.published_date < date_from:
+                            continue
+                        
+                        articles.append(article)
+                    except Exception as e:
+                        print(f"Error extracting article for {symbol}: {e}")
+                        
+            except Exception as e:
+                print(f"Error fetching Yahoo Finance news for {symbol}: {e}")
+        
+        return articles
+    
+    def _extract_yahoo_article(
+        self,
+        news_item: Dict[str, Any],
+        symbol: str
+    ) -> NewsArticle:
+        """Extract NewsArticle from yfinance news item."""
+        if news_item is None:
+            raise ValueError("Yahoo Finance news item is None")
+
+        content = {}
+        if isinstance(news_item.get('content'), dict):
+            content = news_item.get('content') or {}
+        elif isinstance(news_item.get('content'), list) and news_item['content']:
+            first_content = news_item['content'][0]
+            if isinstance(first_content, dict):
+                content = first_content
+
+        # Fallback to using the item itself if content is missing
+        if not content:
+            content = news_item
+
+        # Extract title
+        title = content.get('title', '') or news_item.get('title', '')
+
+        # Extract link - prefer canonical URL, fallback to clickThroughUrl, then raw link
+        canonical_url = ''
+        if isinstance(content.get('canonicalUrl'), dict):
+            canonical_url = content.get('canonicalUrl', {}).get('url', '')
+        click_url = ''
+        if isinstance(content.get('clickThroughUrl'), dict):
+            click_url = content.get('clickThroughUrl', {}).get('url', '')
+        link = canonical_url or click_url or content.get('link', '') or news_item.get('link', '') or ''
+        
+        # Source is Yahoo Finance
+        source = "Yahoo Finance"
+        
+        # Extract author/provider
+        provider = content.get('provider', {})
+        author = provider.get('displayName', None)
+        if author is None and isinstance(news_item.get('provider'), dict):
+            author = news_item.get('provider', {}).get('displayName')
+        
+        # Extract published date
+        pub_date_str = content.get('pubDate', '') or news_item.get('pubDate', '')
+        published_date = self._parse_yahoo_date(pub_date_str)
+        
+        # Extract summary
+        summary = content.get('summary', '') or news_item.get('summary', '')
+        
+        # For content, use summary since we don't have full article text
+        content_text = summary
+        
+        # Extract keywords (use the same method as RSS)
+        keywords = self._extract_keywords(title + " " + summary)
+        
+        return NewsArticle(
+            title=title,
+            link=link,
+            source=source,
+            author=author,
+            published_date=published_date,
+            summary=summary,
+            content=content_text,
+            keywords=keywords
+        )
+    
+    def _parse_yahoo_date(self, date_str: str) -> datetime:
+        """Parse ISO date string from Yahoo Finance."""
+        if not date_str:
+            return datetime.utcnow()
+        
+        try:
+            # Remove 'Z' if present and parse
+            date_str = date_str.rstrip('Z')
+            dt = datetime.fromisoformat(date_str)
+            return dt
+        except (ValueError, TypeError):
+            return datetime.utcnow()
     
     def filter_by_keywords(
         self,

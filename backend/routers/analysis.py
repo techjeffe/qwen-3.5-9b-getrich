@@ -1083,34 +1083,38 @@ async def _pre_ingest_stream(
     db: Session,
     request: AnalysisRequest,
     config: Any,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """Pull RSS feeds and market context, emitting verbose SSE diagnostics to the live feed."""
-    # 1. Build feed map with per-symbol Yahoo Finance feeds
-    yahoo_feeds = {
-        f"yahoo_finance_{sym.lower()}": f"https://finance.yahoo.com/rss/headline?s={sym}"
-        for sym in (request.symbols or [])
-        if str(sym).strip()
-    }
-    merged_feeds = {**build_enabled_rss_feed_map(config), **yahoo_feeds}
-    merged_labels = {
-        **build_enabled_rss_feed_labels(config),
-        **{f"yahoo_finance_{sym.lower()}": f"Yahoo Finance — {sym}" for sym in (request.symbols or []) if str(sym).strip()},
-    }
-    feed_count = len(merged_feeds)
-    yahoo_count = len(yahoo_feeds)
-    configured_count = feed_count - yahoo_count
+    # 1. Build feed map (excluding Yahoo Finance RSS feeds)
+    yahoo_symbols = [str(sym).strip().upper() for sym in (request.symbols or []) if str(sym).strip()]
+    merged_feeds = build_enabled_rss_feed_map(config)
+    merged_labels = build_enabled_rss_feed_labels(config)
+    feed_count = len(merged_feeds) + len(yahoo_symbols)
+    configured_count = len(merged_feeds)
+    yahoo_count = len(yahoo_symbols)
 
-    yield f"data: {json.dumps({'type': 'log', 'message': f'Loading {feed_count} RSS feeds ({configured_count} configured + {yahoo_count} per-symbol Yahoo Finance)...'}, default=str)}\n\n"
+    yield f"data: {json.dumps({'type': 'log', 'message': f'Loading {feed_count} feeds ({configured_count} configured RSS + {yahoo_count} Yahoo Finance symbols)...'}, default=str)}\n\n"
 
     # 2. Parse feeds
+    articles = []
     try:
         from services.data_ingestion.parser import RSSFeedParser
         import asyncio as _asyncio
         parser = RSSFeedParser(feeds=merged_feeds, feed_labels=merged_labels)
-        articles = await _asyncio.to_thread(parser.parse_feeds)
-        yield f"data: {json.dumps({'type': 'log', 'message': f'Fetched {len(articles)} raw articles from {feed_count} feeds'}, default=str)}\n\n"
+        
+        # Parse RSS feeds
+        rss_articles = await _asyncio.to_thread(parser.parse_feeds)
+        articles.extend(rss_articles)
+        
+        # Fetch Yahoo Finance news
+        if yahoo_symbols:
+            yahoo_articles = await _asyncio.to_thread(parser.fetch_yahoo_finance_news, yahoo_symbols)
+            articles.extend(yahoo_articles)
+        
+        yield f"data: {json.dumps({'type': 'log', 'message': f'Fetched {len(articles)} raw articles ({len(rss_articles)} RSS + {len(yahoo_articles) if yahoo_symbols else 0} Yahoo Finance)'}, default=str)}\n\n"
     except Exception as exc:
-        yield f"data: {json.dumps({'type': 'log', 'message': f'RSS parse error: {exc}'}, default=str)}\n\n"
+        yield f"data: {json.dumps({'type': 'log', 'message': f'Feed parse error: {exc}'}, default=str)}\n\n"
         articles = []
         return
 
@@ -1139,7 +1143,7 @@ async def _pre_ingest_stream(
         for k, v in (getattr(config, "symbol_company_aliases", None) or {}).items()
         if str(v).strip()
     }
-    yahoo_source_labels = {merged_labels[k] for k in yahoo_feeds if k in merged_labels}
+    yahoo_source_labels = {"Yahoo Finance"}
 
     # Filter
     kept = []
@@ -1173,6 +1177,10 @@ async def _pre_ingest_stream(
     dupes = 0
     fast_lane_ids = []
     fast_lane_syms = []
+    new_article_ids: List[int] = []
+    if metadata is not None:
+        metadata["new_article_ids"] = new_article_ids
+
     kept.sort(key=lambda a: _coerce_utc(getattr(a, "published_date", None)) or _utc_now(), reverse=True)
     session = db
 
@@ -1190,6 +1198,7 @@ async def _pre_ingest_stream(
         session.commit()
         if is_new:
             stored += 1
+            new_article_ids.append(int(row.id))
         else:
             dupes += 1
         if fast_hit:
@@ -1257,13 +1266,17 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 0/4: Pulling RSS feeds and market context...'}, default=str)}\n\n"
 
             # Pre-analysis RSS ingestion — ensures we always have fresh articles even after DB reset
-            ingestion_result = {}
+            ingestion_result: Dict[str, Any] = {}
             try:
-                async for chunk in _pre_ingest_stream(db, effective_request, config):
+                async for chunk in _pre_ingest_stream(db, effective_request, config, metadata=ingestion_result):
                     yield chunk
             except Exception:
                 pass
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 1/4: Ingesting queued articles and market context...'}, default=str)}\n\n"
+
+            selected_article_ids = ingestion_result.get("new_article_ids")
+            if selected_article_ids:
+                yield f"data: {json.dumps({'type': 'log', 'message': f'Using {len(selected_article_ids)} newly ingested live article(s) for this analysis run'}, default=str)}\n\n"
 
             task = asyncio.create_task(
                 pipeline.run(
@@ -1271,7 +1284,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
                     db=db,
                     config=config,
                     prompt_overrides=prompt_overrides,
-                    article_ids=None,
+                    article_ids=selected_article_ids or None,
                     trigger_source="stream",
                 )
             )
