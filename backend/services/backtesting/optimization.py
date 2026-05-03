@@ -344,7 +344,16 @@ class RollingWindowOptimizer:
         total_return = sum(trade_returns) * 100
         
         days = len(prices)
-        annualized_return = ((1 + total_return/100) ** (252/days) - 1) * 100 if days > 0 else 0.0
+        # Annualized return: handle cases where total_return is very negative
+        if days > 0:
+            base = 1 + total_return/100
+            if base > 0:
+                annualized_return = (base ** (252/days) - 1) * 100
+            else:
+                # If capital is lost (base <= 0), return is undefined; use negative return
+                annualized_return = -100.0 if total_return < 0 else 0.0
+        else:
+            annualized_return = 0.0
         
         # Sharpe ratio
         risk_free_rate = 2.0 / 252  # Daily risk-free rate
