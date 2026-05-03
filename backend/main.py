@@ -159,23 +159,27 @@ async def _telegram_bot_loop():
     from services.telegram_bot import initialize_offset, poll_and_dispatch
 
     offset = None
+    print("[telegram-bot] loop started")
     while True:
         try:
             creds   = get_telegram_credentials()
             token   = (creds.get("bot_token") or "").strip()
             chat_id = (creds.get("chat_id")   or "").strip()
-            if not token or not chat_id:
+            authorized_user_id = (creds.get("authorized_user_id") or "").strip()
+            if not token or not chat_id or not authorized_user_id:
                 # Credentials were removed at runtime — stop the loop
                 print("[telegram-bot] credentials removed, stopping bot loop")
                 return
             if offset is None:
                 offset = await asyncio.to_thread(initialize_offset, token)
                 print(f"[telegram-bot] initialized polling offset at {offset}")
-            offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, offset)
+            offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, authorized_user_id, offset)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[telegram-bot] loop error: {exc}")
+            import traceback
+            traceback.print_exc()
             await asyncio.sleep(5)
 
 
@@ -258,21 +262,28 @@ async def lifespan(app: FastAPI):
         finally:
             db.close()
         _tg = get_telegram_credentials()
-        if (
-            remote_control_enabled
-            and
-            (_tg.get("bot_token") or "").strip()
-            and (_tg.get("chat_id") or "").strip()
-            and (_tg.get("authorized_user_id") or "").strip()
-        ):
+        token   = (_tg.get("bot_token") or "").strip()
+        chat_id = (_tg.get("chat_id") or "").strip()
+        user_id = (_tg.get("authorized_user_id") or "").strip()
+        
+        print(f"[telegram-bot] startup: enabled={remote_control_enabled}, token_present={bool(token)}, chat_id_present={bool(chat_id)}, user_id_present={bool(user_id)}")
+        
+        if remote_control_enabled and token and chat_id and user_id:
             telegram_bot_task = asyncio.create_task(_telegram_bot_loop())
-            print("Telegram bot remote control started (long-polling)")
+            print("[telegram-bot] remote control started (long-polling for /status /stop /start /snapshot /help)")
         elif not remote_control_enabled:
-            print("Telegram bot remote control skipped (disabled in admin settings)")
+            print("[telegram-bot] skipped (disabled in admin settings)")
         else:
-            print("Telegram bot remote control skipped (credentials not configured)")
+            missing = []
+            if not token: missing.append("bot_token")
+            if not chat_id: missing.append("chat_id")
+            if not user_id: missing.append("authorized_user_id")
+            print(f"[telegram-bot] skipped (incomplete credentials: missing {', '.join(missing)})")
+            print("[telegram-bot] Note: configure credentials in admin UI, then restart backend to enable polling")
     except Exception as exc:
-        print(f"Telegram bot remote control skipped: {exc}")
+        import traceback
+        print(f"[telegram-bot] startup error: {exc}")
+        traceback.print_exc()
 
     yield
 

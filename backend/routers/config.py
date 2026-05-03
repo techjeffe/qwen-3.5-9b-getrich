@@ -103,7 +103,11 @@ async def put_config(
         for symbol in (getattr(existing_config, "custom_symbols", []) or [])
         if str(symbol or "").strip()
     }
+    previous_telegram_enabled = bool(getattr(existing_config, "telegram_remote_control_enabled", False))
+    
     config = update_app_config(db, payload)
+    current_telegram_enabled = bool(getattr(config, "telegram_remote_control_enabled", False))
+    
     current_custom_symbols = {
         str(symbol or "").upper().strip()
         for symbol in (getattr(config, "custom_symbols", []) or [])
@@ -112,6 +116,11 @@ async def put_config(
     added_custom_symbols = sorted(current_custom_symbols - previous_custom_symbols)
     removed_custom_symbols = sorted(previous_custom_symbols - current_custom_symbols)
     notices: List[str] = []
+    
+    # Notify when Telegram remote control is enabled
+    if current_telegram_enabled and not previous_telegram_enabled:
+        notices.append("Telegram remote control enabled. Restart the backend to activate long-polling.")
+    
     if removed_custom_symbols:
         closed_positions = close_positions_for_removed_symbols(db, removed_custom_symbols)
         if closed_positions:
@@ -237,6 +246,11 @@ async def put_remote_snapshot_secrets(
                 saved["test_delivery_note"] = "No completed analysis run is available yet."
         saved["remote_snapshot_enabled"] = bool(getattr(config, "remote_snapshot_enabled", False))
         saved["telegram_remote_control_enabled"] = bool(getattr(config, "telegram_remote_control_enabled", False))
+        
+        # Notify user that backend restart is required if credentials changed and remote control is enabled
+        if changed and saved.get("telegram_remote_control_enabled"):
+            saved["restart_note"] = "Telegram credentials updated. Restart the backend to activate the bot with new credentials."
+        
         return saved
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -252,9 +266,10 @@ async def verify_remote_snapshot_secrets(
         creds = get_telegram_credentials()
         token = str(creds.get("bot_token") or "").strip()
         chat_id = str(creds.get("chat_id") or "").strip()
-        if not token or not chat_id:
-            raise HTTPException(status_code=400, detail="Telegram bot token and private chat ID must be saved first.")
-        return verify_remote_control(token, chat_id)
+        authorized_user_id = str(creds.get("authorized_user_id") or "").strip()
+        if not token or not chat_id or not authorized_user_id:
+            raise HTTPException(status_code=400, detail="Telegram bot token, private chat ID, and authorized user ID must all be saved first.")
+        return verify_remote_control(token, chat_id, authorized_user_id)
     except HTTPException:
         raise
     except ValueError as exc:

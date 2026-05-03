@@ -5,13 +5,14 @@ Security model:
   - Only one private chat_id is allowed.
   - Only one Telegram user_id inside that private chat is allowed.
   - Messages from any other chat_id or sender_id are silently ignored.
-  - Only /stop and /start mutate state. No other changes are possible.
+  - Only /stop and /start mutate state. /snapshot requests async delivery.
 
 Commands:
-  /status  — report current alpaca_execution_mode
-  /stop    — set mode to "off", save previous mode for resumption
-  /start   — restore previously saved mode
-  /help    — list commands
+  /status   — report current alpaca_execution_mode
+  /stop     — set mode to "off", save previous mode for resumption
+  /start    — restore previously saved mode
+  /snapshot — remotely request current P&L snapshot via Telegram
+  /help     — list commands
 """
 
 import time
@@ -138,36 +139,71 @@ def _handle_start(token: str, chat_id: str) -> None:
         db.close()
 
 
+def _handle_snapshot(token: str, chat_id: str) -> None:
+    """Request a P&L snapshot delivery to this chat."""
+    from database.engine import SessionLocal
+    from services.remote_snapshot import trigger_remote_snapshot_delivery
+    from services.analysis.models import AnalysisResult
+    
+    db = SessionLocal()
+    try:
+        latest_analysis = (
+            db.query(AnalysisResult)
+            .order_by(AnalysisResult.timestamp.desc(), AnalysisResult.id.desc())
+            .first()
+        )
+        if not latest_analysis or not latest_analysis.request_id:
+            _send(token, chat_id, "No completed analysis available yet. Run /status to check trading mode.")
+            return
+        
+        _send(token, chat_id, "Snapshot generation initiated. Delivering to Telegram...")
+        print(f"[telegram-bot] /snapshot — triggering delivery of analysis {latest_analysis.request_id}")
+        trigger_remote_snapshot_delivery(latest_analysis.request_id, force=True)
+    except Exception as exc:
+        print(f"[telegram-bot] snapshot error: {exc}")
+        _send_generic_error(token, chat_id, "Snapshot command")
+    finally:
+        db.close()
+
+
 # ── Update dispatcher ─────────────────────────────────────────────────────────
 
-def _dispatch(update: dict, token: str, authorized_chat_id: str) -> None:
+def _dispatch(update: dict, token: str, authorized_chat_id: str, authorized_user_id: str) -> None:
     message = update.get("message")
     if not message:
         return
 
     chat_id = str(message.get("chat", {}).get("id", ""))
     chat_type = str(message.get("chat", {}).get("type", "")).strip().lower()
+    sender_id = str(message.get("from", {}).get("id", ""))
     text = str(message.get("text") or "").strip()
 
-    # Security gate — only one private chat may control trading.
-    # In private chats, chat_id == user_id (same number), so verifying
-    # the chat is private and chat_id matches is sufficient.
+    # Security gate — only one authorized operator in one private chat may control trading.
+    # Defense-in-depth: verify both the chat (private + matching ID) AND the sender.
+    # In private chats, chat_id == user_id, so sender_id should match both.
     if chat_type != "private":
+        print(f"[telegram-bot] rejected: non-private message (chat_type={chat_type})")
         return
     if chat_id != authorized_chat_id:
+        print(f"[telegram-bot] rejected: unauthorized chat_id {chat_id} (expected {authorized_chat_id})")
+        return
+    if sender_id != authorized_user_id:
+        print(f"[telegram-bot] rejected: unauthorized sender_id {sender_id} (expected {authorized_user_id})")
         return
 
     # Parse command, stripping optional @BotName suffix
     raw_command = text.split()[0].lower() if text else ""
     command = raw_command.split("@")[0]
+    print(f"[telegram-bot] accepted command: {command}")
 
     if command == "/help":
         _send(token, chat_id, (
             "<b>Remote trading controls</b>\n\n"
-            "/status — current trading mode\n"
-            "/stop   — disable all Alpaca trading\n"
-            "/start  — resume previous trading mode\n"
-            "/help   — show this message"
+            "/status   — current trading mode\n"
+            "/stop     — disable all Alpaca trading\n"
+            "/start    — resume previous trading mode\n"
+            "/snapshot — request P&L snapshot\n"
+            "/help     — show this message"
         ))
     elif command == "/status":
         _handle_status(token, chat_id)
@@ -175,6 +211,8 @@ def _dispatch(update: dict, token: str, authorized_chat_id: str) -> None:
         _handle_stop(token, chat_id)
     elif command == "/start":
         _handle_start(token, chat_id)
+    elif command == "/snapshot":
+        _handle_snapshot(token, chat_id)
     else:
         _send(token, chat_id, "Unknown command. Send /help for available commands.")
 
@@ -207,15 +245,21 @@ def initialize_offset(token: str) -> int:
     return next_offset
 
 
-def verify_remote_control(token: str, chat_id: str) -> Dict[str, Any]:
-    """Validate bot token and private chat targeting.
+def verify_remote_control(token: str, chat_id: str, authorized_user_id: str) -> Dict[str, Any]:
+    """Validate bot token, private chat, and authorized operator (defense-in-depth).
     
-    In private Telegram chats, chat_id == user_id (same number),
-    so we only need to verify the chat is private and the chat_id is correct.
+    Checks:
+    - Bot token is valid
+    - Chat is private
+    - Chat ID matches
+    - Authorized user ID is numeric (verified at setup; in private chats chat_id == user_id)
     """
     normalized_chat_id = str(chat_id or "").strip()
+    normalized_user_id = str(authorized_user_id or "").strip()
     if not normalized_chat_id.isdigit():
         raise ValueError("chat_id must be a positive numeric Telegram private chat ID")
+    if not normalized_user_id.isdigit():
+        raise ValueError("authorized_user_id must be a positive numeric Telegram user ID")
 
     me_payload = _api(token, "getMe")
     chat_payload = _api(token, "getChat", chat_id=normalized_chat_id)
@@ -228,22 +272,24 @@ def verify_remote_control(token: str, chat_id: str) -> Dict[str, Any]:
 
     is_private_chat = chat_type == "private"
     chat_matches = resolved_chat_id == normalized_chat_id
+    user_matches_private_chat = normalized_chat_id == normalized_user_id
 
     return {
-        "ok": bool(bot_ok and is_private_chat and chat_matches),
+        "ok": bool(bot_ok and is_private_chat and chat_matches and user_matches_private_chat),
         "bot_username": str(me.get("username") or "").strip() if isinstance(me, dict) else "",
         "chat_type": chat_type,
         "chat_id_matches": chat_matches,
         "private_chat_required": is_private_chat,
+        "authorized_user_matches_chat": user_matches_private_chat,
         "message": (
             "Telegram remote control verified."
-            if bot_ok and is_private_chat and chat_matches
-            else "Telegram setup must use a private chat with the correct chat ID."
+            if bot_ok and is_private_chat and chat_matches and user_matches_private_chat
+            else "Telegram setup must use a private chat where chat ID and authorized user ID match."
         ),
     }
 
 
-def poll_and_dispatch(token: str, authorized_chat_id: str, offset: int) -> int:
+def poll_and_dispatch(token: str, authorized_chat_id: str, authorized_user_id: str, offset: int) -> int:
     """
     One long-poll cycle against Telegram getUpdates.
     Blocks for up to _POLL_TIMEOUT_SECS seconds waiting for messages.
@@ -256,11 +302,14 @@ def poll_and_dispatch(token: str, authorized_chat_id: str, offset: int) -> int:
         time.sleep(_ERROR_SLEEP_SECS)
         return offset
 
+    if updates:
+        print(f"[telegram-bot] received {len(updates)} update(s)")
+    
     for update in updates:
         update_id = update.get("update_id", 0)
         offset = max(offset, update_id + 1)
         try:
-            _dispatch(update, token, authorized_chat_id)
+            _dispatch(update, token, authorized_chat_id, authorized_user_id)
         except Exception as exc:
             print(f"[telegram-bot] dispatch error: {exc}")
 
