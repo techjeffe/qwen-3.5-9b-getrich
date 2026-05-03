@@ -142,8 +142,8 @@ def _handle_start(token: str, chat_id: str) -> None:
 def _handle_snapshot(token: str, chat_id: str) -> None:
     """Request a P&L snapshot delivery to this chat."""
     from database.engine import SessionLocal
+    from database.models import AnalysisResult
     from services.remote_snapshot import trigger_remote_snapshot_delivery
-    from services.analysis.models import AnalysisResult
     
     db = SessionLocal()
     try:
