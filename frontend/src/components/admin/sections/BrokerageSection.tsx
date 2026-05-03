@@ -2,10 +2,22 @@
 
 import { AppConfig } from "@/lib/utils/config-normalizer";
 
+type OrphanOrder = {
+    id: number;
+    symbol: string;
+    side: string;
+    status: string | null;
+    trading_mode: string;
+    alpaca_order_id: string | null;
+    created_at: string | null;
+};
+
 type BrokerageSectionProps = {
     config: AppConfig;
     setConfig: React.Dispatch<React.SetStateAction<AppConfig>>;
     isAdvancedMode: boolean;
+    orphanOrders?: OrphanOrder[];
+    onAcknowledgeOrphan?: (id: number) => void;
     alpacaStatus: {
         secrets: {
             configured: boolean;
@@ -48,6 +60,8 @@ export function BrokerageSection({
     isSavingAlpacaSecrets, isTestingAlpacaConnection,
     saveAlpacaSecrets, clearAlpacaSecrets, testAlpacaConnection,
     openLiveConfirmModal, setAlpacaExecutionMode,
+    orphanOrders = [],
+    onAcknowledgeOrphan,
 }: BrokerageSectionProps) {
     const isLive = config.alpaca_execution_mode === "live";
     const isPaper = config.alpaca_execution_mode === "paper";
@@ -60,6 +74,53 @@ export function BrokerageSection({
 
     return (
         <section id="alpaca-live-trading" className="scroll-mt-24 rounded-2xl border border-slate-700 bg-slate-900/70 p-5 space-y-5">
+
+            {/* ── Orphan position alerts ── */}
+            {orphanOrders.length > 0 && (
+                <div className="rounded-xl border border-amber-600/50 bg-amber-950/20 p-4 space-y-3">
+                    <div className="flex items-start gap-2.5">
+                        <span className="mt-px text-amber-400 text-sm flex-shrink-0">⚠</span>
+                        <div>
+                            <p className="text-xs font-semibold text-amber-300">
+                                Orphan position{orphanOrders.length > 1 ? "s" : ""} detected
+                            </p>
+                            <p className="mt-0.5 text-[11px] text-amber-400/80 leading-relaxed">
+                                {orphanOrders.length === 1
+                                    ? "This position is recorded as open in the local database but was not found in Alpaca live positions. It may have been closed outside the system."
+                                    : "These positions are recorded as open in the local database but were not found in Alpaca live positions. They may have been closed outside the system."}
+                            </p>
+                        </div>
+                    </div>
+                    <div className="space-y-2">
+                        {orphanOrders.map((order) => (
+                            <div
+                                key={order.id}
+                                className="flex items-center justify-between gap-3 rounded-lg border border-amber-800/40 bg-amber-950/30 px-3 py-2"
+                            >
+                                <div className="flex items-center gap-3 min-w-0">
+                                    <span className="font-mono text-xs font-semibold text-amber-200">{order.symbol}</span>
+                                    <span className="text-[10px] uppercase tracking-wide text-slate-400">{order.trading_mode}</span>
+                                    {order.status && (
+                                        <span className="text-[10px] text-slate-500">status: {order.status}</span>
+                                    )}
+                                    {order.created_at && (
+                                        <span className="hidden sm:inline text-[10px] text-slate-600">
+                                            {new Date(order.created_at).toLocaleDateString()}
+                                        </span>
+                                    )}
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => onAcknowledgeOrphan?.(order.id)}
+                                    className="flex-shrink-0 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1 text-[11px] text-slate-300 hover:border-slate-600 hover:bg-slate-700 transition-colors"
+                                >
+                                    Dismiss
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             {/* ── 1. Execution destination ── */}
             <div className="rounded-3xl border border-slate-800 bg-slate-950/80 p-5">

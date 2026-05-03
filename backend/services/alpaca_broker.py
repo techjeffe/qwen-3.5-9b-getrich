@@ -1228,10 +1228,17 @@ def reconcile_on_startup(db) -> None:
         .all()
     )
 
+    changed = False
     for order in open_buy_orders:
         if order.symbol not in alpaca_syms:
-            print(
-                f"[alpaca] ORPHAN: {order.symbol} is open in our DB "
-                f"(AlpacaOrder id={order.id}, alpaca_order_id={order.alpaca_order_id}) "
-                f"but NOT found in Alpaca {broker.mode} positions. Manual review required."
-            )
+            if not order.is_orphan:
+                order.is_orphan = True
+                changed = True
+            if not order.orphan_acknowledged:
+                print(
+                    f"[alpaca] ORPHAN: {order.symbol} is open in our DB "
+                    f"(AlpacaOrder id={order.id}, alpaca_order_id={order.alpaca_order_id}) "
+                    f"but NOT found in Alpaca {broker.mode} positions. Manual review required."
+                )
+    if changed:
+        db.commit()

@@ -432,6 +432,8 @@ class AlpacaOrder(Base):
     raw_response      = Column(JSON,        nullable=True)
     error_message     = Column(Text,        nullable=True)
     created_at        = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    is_orphan             = Column(Boolean, nullable=False, default=False)
+    orphan_acknowledged   = Column(Boolean, nullable=False, default=False)
 
 
 # Create all tables

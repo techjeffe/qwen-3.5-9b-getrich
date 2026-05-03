@@ -210,6 +210,51 @@ async def get_alpaca_orders(
     ]
 
 
+@router.get("/orphans")
+async def get_orphan_orders(
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """Return open AlpacaOrder rows flagged as orphans that have not been acknowledged."""
+    from database.models import AlpacaOrder
+
+    rows = (
+        db.query(AlpacaOrder)
+        .filter(AlpacaOrder.is_orphan == True, AlpacaOrder.orphan_acknowledged == False)  # noqa: E712
+        .order_by(AlpacaOrder.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id":              o.id,
+            "symbol":          o.symbol,
+            "side":            o.side,
+            "status":          o.status,
+            "trading_mode":    o.trading_mode,
+            "alpaca_order_id": o.alpaca_order_id,
+            "created_at":      o.created_at.isoformat() if o.created_at else None,
+        }
+        for o in rows
+    ]
+
+
+@router.post("/orphans/{order_id}/acknowledge")
+async def acknowledge_orphan(
+    order_id: int,
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Mark an orphan order as acknowledged so it is no longer surfaced."""
+    from database.models import AlpacaOrder
+
+    order = db.query(AlpacaOrder).filter(AlpacaOrder.id == order_id).first()
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order.orphan_acknowledged = True
+    db.commit()
+    return {"ok": True, "id": order_id}
+
+
 @router.post("/poll-orders")
 async def poll_orders(
     _admin: None = Depends(require_admin_token),

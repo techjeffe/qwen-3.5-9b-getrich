@@ -67,6 +67,16 @@ type UnexecutedTrade = {
     request_id: string;
 };
 
+type OrphanOrder = {
+    id: number;
+    symbol: string;
+    side: string;
+    status: string | null;
+    trading_mode: string;
+    alpaca_order_id: string | null;
+    created_at: string | null;
+};
+
 type RemoteSnapshotSecretsStatus = {
     available: boolean;
     configured: boolean;
@@ -131,6 +141,7 @@ export default function AdminPage() {
     const [liveConfirmText, setLiveConfirmText] = useState("");
     const [isEnablingLive, setIsEnablingLive] = useState(false);
     const [alpacaAccountConfigurations, setAlpacaAccountConfigurations] = useState<Record<string, unknown> | null>(null);
+    const [orphanOrders, setOrphanOrders] = useState<OrphanOrder[]>([]);
 
     const isDirty = useMemo(
         () => JSON.stringify(config) !== JSON.stringify(savedConfig),
@@ -353,6 +364,18 @@ export default function AdminPage() {
         } catch { /* silent */ }
     }, []);
 
+    const fetchOrphanOrders = useCallback(async () => {
+        try {
+            const res = await fetch("/api/alpaca/orphans", { cache: "no-store" });
+            if (res.ok) setOrphanOrders(await res.json());
+        } catch { /* silent */ }
+    }, []);
+
+    const acknowledgeOrphan = useCallback(async (id: number) => {
+        await fetch(`/api/alpaca/orphans/${id}/acknowledge`, { method: "POST" });
+        setOrphanOrders((prev) => prev.filter((o) => o.id !== id));
+    }, []);
+
     useEffect(() => {
         if (localStorage.getItem("adminMode") === "advanced") setIsAdvancedMode(true);
     }, []);
@@ -371,7 +394,8 @@ export default function AdminPage() {
         void fetchPriceHistoryStatus();
         void fetchRemoteSnapshotSecrets();
         void fetchAlpacaStatus();
-    }, [fetchUnexecuted, fetchPriceHistoryStatus, fetchRemoteSnapshotSecrets, fetchAlpacaStatus]);
+        void fetchOrphanOrders();
+    }, [fetchUnexecuted, fetchPriceHistoryStatus, fetchRemoteSnapshotSecrets, fetchAlpacaStatus, fetchOrphanOrders]);
 
     useEffect(() => {
         if (!isDirty) return;
@@ -1014,6 +1038,8 @@ export default function AdminPage() {
                                     testAlpacaConnection={testAlpacaConnection}
                                     openLiveConfirmModal={() => { setShowLiveConfirmModal(true); setLiveConfirmText(""); }}
                                     setAlpacaExecutionMode={setAlpacaExecutionMode}
+                                    orphanOrders={orphanOrders}
+                                    onAcknowledgeOrphan={acknowledgeOrphan}
                                 />
                             </>
                         )}
