@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 SECRET_SERVICE_NAME = "qwen-3.5-9b-getrich"
 TELEGRAM_BOT_TOKEN_KEY = "telegram_bot_token"
 TELEGRAM_CHAT_ID_KEY = "telegram_chat_id"
+TELEGRAM_AUTHORIZED_USER_ID_KEY = "telegram_authorized_user_id"
 
 # Per-mode keys (new — paper and live are independent Alpaca accounts)
 ALPACA_PAPER_API_KEY_KEY    = "alpaca_paper_api_key"
@@ -68,13 +69,16 @@ def get_telegram_secret_status() -> Dict[str, Any]:
     try:
         token = _read_secret(TELEGRAM_BOT_TOKEN_KEY)
         chat_id = _read_secret(TELEGRAM_CHAT_ID_KEY)
+        authorized_user_id = _read_secret(TELEGRAM_AUTHORIZED_USER_ID_KEY)
         return {
             "available": True,
-            "configured": bool(token and chat_id),
+            "configured": bool(token and chat_id and authorized_user_id),
             "has_bot_token": bool(token),
             "has_chat_id": bool(chat_id),
+            "has_authorized_user_id": bool(authorized_user_id),
             "bot_token_masked": _mask_secret(token),
             "chat_id_masked": _mask_secret(chat_id),
+            "authorized_user_id_masked": _mask_secret(authorized_user_id),
             "error": "",
         }
     except Exception as exc:
@@ -83,37 +87,50 @@ def get_telegram_secret_status() -> Dict[str, Any]:
             "configured": False,
             "has_bot_token": False,
             "has_chat_id": False,
+            "has_authorized_user_id": False,
             "bot_token_masked": "",
             "chat_id_masked": "",
+            "authorized_user_id_masked": "",
             "error": str(exc),
         }
 
 
-def save_telegram_secrets(bot_token: str, chat_id: str) -> Dict[str, Any]:
+def save_telegram_secrets(bot_token: str, chat_id: str, authorized_user_id: str) -> Dict[str, Any]:
     token = str(bot_token or "").strip()
     chat = str(chat_id or "").strip()
+    user_id = str(authorized_user_id or "").strip()
     if not token:
         raise ValueError("bot_token is required")
     if not chat:
         raise ValueError("chat_id is required")
+    if not user_id:
+        raise ValueError("authorized_user_id is required")
+    if not chat.isdigit():
+        raise ValueError("chat_id must be a positive numeric Telegram private chat ID")
+    if not user_id.isdigit():
+        raise ValueError("authorized_user_id must be a positive numeric Telegram user ID")
 
     _write_secret(TELEGRAM_BOT_TOKEN_KEY, token)
     _write_secret(TELEGRAM_CHAT_ID_KEY, chat)
+    _write_secret(TELEGRAM_AUTHORIZED_USER_ID_KEY, user_id)
     return get_telegram_secret_status()
 
 
 def clear_telegram_secrets() -> Dict[str, Any]:
     _delete_secret(TELEGRAM_BOT_TOKEN_KEY)
     _delete_secret(TELEGRAM_CHAT_ID_KEY)
+    _delete_secret(TELEGRAM_AUTHORIZED_USER_ID_KEY)
     return get_telegram_secret_status()
 
 
 def get_telegram_credentials() -> Dict[str, str]:
     token = _read_secret(TELEGRAM_BOT_TOKEN_KEY)
     chat_id = _read_secret(TELEGRAM_CHAT_ID_KEY)
+    authorized_user_id = _read_secret(TELEGRAM_AUTHORIZED_USER_ID_KEY)
     return {
         "bot_token": token,
         "chat_id": chat_id,
+        "authorized_user_id": authorized_user_id,
     }
 
 

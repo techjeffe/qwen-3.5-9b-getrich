@@ -113,6 +113,7 @@ def migrate():
             ("alpaca_max_total_exposure_usd", "REAL"),
             ("alpaca_daily_loss_limit_usd",   "REAL"),
             ("alpaca_max_consecutive_losses", "INTEGER"),
+            ("alpaca_pre_stop_mode",          "VARCHAR(10)"),
         ]:
             if column_name not in existing_cols:
                 print(f"Adding {column_name} to app_config...")

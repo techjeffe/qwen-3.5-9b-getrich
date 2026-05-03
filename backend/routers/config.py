@@ -29,6 +29,7 @@ from services.secret_store import (
     get_telegram_secret_status,
     save_telegram_secrets,
 )
+from services.telegram_bot import verify_remote_control
 
 
 router = APIRouter()
@@ -207,13 +208,16 @@ async def put_remote_snapshot_secrets(
         previous = get_telegram_credentials()
         next_bot_token = str(payload.get("bot_token") or "")
         next_chat_id = str(payload.get("chat_id") or "")
+        next_authorized_user_id = str(payload.get("authorized_user_id") or "")
         changed = (
             str(previous.get("bot_token") or "").strip() != next_bot_token.strip()
             or str(previous.get("chat_id") or "").strip() != next_chat_id.strip()
+            or str(previous.get("authorized_user_id") or "").strip() != next_authorized_user_id.strip()
         )
         saved = save_telegram_secrets(
             bot_token=str(payload.get("bot_token") or ""),
             chat_id=str(payload.get("chat_id") or ""),
+            authorized_user_id=str(payload.get("authorized_user_id") or ""),
         )
         config = get_or_create_app_config(db)
         if not bool(getattr(config, "remote_snapshot_enabled", False)):
@@ -238,6 +242,26 @@ async def put_remote_snapshot_secrets(
                 saved["test_delivery_note"] = "No completed analysis run is available yet."
         saved["remote_snapshot_enabled"] = True
         return saved
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/admin/remote-snapshot-secrets/verify", tags=["Admin"])
+async def verify_remote_snapshot_secrets(
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    try:
+        creds = get_telegram_credentials()
+        token = str(creds.get("bot_token") or "").strip()
+        chat_id = str(creds.get("chat_id") or "").strip()
+        authorized_user_id = str(creds.get("authorized_user_id") or "").strip()
+        if not token or not chat_id or not authorized_user_id:
+            raise HTTPException(status_code=400, detail="Telegram bot token, private chat ID, and authorized user ID must all be saved first.")
+        return verify_remote_control(token, chat_id, authorized_user_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

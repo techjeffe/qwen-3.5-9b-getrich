@@ -371,6 +371,7 @@ class AppConfig(Base):
 
     # ── Alpaca brokerage execution ────────────────────────────────────────────
     alpaca_execution_mode         = Column(String(10),  nullable=False, default="off")  # off | paper | live
+    alpaca_pre_stop_mode          = Column(String(10),  nullable=True,  default=None)   # saved by /stop bot command
     alpaca_live_trading_enabled   = Column(Boolean,     nullable=False, default=False)
     alpaca_allow_short_selling    = Column(Boolean,     nullable=False, default=False)
     alpaca_fixed_order_size       = Column(Boolean,     nullable=False, default=False)

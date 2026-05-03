@@ -153,6 +153,33 @@ async def _alpaca_poll_scheduler_loop():
             print(f"[alpaca] poll scheduler error: {exc}")
 
 
+async def _telegram_bot_loop():
+    """Long-poll Telegram for /stop /start /status /help commands."""
+    from services.secret_store import get_telegram_credentials
+    from services.telegram_bot import initialize_offset, poll_and_dispatch
+
+    offset = None
+    while True:
+        try:
+            creds   = get_telegram_credentials()
+            token   = (creds.get("bot_token") or "").strip()
+            chat_id = (creds.get("chat_id")   or "").strip()
+            authorized_user_id = (creds.get("authorized_user_id") or "").strip()
+            if not token or not chat_id or not authorized_user_id:
+                # Credentials were removed at runtime — stop the loop
+                print("[telegram-bot] credentials removed, stopping bot loop")
+                return
+            if offset is None:
+                offset = await asyncio.to_thread(initialize_offset, token)
+                print(f"[telegram-bot] initialized polling offset at {offset}")
+            offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, authorized_user_id, offset)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[telegram-bot] loop error: {exc}")
+            await asyncio.sleep(5)
+
+
 async def _pnl_scheduler_loop():
     """Resolve due trade snapshots on the same 30-minute cadence as auto-analyze."""
     tracker = PnLTracker()
@@ -178,6 +205,7 @@ async def lifespan(app: FastAPI):
     data_ingestion_task = None
     pnl_scheduler_task  = None
     alpaca_poll_task    = None
+    telegram_bot_task   = None
 
     print("=" * 60)
     print("3x Leveraged Sentiment Trading System - Starting...")
@@ -221,6 +249,21 @@ async def lifespan(app: FastAPI):
     alpaca_poll_task = asyncio.create_task(_alpaca_poll_scheduler_loop())
     print("Alpaca order poll scheduler started (5 min interval)")
 
+    try:
+        from services.secret_store import get_telegram_credentials
+        _tg = get_telegram_credentials()
+        if (
+            (_tg.get("bot_token") or "").strip()
+            and (_tg.get("chat_id") or "").strip()
+            and (_tg.get("authorized_user_id") or "").strip()
+        ):
+            telegram_bot_task = asyncio.create_task(_telegram_bot_loop())
+            print("Telegram bot remote control started (long-polling)")
+        else:
+            print("Telegram bot remote control skipped (credentials not configured)")
+    except Exception as exc:
+        print(f"Telegram bot remote control skipped: {exc}")
+
     yield
 
     if data_ingestion_task:
@@ -241,6 +284,13 @@ async def lifespan(app: FastAPI):
         alpaca_poll_task.cancel()
         try:
             await alpaca_poll_task
+        except asyncio.CancelledError:
+            pass
+
+    if telegram_bot_task:
+        telegram_bot_task.cancel()
+        try:
+            await telegram_bot_task
         except asyncio.CancelledError:
             pass
 

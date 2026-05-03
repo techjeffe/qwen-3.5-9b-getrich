@@ -27,18 +27,22 @@ def test_save_and_clear_telegram_secrets(monkeypatch):
     dummy = DummyKeyring()
     monkeypatch.setattr(secret_store, "_get_keyring_module", lambda: dummy)
 
-    saved = secret_store.save_telegram_secrets("123456:ABCDEF", "987654321")
+    saved = secret_store.save_telegram_secrets("123456:ABCDEF", "987654321", "987654321")
     assert saved["configured"] is True
     assert saved["has_bot_token"] is True
     assert saved["has_chat_id"] is True
+    assert saved["has_authorized_user_id"] is True
     assert saved["bot_token_masked"] == "***DEF"
     assert saved["chat_id_masked"] == "***321"
+    assert saved["authorized_user_id_masked"] == "***321"
 
     creds = secret_store.get_telegram_credentials()
     assert creds["bot_token"] == "123456:ABCDEF"
     assert creds["chat_id"] == "987654321"
+    assert creds["authorized_user_id"] == "987654321"
 
     cleared = secret_store.clear_telegram_secrets()
     assert cleared["configured"] is False
     assert cleared["has_bot_token"] is False
     assert cleared["has_chat_id"] is False
+    assert cleared["has_authorized_user_id"] is False

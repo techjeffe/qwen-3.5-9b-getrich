@@ -82,8 +82,10 @@ type RemoteSnapshotSecretsStatus = {
     configured: boolean;
     has_bot_token: boolean;
     has_chat_id: boolean;
+    has_authorized_user_id: boolean;
     bot_token_masked: string;
     chat_id_masked: string;
+    authorized_user_id_masked: string;
     error: string;
 };
 
@@ -106,13 +108,17 @@ export default function AdminPage() {
         configured: false,
         has_bot_token: false,
         has_chat_id: false,
+        has_authorized_user_id: false,
         bot_token_masked: "",
         chat_id_masked: "",
+        authorized_user_id_masked: "",
         error: "",
     });
     const [telegramBotToken, setTelegramBotToken] = useState("");
     const [telegramChatId, setTelegramChatId] = useState("");
+    const [telegramAuthorizedUserId, setTelegramAuthorizedUserId] = useState("");
     const [isSavingSecrets, setIsSavingSecrets] = useState(false);
+    const [isVerifyingSecrets, setIsVerifyingSecrets] = useState(false);
     const [secretStatus, setSecretStatus] = useState<string>("");
     const [isSendingSnapshotNow, setIsSendingSnapshotNow] = useState(false);
     const [sendSnapshotStatus, setSendSnapshotStatus] = useState<string>("");
@@ -336,8 +342,10 @@ export default function AdminPage() {
                 configured: !!payload.configured,
                 has_bot_token: !!payload.has_bot_token,
                 has_chat_id: !!payload.has_chat_id,
+                has_authorized_user_id: !!payload.has_authorized_user_id,
                 bot_token_masked: String(payload.bot_token_masked || ""),
                 chat_id_masked: String(payload.chat_id_masked || ""),
+                authorized_user_id_masked: String(payload.authorized_user_id_masked || ""),
                 error: String(payload.error || ""),
             });
         } catch {
@@ -415,6 +423,28 @@ export default function AdminPage() {
         }
     };
 
+    const verifyRemoteSnapshotSecrets = useCallback(async (savedThisRun = false) => {
+        setIsVerifyingSecrets(true);
+        if (!savedThisRun) {
+            setSecretStatus("");
+        }
+        try {
+            const response = await fetch("/api/admin/remote-snapshot-secrets/verify", {
+                method: "POST",
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setSecretStatus(payload?.detail || payload?.error || "Telegram verification failed");
+                return;
+            }
+            setSecretStatus(String(payload?.message || "Telegram remote control verified."));
+        } catch {
+            setSecretStatus("Telegram verification failed");
+        } finally {
+            setIsVerifyingSecrets(false);
+        }
+    }, []);
+
     const saveRemoteSnapshotSecrets = async () => {
         setIsSavingSecrets(true);
         setSecretStatus("");
@@ -422,11 +452,15 @@ export default function AdminPage() {
             const response = await fetch("/api/admin/remote-snapshot-secrets", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ bot_token: telegramBotToken, chat_id: telegramChatId }),
+                body: JSON.stringify({
+                    bot_token: telegramBotToken,
+                    chat_id: telegramChatId,
+                    authorized_user_id: telegramAuthorizedUserId,
+                }),
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
-                setSecretStatus(payload?.error || "Failed to save secrets");
+                setSecretStatus(payload?.detail || payload?.error || "Failed to save secrets");
                 return;
             }
             setRemoteSecrets({
@@ -434,21 +468,25 @@ export default function AdminPage() {
                 configured: !!payload.configured,
                 has_bot_token: !!payload.has_bot_token,
                 has_chat_id: !!payload.has_chat_id,
+                has_authorized_user_id: !!payload.has_authorized_user_id,
                 bot_token_masked: String(payload.bot_token_masked || ""),
                 chat_id_masked: String(payload.chat_id_masked || ""),
+                authorized_user_id_masked: String(payload.authorized_user_id_masked || ""),
                 error: String(payload.error || ""),
             });
             setConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
             setSavedConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
             setTelegramBotToken("");
             setTelegramChatId("");
+            setTelegramAuthorizedUserId("");
             if (payload?.test_delivery_started) {
-                setSecretStatus("Secrets saved. A test snapshot is being sent now.");
+                setSecretStatus("Credentials saved. A test snapshot is being sent now.");
             } else if (payload?.test_delivery_note) {
-                setSecretStatus(`Secrets saved. ${payload.test_delivery_note}`);
+                setSecretStatus(`Credentials saved. ${payload.test_delivery_note}`);
             } else {
-                setSecretStatus("Secrets saved to OS keychain");
+                setSecretStatus("Credentials saved to OS keychain.");
             }
+            await verifyRemoteSnapshotSecrets(true);
         } catch {
             setSecretStatus("Failed to save secrets");
         } finally {
@@ -473,12 +511,15 @@ export default function AdminPage() {
                 configured: !!payload.configured,
                 has_bot_token: !!payload.has_bot_token,
                 has_chat_id: !!payload.has_chat_id,
+                has_authorized_user_id: !!payload.has_authorized_user_id,
                 bot_token_masked: String(payload.bot_token_masked || ""),
                 chat_id_masked: String(payload.chat_id_masked || ""),
+                authorized_user_id_masked: String(payload.authorized_user_id_masked || ""),
                 error: String(payload.error || ""),
             });
             setTelegramBotToken("");
             setTelegramChatId("");
+            setTelegramAuthorizedUserId("");
             setSecretStatus("Secrets cleared from OS keychain");
         } catch {
             setSecretStatus("Failed to clear secrets");
@@ -1190,11 +1231,15 @@ export default function AdminPage() {
                 showRemoteSnapshotSetupModal={showRemoteSnapshotSetupModal}
                 telegramBotToken={telegramBotToken}
                 telegramChatId={telegramChatId}
+                telegramAuthorizedUserId={telegramAuthorizedUserId}
                 setTelegramBotToken={setTelegramBotToken}
                 setTelegramChatId={setTelegramChatId}
+                setTelegramAuthorizedUserId={setTelegramAuthorizedUserId}
                 saveRemoteSecrets={saveRemoteSnapshotSecrets}
+                verifyRemoteSecrets={() => void verifyRemoteSnapshotSecrets(false)}
                 clearRemoteSecrets={clearRemoteSnapshotSecrets}
                 isSavingSecrets={isSavingSecrets}
+                isVerifyingSecrets={isVerifyingSecrets}
                 secretStatus={secretStatus}
                 remoteSecrets={remoteSecrets}
                 setShowRemoteSnapshotSetupModal={setShowRemoteSnapshotSetupModal}
