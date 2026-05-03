@@ -159,15 +159,19 @@ def format_stage1_extraction_prompt(
     )
 
 
-SYMBOL_KEYWORD_GENERATION_PROMPT = """List 15-20 keywords and proxy terms that appear in news articles likely to affect the stock or asset {symbol}.
+SYMBOL_KEYWORD_GENERATION_PROMPT = """List 25-35 keywords and proxy terms that would appear in news articles capable of moving the stock price of {symbol}. Cast the net wide — include BOTH direct mentions AND indirect catalysts that affect revenue, costs, or demand even when the company is not named.
 
-Include:
-- Company or fund name and common abbreviations
-- Key products, services, or major holdings
-- Sector and industry terms
-- Notable competitors or sector peers
-- Relevant macro factors (commodities, rates, regulation topics)
-- Common news triggers for this ticker
+Cover all of the following:
+- Company name, ticker, and common abbreviations
+- Key products, services, or major business lines
+- Major customers or end-markets (e.g. hyperscalers, automakers, defense contractors)
+- Supply chain: key suppliers, foundries, manufacturing partners, raw materials, critical components
+- Competitors and sector peers whose news signals market shifts — a rival's product launch or production ramp is a direct catalyst even if {symbol} is not mentioned
+- Geopolitical and regulatory terms with sector-specific bite: export controls, sanctions, tariffs, antitrust actions, licensing restrictions — name the specific affected products or regions where relevant
+- Sector and industry umbrella terms this stock moves with
+- Common news event types for this ticker: earnings beats/misses, contract wins, regulatory approvals, product recalls, workforce changes
+
+Example for a semiconductor stock: terms would include the company name AND "chip export ban", "export restriction", "advanced packaging", "foundry capacity", "gpu competition", "ai accelerator", "wafer shortage", plus competitor names like "intel gpu", "amd server chip".
 
 Return JSON only, no other text:
 {{"terms": ["term1", "term2", ...]}}"""

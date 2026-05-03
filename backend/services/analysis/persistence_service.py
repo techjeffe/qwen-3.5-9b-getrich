@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from database.models import AnalysisResult, PaperTrade, ScrapedArticle, Trade
-from database.models import TradeExecution, TradeSnapshot, TradingSignalModel
+from database.models import TradeExecution, TradeSnapshot, TradingSignal as TradingSignalModel
 from schemas.analysis import AnalysisResponse
 from services.data_ingestion.worker import build_analysis_posts
 from services.runtime_health import record_analysis_result
@@ -54,6 +54,7 @@ class PersistenceService:
         secret_trace: Optional[Dict[str, Any]] = None,
         sentiment_results: Optional[Dict[str, Any]] = None,
         per_symbol_counts: Optional[Dict[str, int]] = None,
+        price_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Save the full analysis result and trigger downstream hooks."""
         counts = per_symbol_counts or (
@@ -75,6 +76,7 @@ class PersistenceService:
             secret_trace=secret_trace,
             sentiment_results=sentiment_results,
             per_symbol_counts=counts,
+            price_context=price_context,
         )
 
     def load_saved_analysis_response(self, analysis: AnalysisResult) -> Optional[Dict[str, Any]]:
@@ -217,6 +219,7 @@ class PersistenceService:
         secret_trace: Optional[Dict[str, Any]],
         sentiment_results: Optional[Dict[str, Any]],
         per_symbol_counts: Dict[str, int],
+        price_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
             frozen_snapshot = dataset_snapshot or self._build_dataset_snapshot(
@@ -316,6 +319,13 @@ class PersistenceService:
                         _conviction = "MEDIUM"
                     _trade_type = {"HIGH": "POSITION", "MEDIUM": "SWING", "LOW": "VOLATILE_EVENT"}.get(_conviction, "SWING")
                     _hold_mins = _cv["holding_minutes"].get(_trade_type, 720)
+                    _atr_pct = 0.0
+                    if price_context:
+                        _indicators = (price_context.get(f"technical_indicators_{sym.lower()}") or {})
+                        try:
+                            _atr_pct = float(_indicators.get("atr_14_pct") or 0.0)
+                        except (TypeError, ValueError):
+                            _atr_pct = 0.0
                     recs_for_paper.append({
                         "underlying": sym_upper,
                         "execution_ticker": rec.get("symbol", sym_upper) if rec else sym_upper,
@@ -324,6 +334,7 @@ class PersistenceService:
                         "conviction_level": _conviction,
                         "trading_type": _trade_type,
                         "holding_minutes": _hold_mins,
+                        "atr_pct": _atr_pct,
                     })
                 if recs_for_paper:
                     paper_process_signals(
@@ -340,8 +351,8 @@ class PersistenceService:
             db.commit()
             trigger_remote_snapshot_delivery(request_id)
         except Exception as e:
-            print(f"Error saving analysis result: {e}")
             db.rollback()
+            raise RuntimeError(f"Error saving analysis result: {e}") from e
 
     def _build_dataset_snapshot(
         self,
@@ -355,14 +366,16 @@ class PersistenceService:
         risk_profile: str,
         secret_trace: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        request_payload = getattr(response, "request_payload", None) or {}
+        article_ids = list(getattr(response, "article_ids", None) or [])
         frozen_snapshot: Dict[str, Any] = {
             "request_id": response.request_id or "",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "request_payload": response.request_payload or {},
+            "request_payload": request_payload,
             "prompt_overrides": dict(prompt_overrides or {}),
             "dataset": {
                 "symbols_analyzed": list(response.symbols_analyzed or []),
-                "article_ids": list(response.article_ids or []),
+                "article_ids": article_ids,
                 "posts_scraped": int(response.posts_scraped or 0),
                 "articles": self._serialize_snapshot_posts(response.request_id, posts) if posts else [],
                 "quotes_by_symbol": self._restore_snapshot_quotes(quotes_by_symbol),
@@ -403,8 +416,9 @@ class PersistenceService:
         }
 
     def _build_secret_trace(self, response: AnalysisResponse, quotes_by_symbol: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        request_payload = getattr(response, "request_payload", None) or {}
         return {
-            "source": response.request_payload.get("secret_source") if response.request_payload else None,
+            "source": request_payload.get("secret_source"),
             "price_source": [
                 {
                     "symbol": symbol,

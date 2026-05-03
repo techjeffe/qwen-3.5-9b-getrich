@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Any, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -153,10 +154,17 @@ class StreamService:
         stability_mode = "normal"
         previous_response = None
         entry_threshold_override = None
+        signal_age_hours = 0.0
         if self._hysteresis.is_closed_market_session(quotes_by_symbol):
             stability_mode = "closed_market_hysteresis"
-            previous_response = self._hysteresis.latest_previous_analysis_response(db)
+            _prev_state = self._hysteresis.latest_previous_analysis_state(db)
+            previous_response = (_prev_state or {}).get("response")
             entry_threshold_override = self._L["entry_thresholds"].get("closed_market", 0.25)
+            _prev_ts = getattr((_prev_state or {}).get("analysis"), "timestamp", None)
+            if _prev_ts is not None:
+                if _prev_ts.tzinfo is None:
+                    _prev_ts = _prev_ts.replace(tzinfo=timezone.utc)
+                signal_age_hours = (datetime.now(timezone.utc) - _prev_ts).total_seconds() / 3600.0
 
         sentiment_results = None
         sentiment_trace = None
@@ -204,6 +212,7 @@ class StreamService:
             stability_mode=stability_mode,
             entry_threshold_override=entry_threshold_override,
             price_context=price_context,
+            signal_age_hours=signal_age_hours,
         )
         per_symbol_counts = self._materiality._count_symbol_articles(
             posts, list(sentiment_results.keys()),
@@ -341,6 +350,7 @@ class StreamService:
                 extraction_model=extraction_model or "",
                 reasoning_model=reasoning_model or "",
                 risk_profile=getattr(config, 'risk_profile', 'moderate'),
+                price_context=price_context,
             )
             yield self._sse_result("save", "ok", {"request_id": request_id, "analysis_id": analysis_id})
         except Exception as save_err:

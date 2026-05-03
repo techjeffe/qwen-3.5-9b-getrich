@@ -4,6 +4,40 @@ export function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
 }
 
+const MIN_TIMING_SAMPLE_SECONDS = 5;
+const MAX_TIMING_SAMPLE_SECONDS = 1800;
+const DEFAULT_MAX_TIMING_SAMPLES = 12;
+
+export function sanitizeTimingSamples(samples: unknown, maxSamples = DEFAULT_MAX_TIMING_SAMPLES): number[] {
+    if (!Array.isArray(samples)) return [];
+    return samples
+        .map((value) => Number(value))
+        .filter((value) =>
+            Number.isFinite(value)
+            && value >= MIN_TIMING_SAMPLE_SECONDS
+            && value <= MAX_TIMING_SAMPLE_SECONDS
+        )
+        .map((value) => Math.round(value))
+        .slice(-Math.max(1, maxSamples));
+}
+
+export function appendTimingSample(samples: unknown, nextSampleSeconds: number, maxSamples = DEFAULT_MAX_TIMING_SAMPLES): number[] {
+    return sanitizeTimingSamples(
+        [...sanitizeTimingSamples(samples, maxSamples), nextSampleSeconds],
+        maxSamples,
+    );
+}
+
+export function mergeTimingSamples(
+    primarySamples: unknown,
+    secondarySamples: unknown,
+    maxSamples = DEFAULT_MAX_TIMING_SAMPLES,
+): number[] {
+    const primary = sanitizeTimingSamples(primarySamples, maxSamples);
+    const secondary = sanitizeTimingSamples(secondarySamples, maxSamples);
+    return sanitizeTimingSamples([...secondary, ...primary], maxSamples);
+}
+
 export function percentile(sorted: number[], p: number) {
     if (sorted.length === 0) return 0;
     if (sorted.length === 1) return sorted[0];
@@ -16,9 +50,7 @@ export function percentile(sorted: number[], p: number) {
 }
 
 export function estimateRunTiming(samples: number[], fallbackSeconds: number) {
-    const cleaned = samples
-        .filter((value) => Number.isFinite(value) && value > 0)
-        .slice(-8)
+    const cleaned = sanitizeTimingSamples(samples, 8)
         .sort((a, b) => a - b);
 
     if (cleaned.length < 2) {

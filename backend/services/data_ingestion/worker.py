@@ -87,20 +87,39 @@ def _load_symbol_relevance_terms() -> Dict[str, List[str]]:
     return {str(symbol).upper(): list(terms or []) for symbol, terms in SYMBOL_RELEVANCE_TERMS.items()}
 
 
-def _iter_stage0_terms(symbols: Iterable[str]) -> List[str]:
+def _iter_stage0_terms(
+    symbols: Iterable[str],
+    company_aliases: Optional[Dict[str, str]] = None,
+) -> List[str]:
     relevance_terms = _load_symbol_relevance_terms()
+    aliases = company_aliases or {}
     selected_terms: List[str] = []
     for symbol in symbols:
-        selected_terms.extend(relevance_terms.get(str(symbol).upper(), []))
+        sym_upper = str(symbol).upper()
+        terms = relevance_terms.get(sym_upper, [])
+        if terms:
+            selected_terms.extend(terms)
+        else:
+            # Custom symbol: at minimum match the ticker itself and each word of
+            # the company alias (e.g. "gopro" from "GoPro", "nvidia" from "NVIDIA").
+            selected_terms.append(sym_upper.lower())
+            alias = aliases.get(sym_upper, "")
+            for word in alias.lower().split():
+                if len(word) > 3:  # skip short noise like "inc", "llc", "the"
+                    selected_terms.append(word)
     selected_terms.extend(MAJOR_POLICY_SHIFT_TERMS)
     return expand_proxy_terms_for_matching(selected_terms)
 
 
-def _matches_stage0_filter(article: NewsArticle, tracked_symbols: Iterable[str]) -> bool:
+def _matches_stage0_filter(
+    article: NewsArticle,
+    tracked_symbols: Iterable[str],
+    company_aliases: Optional[Dict[str, str]] = None,
+) -> bool:
     text = normalize_text_for_matching(" ".join([article.title or "", article.summary or ""]))
     if not text:
         return False
-    return any(term in text for term in _iter_stage0_terms(tracked_symbols))
+    return any(term in text for term in _iter_stage0_terms(tracked_symbols, company_aliases))
 
 
 def check_fast_lane(article_summary: str) -> bool:
@@ -415,13 +434,47 @@ async def run_ingestion_cycle(db: Optional[Session] = None) -> Dict[str, Any]:
     try:
         config = get_or_create_app_config(session)
         tracked_symbols = [str(symbol).upper().strip() for symbol in (config.tracked_symbols or []) if str(symbol).strip()]
+        company_aliases = {
+            str(k).upper(): str(v).strip()
+            for k, v in (getattr(config, "symbol_company_aliases", None) or {}).items()
+            if str(v).strip()
+        }
+
+        # Auto-inject a Yahoo Finance RSS feed for every tracked symbol so custom
+        # equities (NVDA, GPRO, etc.) have a dedicated per-ticker news stream without
+        # requiring manual feed configuration.
+        yahoo_feeds = {
+            f"yahoo_finance_{sym.lower()}": f"https://finance.yahoo.com/rss/headline?s={sym}"
+            for sym in tracked_symbols
+            if sym
+        }
+        merged_feeds = {**build_enabled_rss_feed_map(config), **yahoo_feeds}
+        merged_labels = {
+            **build_enabled_rss_feed_labels(config),
+            **{f"yahoo_finance_{sym.lower()}": f"Yahoo Finance — {sym}" for sym in tracked_symbols},
+        }
         parser = RSSFeedParser(
-            feeds=build_enabled_rss_feed_map(config),
-            feed_labels=build_enabled_rss_feed_labels(config),
+            feeds=merged_feeds,
+            feed_labels=merged_labels,
         )
         articles = await asyncio.to_thread(parser.parse_feeds)
+        print(f"Ingestion: {len(articles)} raw articles from {len(merged_feeds)} feeds "
+              f"({len(yahoo_feeds)} Yahoo Finance per-symbol, {len(merged_feeds)-len(yahoo_feeds)} configured)")
 
-        kept_articles = [article for article in articles if article.link and _matches_stage0_filter(article, tracked_symbols)]
+        # Articles from per-symbol Yahoo Finance feeds are relevant by definition —
+        # bypass Stage 0 for them so "Alphabet Reports Earnings" doesn't get dropped
+        # because it doesn't contain the ticker "goog".
+        yahoo_source_labels: set = {merged_labels[k] for k in yahoo_feeds if k in merged_labels}
+
+        kept_articles = [
+            article for article in articles
+            if article.link and (
+                article.source in yahoo_source_labels
+                or _matches_stage0_filter(article, tracked_symbols, company_aliases)
+            )
+        ]
+        print(f"Stage 0 filter: {len(kept_articles)}/{len(articles)} articles passed "
+              f"(symbols: {', '.join(tracked_symbols)})")
         kept_articles.sort(
             key=lambda item: _coerce_utc(getattr(item, "published_date", None)) or _utc_now(),
             reverse=True,

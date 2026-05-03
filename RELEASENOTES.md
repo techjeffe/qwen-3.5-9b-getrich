@@ -1,3 +1,41 @@
+# Release Notes — May 2, 2026
+
+## Quant-Quality Signal Improvements: Volatility-Normalized Sizing, Sentiment Decay, and Portfolio Cap
+
+Three structural improvements to the signal generation and execution layer.
+
+**Volatility-normalized position sizing:**
+
+- Position size is now computed from a 1% daily volatility target instead of a flat notional amount
+- Formula: `size = (1% × base_amount) / ATR_14d_pct`, then scaled by conviction (HIGH=1.5×, MEDIUM=1.0×, LOW=0.5×)
+- High-volatility assets (BITO, crude) automatically receive smaller positions than low-volatility assets (SPY) for the same signal strength — size is inversely proportional to daily risk
+- Example at $100 base: SPY ATR=0.8% MEDIUM→$125, HIGH→$187.50; BITO ATR=3.5% MEDIUM→$28.57
+- Falls back to conviction-scaled base when ATR is unavailable (no price history pulled yet)
+- Clamped to [0.25×, 5.0×] the configured base amount
+- Flows through to Alpaca paper and live orders automatically — Alpaca reads `paper_trade.amount` directly as notional, so no broker-layer changes were needed
+- Configurable in `logic_config.json` under `vol_sizing`: `enabled`, `target_daily_vol_pct`, `conviction_scalars`, `min_size_multiple`, `max_size_multiple`
+
+**Sentiment half-life decay:**
+
+- Directional scores are exponentially decayed based on hours elapsed since the previous analysis ran
+- Formula: `decay_factor = max(min_factor, 0.5^(age_hours / half_life))` — a signal at its half-life age clears the entry threshold at half strength
+- Per-symbol half-lives reflect how quickly each market absorbs news: SPY/QQQ=2h, USO=4h, BITO/IBIT=6h, default=3h
+- Decay only gates threshold comparisons (entry and hysteresis keep-threshold) — raw scores for conviction level and basket-score weighting are unchanged
+- Prevents stale news from sustaining hysteresis re-entries after the market has priced in the information
+- Fresh analysis (`signal_age_hours=0`) produces decay_factor=1.0 — no impact on first-run signals
+- Configurable in `logic_config.json` under `signal_decay`: `enabled`, `default_half_life_hours`, `symbol_half_lives`, `min_decay_factor`
+
+**Portfolio cap:**
+
+- A new **Portfolio Cap ($)** field in Admin › Trading Logic limits total open notional exposure across all symbols simultaneously
+- When the cap is reached, new trade opens are skipped until an existing position closes and frees capacity
+- If a single computed trade is larger than the remaining room it is scaled down to fit rather than skipped entirely — the cap controls cumulative exposure, not individual trade size
+- Example: $5,000 account capped at $1,000 — after two MEDIUM-conviction SPY trades (~$250 each) only ~$500 is left; a third trade in a third symbol is sized down to $500 if needed, or skipped if there is no room at all
+- Tracked via a running in-memory counter within each analysis loop (open positions opened earlier in the same run count against the cap immediately, even before the DB is committed)
+- Configurable in `logic_config.json` under `vol_sizing.portfolio_cap_usd`; also overridable per-account from Admin › Trading Logic (`vol_sizing_portfolio_cap_usd`)
+
+---
+
 # Release Notes — May 1, 2026
 
 ## Dashboard Deconstruction and Trading Enforcement Hardening

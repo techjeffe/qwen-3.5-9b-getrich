@@ -180,6 +180,102 @@ def _same_day_exit_edge_blocks_close(open_pos, exit_price: float, now: datetime,
     return pnl_pct > 0 and pnl_pct < threshold_pct
 
 
+def _portfolio_cap_for_config(app_config) -> Optional[float]:
+    """Return the configured portfolio cap in USD, or None if uncapped."""
+    try:
+        if app_config is not None:
+            override = getattr(app_config, "vol_sizing_portfolio_cap_usd", None)
+            if override is not None:
+                return max(0.0, float(override))
+    except Exception:
+        pass
+    cap = _L.get("vol_sizing", {}).get("portfolio_cap_usd")
+    return max(0.0, float(cap)) if cap is not None else None
+
+
+def _get_alpaca_system_open_exposure(broker, db, app_config=None) -> Optional[float]:
+    """Return total |market_value| of Alpaca positions in tickers this system trades.
+
+    Covers both the fixed execution tickers from INSTRUMENT_SPECS (TQQQ, SPXL, etc.)
+    and any custom symbols the user has added (NVDA, TSLA, etc.). Positions opened
+    outside this system are still counted — the risk is real regardless of who opened
+    them — and logged as a warning. Returns None on API error so the caller falls back
+    to the DB total.
+    """
+    try:
+        from services.trading_instruments import INSTRUMENT_SPECS
+        from database.models import PaperTrade as _PT
+
+        # Fixed execution tickers (leveraged ETF proxies for default symbols).
+        _our_tickers: set = set()
+        for spec in INSTRUMENT_SPECS.values():
+            for direction in ("bull", "bear"):
+                _our_tickers.update(spec.get(direction, {}).values())
+
+        # Custom symbols trade directly under their own ticker.
+        if app_config is not None:
+            for sym in (getattr(app_config, "custom_symbols", None) or []):
+                sym = str(sym or "").upper().strip()
+                if sym:
+                    _our_tickers.add(sym)
+
+        _db_tickers = {
+            str(p.execution_ticker or "").upper()
+            for p in db.query(_PT).filter(_PT.exited_at.is_(None)).all()
+            if p.execution_ticker
+        }
+
+        positions = broker.get_positions()
+        total = 0.0
+        for p in positions:
+            sym = str(p.get("symbol") or "").upper()
+            if sym not in _our_tickers:
+                continue
+            mv = abs(float(p.get("market_value") or 0))
+            total += mv
+            if sym not in _db_tickers:
+                print(
+                    f"[cap] external position in {sym} (${mv:.2f}) not opened by this system"
+                    f" — counting against portfolio cap"
+                )
+        return total
+    except Exception as exc:
+        print(f"[cap] could not fetch Alpaca positions for exposure baseline: {exc}")
+        return None
+
+
+def _compute_vol_normalized_amount(
+    base_amount: float,
+    conviction_level: str,
+    atr_pct: float,
+) -> float:
+    """
+    Compute position size using volatility targeting.
+
+    Formula: size = (target_daily_vol_pct/100 * base) / (atr_14d_pct/100)
+    Scaled by conviction level, then clamped to [min_mult, max_mult] × base.
+
+    When ATR is unavailable (0), falls back to conviction-scaled base amount.
+    """
+    cfg = _L.get("vol_sizing", {})
+    if not cfg.get("enabled", True):
+        return base_amount
+
+    target_vol = float(cfg.get("target_daily_vol_pct", 1.0)) / 100.0
+    scalars = cfg.get("conviction_scalars", {"HIGH": 1.5, "MEDIUM": 1.0, "LOW": 0.5})
+    conviction_scalar = float(scalars.get(str(conviction_level).upper(), 1.0))
+    min_mult = float(cfg.get("min_size_multiple", 0.25))
+    max_mult = float(cfg.get("max_size_multiple", 5.0))
+
+    if atr_pct > 0:
+        vol_size = (target_vol * base_amount) / (atr_pct / 100.0)
+    else:
+        vol_size = base_amount
+
+    scaled = vol_size * conviction_scalar
+    return round(max(base_amount * min_mult, min(base_amount * max_mult, scaled)), 2)
+
+
 def close_expired_positions(db, alpaca_pending: Optional[list] = None) -> List[Dict[str, Any]]:
     """
     Close any open positions whose conviction window has expired.
@@ -351,6 +447,33 @@ def process_signals(
     now = datetime.utcnow()
     actions: List[Dict[str, Any]] = [_expired_action(ea) for ea in expired_actions]
 
+    # Portfolio cap — seed running exposure from Alpaca when connected so external
+    # positions in our execution tickers count against the cap. Falls back to DB.
+    _portfolio_cap = _portfolio_cap_for_config(_app_config)
+    _open_exposure = 0.0
+    if _portfolio_cap is not None:
+        _alpaca_mode = (getattr(_app_config, "alpaca_execution_mode", None) or "off")
+        _alpaca_exposure: Optional[float] = None
+        if _alpaca_mode != "off":
+            try:
+                from services.alpaca_broker import get_broker_from_keychain as _gbfk
+                _cap_broker = _gbfk(mode=_alpaca_mode)
+                if _cap_broker:
+                    _alpaca_exposure = _get_alpaca_system_open_exposure(_cap_broker, db, _app_config)
+            except Exception:
+                pass
+        if _alpaca_exposure is not None:
+            _open_exposure = _alpaca_exposure
+        else:
+            try:
+                from database.models import PaperTrade as _PT
+                _open_exposure = sum(
+                    float(p.amount or 0)
+                    for p in db.query(_PT).filter(_PT.exited_at.is_(None)).all()
+                )
+            except Exception:
+                _open_exposure = 0.0
+
     for rec in recommendations:
         underlying = str(rec.get("underlying") or rec.get("symbol") or "").upper()
         execution_ticker = str(rec.get("execution_ticker") or rec.get("entry_symbol") or "").upper()
@@ -512,6 +635,8 @@ def process_signals(
             action_summary["closed_pnl"] = open_pos.realized_pnl
             action_summary["exit_price"] = existing_pos_price
             _alpaca_pending.append((open_pos, "close"))
+            if _portfolio_cap is not None:
+                _open_exposure = max(0.0, _open_exposure - float(open_pos.amount or 0))
         elif window_blocks_close:
             action_summary["action"] = "held"
             action_summary["reason"] = "conviction_window_blocks_flip"
@@ -582,8 +707,22 @@ def process_signals(
             actions.append(action_summary)
             continue
 
-        # Open new position
-        _amount = trade_amount if trade_amount and trade_amount > 0 else _L["paper_trade_amount"]
+        # Open new position — size using volatility targeting, then apply portfolio cap
+        _base_amount = trade_amount if trade_amount and trade_amount > 0 else _L["paper_trade_amount"]
+        _atr_pct = float(rec.get("atr_pct") or 0.0)
+        _amount = _compute_vol_normalized_amount(_base_amount, conviction_level, _atr_pct)
+
+        if _portfolio_cap is not None:
+            _remaining = max(0.0, _portfolio_cap - _open_exposure)
+            if _remaining <= 0.0:
+                action_summary["action"] = "skipped"
+                action_summary["reason"] = "portfolio_cap_reached"
+                action_summary["portfolio_cap_usd"] = _portfolio_cap
+                action_summary["open_exposure_usd"] = round(_open_exposure, 2)
+                actions.append(action_summary)
+                continue
+            _amount = min(_amount, _remaining)
+
         if entry_price > 0:
             window_until = datetime.utcnow() + timedelta(minutes=holding_minutes)
             shares = round(_amount / entry_price, 6)
@@ -605,8 +744,11 @@ def process_signals(
             )
             db.add(new_trade)
             _alpaca_pending.append((new_trade, "open"))
+            if _portfolio_cap is not None:
+                _open_exposure += _amount
             action_summary["action"] = "opened"
             action_summary["entry_price"] = entry_price
+            action_summary["amount"] = round(_amount, 2)
             action_summary["holding_window_until"] = _utc_iso(window_until)
         else:
             action_summary["action"] = "skipped"

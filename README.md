@@ -351,7 +351,7 @@ Backend:
 - Local Ollama-served symbol-specialist runs, signal generation, and paper-trade persistence
 - Frozen analysis snapshot persistence for model-to-model replay in Advanced Mode
 - Persistent admin configuration stored in the local database so saved symbols, feeds, prompt overrides, and timezone survive rebuilds/restarts
-- Paper trading hook wired into every analysis save — simulates $100 per signal, manages position lifecycle, stores results in a dedicated `paper_trades` table independent of all other analysis tables
+- Paper trading hook wired into every analysis save — simulates a volatility-normalized position size per signal, manages position lifecycle, stores results in a dedicated `paper_trades` table independent of all other analysis tables
 - Alpaca brokerage integration — every paper trade open/close is optionally mirrored to Alpaca in real time; extended-hours orders use qty+limit automatically; same-symbol live exposure is checked before new opens; PDT-risk opens/closes can be skipped on sub-$25k accounts; a circuit breaker auto-disables live trading when exposure/loss limits are hit; all order outcomes written to `alpaca_orders` for audit
 - Analysis lease/lock coordination in `app_config` so scheduled runs and urgent off-cycle runs do not process the same queued articles in parallel
 
@@ -391,7 +391,9 @@ Model flow:
 - Comparison results now show clearer baseline vs comparison labeling plus per-symbol reasoning summaries to explain disagreements
 - Compare can also load two saved historical runs directly and show why a symbol changed, including recommendation flips, score deltas, confidence moves, and leverage-threshold changes
 - P&L tracking with live prices, forward-horizon snapshots (1h / 4h / 1d / 3d / 1w), and realized close price recording
-- **Paper trading simulation** — every analysis run auto-simulates a $100 paper trade per signal during extended market hours (4am–8pm ET); position lifecycle mirrors what a real trader following every signal would do; results visible on the `/trading` page with equity curve, open positions with live P&L, and closed trade history
+- **Paper trading simulation** — every analysis run auto-simulates a volatility-normalized paper trade per signal during extended market hours (4am–8pm ET); position size scales with ATR and conviction rather than a flat notional; position lifecycle mirrors what a real trader following every signal would do; results visible on the `/trading` page with equity curve, open positions with live P&L, and closed trade history
+- **Volatility-normalized position sizing** — each trade is sized by ATR rather than a flat notional: calmer assets (SPY) get a bigger slice, volatile ones (BITO) get a smaller one; conviction level scales the result (HIGH=1.5×, MEDIUM=1.0×, LOW=0.5×); the floor is 0.25× and ceiling is 5× the configured base; flows through to Alpaca notional automatically; see the **Position Sizing** section below for a full example table; configurable in `logic_config.json` under `vol_sizing`
+- **Sentiment half-life decay** — directional scores are exponentially decayed based on hours since the previous analysis ran (`decay = max(floor, 0.5^(age/half_life))`); per-symbol half-lives: SPY/QQQ=2h, USO=4h, BITO/IBIT=6h; prevents stale news from sustaining hysteresis entries after the market has priced it in; configurable in `logic_config.json` under `signal_decay`
 - **ATR-scaled leverage caps** — leverage assigned to a new paper trade is capped by the symbol's 14-day ATR %; high volatility forces 1x regardless of confidence score; thresholds configurable in `logic_config.json`
 - **Trailing stop on HOLD** — a HOLD signal on an open position sets a tightened trailing stop instead of force-closing; stop tracks `best_price_seen` and closes only if price crosses; thesis re-confirmation clears the trailing stop
 - **Trail on window expiry** — when a conviction holding window expires, the position transitions to trailing stop mode instead of closing flat; configurable per-run via Admin (`trail_on_window_expiry`)
@@ -435,7 +437,7 @@ The Admin page is organized around the things users change most often first.
    - Light: single "Analysis Model" (same model for Stage 1 and Stage 2)
    - Normal: optional Stage 1 and Stage 2 selectors; single-stage if only one is set
    - Detailed: both models required; amber warning shown until both are selected
-3. **Trading Logic** — session hours toggle (allow pre-market / after-hours paper trading), and threshold overrides for paper trade amount, entry threshold, stop loss, take profit, the materiality gate, and minimum same-day exit edge; trail-on-expiry toggle and re-entry cooldown minutes; leave fields blank to use `logic_config.json` defaults
+3. **Trading Logic** — session hours toggle (allow pre-market / after-hours paper trading), and threshold overrides for paper trade amount, entry threshold, stop loss, take profit, the materiality gate, and minimum same-day exit edge; trail-on-expiry toggle and re-entry cooldown minutes; leave fields blank to use `logic_config.json` defaults; volatility-normalized sizing and signal decay are configured directly in `logic_config.json` under `vol_sizing` and `signal_decay`
 4. **Symbols** — enable/disable default symbols, add up to 3 custom symbols
 5. **RSS Sources** — enable/disable the built-in feeds, add up to 3 custom feeds, and set a display label for each custom feed
 6. **Prompt Overrides** — per-symbol specialist prompt guidance
@@ -492,6 +494,34 @@ All indicators are computed locally from the `price_history` table using numpy �
 - Most geopolitical and market headlines come from standard RSS feeds
 - Truth Social coverage currently comes from the third-party RSS feed `https://trumpstruth.org/feed`
 - Direct Playwright scraping of Truth Social is not the active production path right now
+
+## Position Sizing
+
+The `paper_trade_amount` setting (default $100) is a **base amount, not a fixed trade size**. Each trade is sized by volatility: calmer assets get a bigger slice, wilder assets get a smaller one. With a $100 base the floor is **$25** and the ceiling is **$500** per trade.
+
+**Formula:** `trade size = (1% × base_amount) / ATR_14d_pct`, then scaled by conviction level.
+
+Typical sizes at $100 base using recent ATR values:
+
+| Symbol | Typical ATR | LOW conviction | MEDIUM conviction | HIGH conviction |
+|--------|------------|---------------|-------------------|-----------------|
+| SPY    | ~0.8%      | $62.50        | $125.00           | $187.50         |
+| QQQ    | ~1.2%      | $41.67        | $83.33            | $125.00         |
+| USO    | ~2.0%      | $25.00        | $50.00            | $75.00          |
+| BITO/IBIT | ~3.5%  | $25.00        | $28.57            | $42.86          |
+
+**What this means for a $1,000 account:**
+
+- A single HIGH-conviction SPY trade uses ~$187 — about 19% of the account
+- All four symbols firing at HIGH conviction simultaneously would deploy ~$430 total — well within a $1,000 account
+- All four at MEDIUM conviction would deploy ~$287 total
+- The floor ($25) and ceiling ($500) are hard clamps, so one trade can never be less than $25 or more than $500 regardless of ATR
+
+**If price history has not been pulled** for a symbol its ATR is unknown and the trade falls back to the conviction-scaled base: LOW=$50, MEDIUM=$100, HIGH=$150.
+
+**Portfolio Cap** — set a **Portfolio Cap ($)** in Admin › Trading Logic to hard-limit total open exposure across all symbols at once. If you connect a $5,000 account but only want to risk $1,000, set the cap to 1000. When the cap is reached, new trades are skipped; when an existing position closes, the freed exposure can be reused. If a single computed trade size would exceed the remaining room, it is scaled down to fit rather than skipped entirely. Leave the field blank for no cap.
+
+**If using Alpaca live trading**, set `alpaca_max_total_exposure_usd` in Admin to a comfortable fraction of your account (e.g. $400 for a $1,000 account) as a hard backstop — the circuit breaker will skip new opens once that limit is reached.
 
 ## Signal Logic
 

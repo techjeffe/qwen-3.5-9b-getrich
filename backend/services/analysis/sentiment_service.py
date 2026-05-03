@@ -25,7 +25,7 @@ from schemas.analysis import ModelInputDebug, ModelInputArticle
 from services.data_ingestion.market_validation import MarketValidationClient
 from services.data_ingestion.yfinance_client import PriceClient
 from services.ollama import get_ollama_status
-from services.sentiment.engine import SentimentEngine
+from services.sentiment.engine import SentimentEngine, SentimentAnalysisResponse
 from services.sentiment.prompts import (
     format_stage2_proxy_appendix,
     format_symbol_specialist_context_prompt,
@@ -76,9 +76,10 @@ class SentimentService:
         exposure_hints_by_symbol: Dict[str, str] = {}
         stage_metrics: Dict[str, Dict[str, Any]] = {}
 
-        if extraction_model and reasoning_model:
+        stage1_model = extraction_model or model_name
+        if stage1_model:
             stage1_started = time.time()
-            stage1_result = await engine.extract_relevant_articles(posts, symbols, extraction_model)
+            stage1_result = await engine.extract_relevant_articles(posts, symbols, stage1_model)
             stage1_duration_ms = (time.time() - stage1_started) * 1000
             analysis_posts = stage1_result["filtered_posts"]
             proxy_terms_by_symbol = stage1_result["proxy_terms_by_symbol"]
@@ -86,7 +87,7 @@ class SentimentService:
             keyword_generation_trace_by_symbol = stage1_result.get("keyword_generation_trace_by_symbol", {}) or {}
             stage_metrics["stage1"] = {
                 "status": "completed",
-                "model_name": extraction_model,
+                "model_name": stage1_model,
                 "duration_ms": stage1_duration_ms,
                 "item_count": len(analysis_posts),
                 "input_articles": len(posts),
@@ -99,10 +100,10 @@ class SentimentService:
             keyword_generation_trace_by_symbol = {}
             stage_metrics["stage1"] = {
                 "status": "skipped",
-                "model_name": extraction_model or "",
+                "model_name": "",
                 "duration_ms": 0.0,
                 "item_count": len(posts),
-                "reason": "single-stage pipeline",
+                "reason": "no model available for stage 1",
                 "input_articles": len(posts),
             }
 
@@ -111,20 +112,61 @@ class SentimentService:
             raise ValueError("No post content available for sentiment analysis")
         price_context = {**price_context, "source_count": len(analysis_posts)}
 
+        # Per-symbol article subsets from Stage 1. Each symbol's specialist only
+        # sees articles that matched its own proxy terms (chips/AI/export bans for
+        # NVDA, not SPY macro headlines). Falls back to the global pool when Stage 1
+        # was skipped or didn't produce a per-symbol breakdown.
+        posts_by_symbol: Dict[str, List[Any]] = (
+            (stage1_result or {}).get("posts_by_symbol") or {}
+        )
+
         # ── Stage 2: per-symbol reasoning ────────────────────────────────────────
         effective_reasoning_model = reasoning_model or model_name
         stage2_started = time.time()
-        analyses = await asyncio.gather(*[
-            engine.analyze(
+
+        async def _analyze_symbol(symbol: str) -> SentimentAnalysisResponse:
+            sym_posts = posts_by_symbol.get(symbol)
+            # Skip the LLM entirely when no articles matched this symbol —
+            # saves tokens and produces a clear "no data" message instead of boilerplate.
+            if sym_posts is not None and len(sym_posts) == 0:
+                msg = f"No {symbol}-relevant articles in current batch — holding until news arrives."
+                return SentimentAnalysisResponse(
+                    request_id="",
+                    timestamp=datetime.utcnow(),
+                    is_bluster=False,
+                    bluster_score=0.0,
+                    bluster_indicators=[],
+                    is_policy_change=False,
+                    policy_score=0.0,
+                    policy_indicators=[],
+                    impact_severity="low",
+                    confidence=0.05,
+                    reasoning=msg,
+                    directional_score=0.0,
+                    signal_type="HOLD",
+                    urgency="LOW",
+                    entry_symbol=symbol,
+                    analyst_writeup=msg,
+                    parsed_payload={
+                        "exposure_type": "UNRELATED",
+                        "event_type": "noise",
+                        "confirmed": False,
+                        "source_count": 0,
+                    },
+                )
+            return await engine.analyze(
                 text=self._build_symbol_specific_news_context(
-                    analysis_posts,
+                    sym_posts if sym_posts is not None else analysis_posts,
                     symbol,
                     aggregated,
                     proxy_terms_by_symbol.get(symbol, []),
                 ),
                 text_source=f"aggregated_{symbol.lower()}",
                 include_context=True,
-                context_data=self._build_symbol_specific_price_context(price_context, symbol),
+                context_data={
+                    **self._build_symbol_specific_price_context(price_context, symbol),
+                    "source_count": len(sym_posts or []) or len(analysis_posts),
+                },
                 specialist_symbol=symbol,
                 specialist_focus=self._symbol_specialist_focus(symbol, prompt_overrides),
                 model_override=effective_reasoning_model,
@@ -133,8 +175,8 @@ class SentimentService:
                 ),
                 web_research_context=web_context_by_symbol.get(symbol, ""),
             )
-            for symbol in symbols
-        ])
+
+        analyses = await asyncio.gather(*[_analyze_symbol(symbol) for symbol in symbols])
         stage2_duration_ms = (time.time() - stage2_started) * 1000
         results: Dict[str, Dict[str, Any]] = {}
 
@@ -193,10 +235,10 @@ class SentimentService:
             }
 
         trace = {
-            "used_two_stage": bool(extraction_model and reasoning_model),
+            "used_two_stage": bool(stage1_model and effective_reasoning_model),
             "pipeline_models": {
                 "analysis_model": model_name or "",
-                "extraction_model": extraction_model or "",
+                "extraction_model": stage1_model or "",
                 "reasoning_model": effective_reasoning_model or "",
             },
             "stage_metrics": {
@@ -208,6 +250,16 @@ class SentimentService:
                     "item_count": len(symbols),
                     "input_articles": len(analysis_posts),
                     "analyzed_symbols": len(symbols),
+                    "details": {
+                        "posts_by_symbol_counts": {
+                            sym: len(posts_by_symbol.get(sym) or []) for sym in symbols
+                        },
+                        "exposure_hints_by_symbol": dict(exposure_hints_by_symbol),
+                        "keyword_terms_by_symbol": {
+                            sym: list((kw.get("terms") or [])[:10])
+                            for sym, kw in keyword_generation_trace_by_symbol.items()
+                        },
+                    },
                 },
             },
             "aggregated_news_length": len(aggregated),

@@ -7,6 +7,7 @@ import uuid
 import json
 import time
 import asyncio
+import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple, Callable, Awaitable
@@ -73,6 +74,16 @@ from services.remote_snapshot import trigger_remote_snapshot_delivery
 from services.runtime_health import record_analysis_result, record_data_pull
 from services.trading_instruments import build_execution_recommendation
 from services.web_research import fetch_recent_symbol_web_context
+from services.analysis.cache_service import get_price_cache_service
+from services.analysis.sentiment_service import SentimentService
+from services.analysis.signal_service import SignalService
+from services.analysis.materiality_service import MaterialityService
+from services.analysis.hysteresis_service import HysteresisService
+from services.analysis.persistence_service import PersistenceService
+from services.analysis.backtest_service import BacktestService
+from services.analysis.market_data_service import MarketDataService
+from services.analysis.pipeline_service import PipelineService
+from config.market_constants import SYMBOL_RELEVANCE_TERMS
 
 
 router = APIRouter()
@@ -100,26 +111,6 @@ def _stage_metric(
 
 class AnalysisLockError(RuntimeError):
     """Raised when another analysis run already owns the queue lease."""
-
-
-# Module-level price cache to avoid hitting yfinance on every request.
-# TTL of 5 minutes matches yfinance's own guidance and keeps well under rate limits.
-_price_cache: Dict[str, Any] = {}
-_price_cache_ts: Dict[str, float] = {}
-_PRICE_CACHE_TTL = 300  # seconds
-
-
-def _resolve_price_cache_ttl(quote: Optional[Dict[str, Any]]) -> int:
-    """Use shorter cache windows when the market is active or in extended-hours."""
-    if not quote:
-        return _PRICE_CACHE_TTL
-    session = str(quote.get("session") or "closed").lower()
-    is_stale = bool(quote.get("is_stale"))
-    if session in {"regular", "premarket", "postmarket"} and not is_stale:
-        return 30
-    if session in {"regular", "premarket", "postmarket"}:
-        return 90
-    return _PRICE_CACHE_TTL
 
 
 def _utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -201,45 +192,6 @@ def _build_red_team_signal_changes(
         )
 
     return changes
-
-SYMBOL_RELEVANCE_TERMS: Dict[str, List[str]] = {
-    "USO": [
-        # Commodity and supply terms
-        "oil", "crude", "gasoline", "distillate", "refinery", "opec", "energy",
-        "barrel", "petroleum", "diesel", "brent", "wti", "tanker", "pipeline",
-        "natural gas", "lng", "shale", "fracking", "shipping lane",
-        "supply disruption", "crude export", "crude imports", "oilfield",
-        # Geo-political terms that are OIL-SPECIFIC — not country names alone,
-        # which would pull in all geopolitical news regardless of oil relevance
-        "strait of hormuz", "oil sanction", "energy sanction", "oil supply",
-        "oil production", "oil export", "oil shipment", "energy supply",
-        "hormuz", "hormuz shipping", "hormuz transit",
-        "opec cut", "opec quota", "output cut", "production cut",
-        "russia oil", "iran oil", "iranian oil", "venezuela oil",
-    ],
-    "IBIT": [
-        "bitcoin", "btc", "crypto", "cryptocurrency", "blockchain",
-        "stablecoin", "defi", "nft", "altcoin", "ethereum", "eth",
-        "sec crypto", "cftc crypto", "crypto regulation", "crypto etf",
-        "digital asset", "mining", "halving", "satoshi",
-        "m2", "liquidity", "dollar strength",
-    ],
-    "QQQ": [
-        "tech", "technology", "ai", "artificial intelligence", "semiconductor",
-        "chip", "software", "nasdaq", "megacap", "cloud", "data center",
-        "apple", "microsoft", "nvidia", "google", "meta", "amazon",
-        "antitrust", "big tech", "interest rate", "rate cut", "rate hike",
-        "earnings", "valuation", "growth stock",
-    ],
-    "SPY": [
-        "economy", "economic", "fed", "federal reserve", "rates", "inflation",
-        "unemployment", "labor market", "jobs report", "earnings season",
-        "credit spread", "high yield", "recession", "gdp", "growth",
-        "stock market", "s&p", "dow jones", "wall street", "risk appetite",
-        "tariff", "trade war", "fiscal policy",
-    ],
-}
-
 
 @router.post("/trades/{trade_id}/execute", tags=["Analysis"])
 async def record_trade_execution(
@@ -381,23 +333,22 @@ async def get_market_prices(
 ):
     """Return session-aware quotes for the requested symbols, defaulting to tracked config."""
     client = PriceClient()
+    cache = get_price_cache_service()
     config = get_or_create_app_config(db)
     requested_symbols = [
         str(symbol).upper().strip()
         for symbol in (symbols.split(",") if symbols else (config.tracked_symbols or ["USO", "IBIT", "QQQ", "SPY"]))
         if str(symbol).strip()
     ]
-    now = time.monotonic()
     result = {}
     symbols_to_fetch = []
 
     for symbol in requested_symbols:
-        cached_ts = _price_cache_ts.get(symbol, 0.0)
-        cache_ttl = int((_price_cache.get(symbol) or {}).get("cache_ttl_seconds") or _PRICE_CACHE_TTL)
-        if symbol in _price_cache and (now - cached_ts) < cache_ttl:
-            result[symbol] = _price_cache[symbol]
-        else:
-            symbols_to_fetch.append(symbol)
+        cached_entry = cache.get(symbol)
+        if cached_entry:
+            result[symbol] = cached_entry
+            continue
+        symbols_to_fetch.append(symbol)
 
     if symbols_to_fetch:
         print(f"Fetching fresh prices from yfinance: {', '.join(symbols_to_fetch)}")
@@ -410,7 +361,7 @@ async def get_market_prices(
                 continue
             prev = quote.get("previous_close") or price
             change_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
-            cache_ttl = _resolve_price_cache_ttl(quote)
+            cache_ttl = cache.resolve_ttl(quote)
             entry = {
                 "price": round(price, 2),
                 "change": round(price - prev, 2),
@@ -423,8 +374,7 @@ async def get_market_prices(
                 "is_stale": bool(quote.get("is_stale")),
                 "cache_ttl_seconds": cache_ttl,
             }
-            _price_cache[symbol] = entry
-            _price_cache_ts[symbol] = now
+            cache.set(symbol, entry)
             result[symbol] = entry
 
     return result
@@ -625,7 +575,7 @@ async def rerun_analysis_snapshot(
     payload: Dict[str, Any],
     db: Session = Depends(get_db),
 ):
-    """Re-run a frozen analysis dataset snapshot with a different model."""
+    """Re-run a frozen analysis dataset snapshot with alternate model settings."""
     analysis = db.query(AnalysisResult).filter(AnalysisResult.request_id == request_id).first()
     if not analysis:
         raise HTTPException(status_code=404, detail="Saved analysis snapshot not found")
@@ -638,16 +588,13 @@ async def rerun_analysis_snapshot(
     requested_model = str(payload.get("model_name", "") or "").strip()
     rerun_extraction = str(payload.get("extraction_model", "") or "").strip() or None
     rerun_reasoning = str(payload.get("reasoning_model", "") or "").strip() or None
-
-    # Support both single-model (model_name) and two-stage (extraction_model + reasoning_model).
-    # extraction_model alone also works as a single-model override.
     effective_model = requested_model or rerun_extraction or ""
     if not effective_model:
         raise HTTPException(status_code=400, detail="model_name or extraction_model is required")
 
     started = time.time()
     rerun_request_id = str(uuid.uuid4())[:8]
-    symbols = snapshot.get("symbols") or metadata.get("symbols") or []
+    symbols = list(snapshot.get("symbols") or metadata.get("symbols") or [])
     prompt_overrides = snapshot.get("prompt_overrides") or {}
     posts = _restore_snapshot_posts(snapshot.get("posts") or [])
     price_context = snapshot.get("price_context") or {}
@@ -657,11 +604,17 @@ async def rerun_analysis_snapshot(
     saved_secret_trace = snapshot.get("secret_trace") or metadata.get("secret_trace") or {}
     quotes_by_symbol = _restore_snapshot_quotes(snapshot.get("quotes_by_symbol") or {})
     market_validation = snapshot.get("market_validation") or {}
-    include_backtest = bool(snapshot.get("include_backtest", False))
-    lookback_days = int(snapshot.get("lookback_days") or 14)
 
     if not posts:
         raise HTTPException(status_code=400, detail="Saved snapshot is missing article data")
+
+    config = get_or_create_app_config(db)
+    services = _analysis_services(db)
+    sentiment_service = services["sentiment"]
+    signal_service = services["signal"]
+    materiality_service = services["materiality"]
+    hysteresis_service = services["hysteresis"]
+    persistence_service = services["persistence"]
 
     mark_analysis_started(db, rerun_request_id)
     stage_metrics: Dict[str, Dict[str, Any]] = {
@@ -677,60 +630,84 @@ async def rerun_analysis_snapshot(
     }
 
     try:
-        previous_state = _latest_previous_analysis_state(db)
-        previous_response = previous_state.get("response") if previous_state else None
-        sentiment_results, sentiment_trace = await _analyze_sentiment(
-            posts,
-            symbols,
-            price_context,
-            prompt_overrides,
-            effective_model,
+        previous_state = hysteresis_service.latest_previous_analysis_state(db)
+        normalized_previous_state = _normalize_previous_state(previous_state)
+        previous_response = normalized_previous_state.get("response") if normalized_previous_state else None
+
+        _prev_analysis = (previous_state or {}).get("analysis")
+        _prev_ts = getattr(_prev_analysis, "timestamp", None) if _prev_analysis else None
+        if _prev_ts is not None:
+            if _prev_ts.tzinfo is None:
+                _prev_ts = _prev_ts.replace(tzinfo=timezone.utc)
+            signal_age_hours = (datetime.now(timezone.utc) - _prev_ts).total_seconds() / 3600.0
+        else:
+            signal_age_hours = 0.0
+
+        sentiment_results, sentiment_trace = await sentiment_service.analyze_sentiment(
+            posts=posts,
+            symbols=symbols,
+            price_context=price_context,
+            prompt_overrides=prompt_overrides,
+            model_name=effective_model,
             extraction_model=rerun_extraction,
             reasoning_model=rerun_reasoning,
             web_context_by_symbol=web_context_by_symbol,
         )
         stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
-        # Use the risk_profile stored in the snapshot so reruns reproduce the original leverage logic.
-        # Fall back to current config only for old snapshots that predate risk_profile storage.
-        _snapshot_risk = str(snapshot.get("risk_profile") or "")
-        if not _snapshot_risk:
-            _rerun_cfg = get_or_create_app_config(db)
-            _snapshot_risk = str(getattr(_rerun_cfg, "risk_profile", "moderate") or "moderate")
-        _hyst = _L["entry_thresholds"]
+
+        snapshot_risk = str(snapshot.get("risk_profile") or getattr(config, "risk_profile", "moderate") or "moderate")
+        previous_signal = None
+        if previous_response:
+            prev_signal_payload = previous_response.get("blue_team_signal") or previous_response.get("trading_signal")
+            if isinstance(prev_signal_payload, dict):
+                try:
+                    previous_signal = TradingSignal.model_validate(prev_signal_payload)
+                except Exception:
+                    previous_signal = None
+
         use_closed_market_hysteresis = (
-            _is_closed_market_session(quotes_by_symbol)
+            hysteresis_service.is_closed_market_session(quotes_by_symbol)
             and previous_response is not None
-            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= _hyst["hysteresis_max_post_delta"]
-            and _max_sentiment_input_delta(sentiment_results, previous_response) <= _hyst["hysteresis_max_sentiment_delta"]
         )
-        blue_team_signal = _generate_trading_signal(
-            sentiment_results,
-            quotes_by_symbol,
-            risk_profile=_snapshot_risk,
-            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
+        blue_team_signal = signal_service.generate_trading_signal(
+            sentiment_results=sentiment_results,
+            quotes_by_symbol=quotes_by_symbol,
+            risk_profile=snapshot_risk,
+            previous_signal=previous_signal,
             stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
             price_context=price_context,
+            signal_age_hours=signal_age_hours,
         )
-        _sym_counts = _count_symbol_articles(posts, symbols)
-        if previous_response and not _material_change_gate(
+
+        per_symbol_counts = materiality_service._count_symbol_articles(
+            posts,
+            symbols,
+            relevance_terms=SYMBOL_RELEVANCE_TERMS,
+        )
+        if normalized_previous_state and not materiality_service.material_change_gate(
+            db=db,
             symbols=symbols,
             posts_count=len(posts),
             sentiment_results=sentiment_results,
             price_context=price_context,
             quotes_by_symbol=quotes_by_symbol,
-            previous_state=previous_state,
+            previous_state=normalized_previous_state,
             candidate_signal=blue_team_signal,
-            per_symbol_counts=_sym_counts,
-            db=db,
+            per_symbol_counts=per_symbol_counts,
         ):
-            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
-        quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
+            if previous_signal:
+                blue_team_signal = previous_signal
+
+        quotes_by_symbol = signal_service.ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
         if blue_team_signal.entry_symbol in quotes_by_symbol:
             blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
-        if bool(getattr(get_or_create_app_config(db), "red_team_enabled", True)):
+
+        red_team_review = None
+        red_team_debug = None
+        trading_signal = blue_team_signal
+        if bool(getattr(config, "red_team_enabled", True)):
             red_team_started = time.time()
-            red_team_review, red_team_debug = await _run_red_team_review(
-                model_name=rerun_reasoning or effective_model,
+            red_team_context = signal_service.build_red_team_context(
                 symbols=symbols,
                 posts=posts,
                 sentiment_results=sentiment_results,
@@ -739,26 +716,30 @@ async def rerun_analysis_snapshot(
                 quotes_by_symbol=quotes_by_symbol,
                 market_validation=market_validation,
             )
-            trading_signal = _build_consensus_trading_signal(
-                blue_team_signal,
-                red_team_review,
-                quotes_by_symbol=quotes_by_symbol,
-                risk_profile=_snapshot_risk,
+            red_team_review, red_team_debug = signal_service.run_red_team_review(
+                model_name=rerun_reasoning or effective_model,
+                context={"raw_context": json.dumps(red_team_context, ensure_ascii=True, default=str, indent=2)},
             )
-            red_team_duration_ms = (time.time() - red_team_started) * 1000
+            trading_signal = signal_service.build_consensus_trading_signal(
+                blue_team_signal=blue_team_signal,
+                red_team_review=red_team_review,
+                quotes_by_symbol=quotes_by_symbol,
+                risk_profile=snapshot_risk,
+            )
+            if red_team_debug and red_team_review:
+                red_team_debug.signal_changes = signal_service.build_red_team_signal_changes(
+                    blue_team_signal,
+                    trading_signal,
+                    red_team_review,
+                )
             stage_metrics["red_team"] = _stage_metric(
                 status="completed",
                 model_name=rerun_reasoning or effective_model,
-                duration_ms=red_team_duration_ms,
+                duration_ms=(time.time() - red_team_started) * 1000,
                 item_count=len(symbols),
                 reviewed_symbols=len(symbols),
             )
-            if red_team_debug:
-                red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
         else:
-            red_team_review = None
-            red_team_debug = None
-            trading_signal = blue_team_signal
             stage_metrics["red_team"] = _stage_metric(
                 status="skipped",
                 model_name=rerun_reasoning or effective_model,
@@ -766,19 +747,18 @@ async def rerun_analysis_snapshot(
                 item_count=len(symbols),
                 reason="disabled in config",
             )
-        quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
+
+        quotes_by_symbol = signal_service.ensure_execution_quotes(trading_signal, quotes_by_symbol)
         if trading_signal.entry_symbol in quotes_by_symbol:
             trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
 
-        backtest_results = None
-
         processing_time_ms = (time.time() - started) * 1000
-        restored_model_inputs = snapshot.get("model_inputs") or _build_model_input_debug(
-            posts,
-            price_context,
-            market_validation,
-            symbols,
-            prompt_overrides,
+        restored_model_inputs = sentiment_service.build_model_input_debug(
+            posts=posts,
+            price_context=price_context,
+            market_validation=market_validation,
+            symbols=symbols,
+            prompt_overrides=prompt_overrides,
             web_context_by_symbol=web_context_by_symbol,
             web_items_by_symbol=web_items_by_symbol,
         )
@@ -790,10 +770,10 @@ async def rerun_analysis_snapshot(
             posts_scraped=len(posts),
             sentiment_scores={
                 symbol: SentimentScore(
-                    market_bluster=sentiment.get("bluster_score", 0.0),
-                    policy_change=sentiment.get("policy_score", 0.0),
-                    confidence=sentiment.get("confidence", 0.5),
-                    reasoning=sentiment.get("reasoning", ""),
+                    market_bluster=float(sentiment.get("bluster_score", 0.0) or 0.0),
+                    policy_change=float(sentiment.get("policy_score", 0.0) or 0.0),
+                    confidence=float(sentiment.get("confidence", 0.5) or 0.5),
+                    reasoning=str(sentiment.get("reasoning", "") or ""),
                 )
                 for symbol, sentiment in sentiment_results.items()
             },
@@ -804,11 +784,13 @@ async def rerun_analysis_snapshot(
             red_team_review=red_team_review,
             red_team_debug=red_team_debug,
             stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
-            model_inputs=ModelInputDebug.model_validate(restored_model_inputs),
-            backtest_results=backtest_results,
+            model_inputs=restored_model_inputs,
+            ingestion_trace=IngestionTraceDebug.model_validate(snapshot.get("ingestion_trace") or {}) if snapshot.get("ingestion_trace") else None,
+            backtest_results=None,
             processing_time_ms=processing_time_ms,
             status="SUCCESS",
         )
+
         rerun_secret_trace = dict(saved_secret_trace or {})
         rerun_secret_trace["request_id"] = rerun_request_id
         rerun_secret_trace["models"] = {
@@ -816,24 +798,29 @@ async def rerun_analysis_snapshot(
             "active_model": effective_model,
             "extraction_model": rerun_extraction or "",
             "reasoning_model": rerun_reasoning or "",
-            "risk_profile": _snapshot_risk,
+            "risk_profile": snapshot_risk,
         }
         rerun_secret_trace["blue_team_signal"] = blue_team_signal.model_dump(mode="json") if blue_team_signal else {}
         rerun_secret_trace["trading_signal"] = trading_signal.model_dump(mode="json") if trading_signal else {}
         rerun_secret_trace["red_team_review"] = red_team_review.model_dump(mode="json") if red_team_review else {}
         rerun_secret_trace["red_team_debug"] = red_team_debug.model_dump(mode="json") if red_team_debug else {}
-        _save_analysis_result(
-            db,
-            rerun_request_id,
-            response,
-            quotes_by_symbol,
+
+        persistence_service.save_analysis_result(
+            db=db,
+            request_id=rerun_request_id,
+            response=response,
+            quotes_by_symbol=quotes_by_symbol,
+            posts=posts,
             model_name=effective_model,
+            prompt_overrides=prompt_overrides,
             dataset_snapshot=snapshot,
             extraction_model=rerun_extraction or "",
             reasoning_model=rerun_reasoning or "",
-            risk_profile=_snapshot_risk,
+            risk_profile=snapshot_risk,
             secret_trace=rerun_secret_trace,
             sentiment_results=sentiment_results,
+            per_symbol_counts=per_symbol_counts,
+            price_context=price_context,
         )
         mark_analysis_completed(db, rerun_request_id)
         record_analysis_result(
@@ -860,1303 +847,43 @@ async def rerun_analysis_snapshot(
         )
 
 
-def _sse(message: str) -> str:
-    return f"data: {json.dumps({'type': 'log', 'message': message})}\n\n"
-
-
-def _sse_result(data: dict) -> str:
-    return f"data: {json.dumps({'type': 'result', 'data': data})}\n\n"
-
-
-def _sse_error(message: str) -> str:
-    return f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
-
-
-def _sse_article(source: str, title: str, description: str, keywords: list) -> str:
-    return f"data: {json.dumps({'type': 'article', 'source': source, 'title': title, 'description': description, 'keywords': keywords})}\n\n"
-
-
-async def _emit_progress(callback: ProgressCallback, event_type: str, payload: Dict[str, Any]) -> None:
-    if callback is not None:
-        await callback(event_type, payload)
-
-
-def _resolve_active_model_name() -> str:
-    try:
-        ollama_status = get_ollama_status()
-        return str(ollama_status.get("active_model") or "").strip() or "unknown model"
-    except Exception:
-        import os as _os
-
-        ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
-        model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
-        raise RuntimeError(f"Ollama is not running at {ollama_root}. Start it with: ollama run {model}")
-
-
-def _mark_scraped_articles_processed(db: Session, article_ids: List[int]) -> None:
-    if not article_ids:
-        return
-    (
-        db.query(ScrapedArticle)
-        .filter(ScrapedArticle.id.in_(article_ids))
-        .update({ScrapedArticle.processed: True}, synchronize_session=False)
-    )
-    db.commit()
-
-
-async def _run_analysis_pipeline(
-    *,
-    db: Session,
-    request: AnalysisRequest,
-    article_ids: Optional[List[int]] = None,
-    trigger_source: str = "api",
-    progress_callback: ProgressCallback = None,
-) -> Optional[AnalysisResponse]:
-    start_time = time.time()
-    request_id = str(uuid.uuid4())[:8]
-    pipeline_events: List[str] = []
-    active_model = _resolve_active_model_name()
+def _analysis_services(db: Session) -> Dict[str, Any]:
     config = get_or_create_app_config(db)
-    effective_request = _apply_request_defaults(request, config)
-    prompt_overrides = config.symbol_prompt_overrides or {}
-    SentimentEngine.configure_parallelism(
-        int(getattr(config, "ollama_parallel_slots", 1) or 1)
-    )
-
-    if not try_acquire_analysis_lock(db, request_id):
-        raise AnalysisLockError("Another analysis run is already in progress")
-
-    try:
-        mark_analysis_started(db, request_id)
-        await _emit_progress(progress_callback, "log", {"message": f"Ollama reachable - using {active_model}"})
-
-        ingest_started = time.time()
-        posts, ingestion_trace = await _ingest_data(
-            effective_request,
-            config,
-            db,
-            article_ids=article_ids,
-            trigger_source=trigger_source,
-        )
-        ingest_duration_ms = (time.time() - ingest_started) * 1000
-        stage_metrics: Dict[str, Dict[str, Any]] = {
-            "ingest": _stage_metric(
-                status="completed",
-                duration_ms=ingest_duration_ms,
-                item_count=len(posts),
-                trigger_source=trigger_source,
-                selected_count=int(ingestion_trace.get("queue", {}).get("selected_count") or 0),
-                usable_count=int(ingestion_trace.get("queue", {}).get("usable_count") or len(posts)),
-            )
-        }
-        skipped_empty_ids = list(ingestion_trace.get("queue", {}).get("skipped_empty_article_ids") or [])
-        if skipped_empty_ids:
-            _mark_scraped_articles_processed(db, skipped_empty_ids)
-            skip_message = f"Skipped {len(skipped_empty_ids)} queued articles with no usable text"
-            pipeline_events.append(skip_message)
-            await _emit_progress(progress_callback, "log", {"message": skip_message})
-        pipeline_events.append(f"Loaded {len(posts)} queued articles from the database")
-        await _emit_progress(progress_callback, "log", {"message": f"Loaded {len(posts)} queued articles from the database"})
-        for post in posts:
-            description = str(getattr(post, "content", "") or "")
-            if description == str(getattr(post, "title", "") or ""):
-                description = ""
-            await _emit_progress(
-                progress_callback,
-                "article",
-                {
-                    "source": str(getattr(post, "source", "") or "Queued Article"),
-                    "title": str(getattr(post, "title", "") or ""),
-                    "description": description[:1200],
-                    "keywords": list(getattr(post, "keywords", None) or [])[:6],
-                },
-            )
-
-        if not posts:
-            message = "No queued articles contained usable text for sentiment analysis"
-            mark_analysis_completed(db, request_id)
-            record_analysis_result(
-                status="skipped",
-                request_id=request_id,
-                active_model=active_model,
-                error=message,
-            )
-            if trigger_source in {"worker", "fast_lane"}:
-                await _emit_progress(progress_callback, "log", {"message": message})
-                return None
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
-
-        refresh_analysis_lock(db, request_id)
-        await _emit_progress(progress_callback, "log", {"message": f"Fetching real-time price data for {', '.join(effective_request.symbols)}..."})
-        price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
-        price_context = _inject_technical_context(price_context, effective_request.symbols, db)
-        web_context_by_symbol, web_items_by_symbol = await _get_symbol_web_research(
-            effective_request.symbols,
-            bool(getattr(config, "web_research_enabled", False)),
-            resolve_web_research_items_per_symbol(config),
-            resolve_web_research_recency_days(config),
-            getattr(config, "symbol_company_aliases", {}) or {},
-        )
-
-        refresh_analysis_lock(db, request_id)
-        extraction_model, reasoning_model = _resolve_pipeline_models(config, active_model)
-        await _emit_progress(progress_callback, "log", {"message": "Running sentiment analysis on queued articles..."})
-        sentiment_results, sentiment_trace = await _analyze_sentiment(
-            posts,
-            effective_request.symbols,
-            price_context,
-            prompt_overrides,
-            active_model,
-            extraction_model=extraction_model,
-            reasoning_model=reasoning_model,
-            web_context_by_symbol=web_context_by_symbol,
-        )
-        stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
-
-        for symbol, sentiment in sentiment_results.items():
-            await _emit_progress(
-                progress_callback,
-                "log",
-                {
-                    "message": (
-                        f"{symbol}: bluster={float(sentiment.get('bluster_score', 0.0)):+.2f}  "
-                        f"policy={float(sentiment.get('policy_score', 0.0)):.2f}  "
-                        f"confidence={float(sentiment.get('confidence', 0.0)):.0%}"
-                    )
-                },
-            )
-
-        _risk_profile = str(getattr(config, "risk_profile", "moderate") or "moderate")
-        previous_state = _latest_previous_analysis_state(db)
-        previous_response = previous_state.get("response") if previous_state else None
-        _hyst = _L["entry_thresholds"]
-        use_closed_market_hysteresis = (
-            _is_closed_market_session(quotes_by_symbol)
-            and previous_response is not None
-            and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= _hyst["hysteresis_max_post_delta"]
-            and _max_sentiment_input_delta(sentiment_results, previous_response) <= _hyst["hysteresis_max_sentiment_delta"]
-        )
-
-        blue_team_signal = _generate_trading_signal(
-            sentiment_results,
-            quotes_by_symbol,
-            risk_profile=_risk_profile,
-            previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
-            stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
-            entry_threshold_override=float(getattr(config, "entry_threshold", None) or 0) or None,
-            price_context=price_context,
-        )
-        _sym_counts = _count_symbol_articles(posts, effective_request.symbols)
-        if previous_response and not _material_change_gate(
-            symbols=effective_request.symbols,
-            posts_count=len(posts),
-            sentiment_results=sentiment_results,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            previous_state=previous_state,
-            candidate_signal=blue_team_signal,
-            min_posts_delta=getattr(config, "materiality_min_posts_delta", None) or None,
-            min_sentiment_delta=getattr(config, "materiality_min_sentiment_delta", None) or None,
-            per_symbol_counts=_sym_counts,
-            db=db,
-        ):
-            blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
-
-        quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
-        if blue_team_signal.entry_symbol in quotes_by_symbol:
-            blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
-
-        refresh_analysis_lock(db, request_id)
-        if bool(getattr(config, "red_team_enabled", True)):
-            red_team_started = time.time()
-            red_team_review, red_team_debug = await _run_red_team_review(
-                model_name=reasoning_model or active_model,
-                symbols=effective_request.symbols,
-                posts=posts,
-                sentiment_results=sentiment_results,
-                trading_signal=blue_team_signal,
-                price_context=price_context,
-                quotes_by_symbol=quotes_by_symbol,
-                market_validation=market_validation,
-            )
-            trading_signal = _build_consensus_trading_signal(
-                blue_team_signal,
-                red_team_review,
-                quotes_by_symbol=quotes_by_symbol,
-                risk_profile=_risk_profile,
-            )
-            red_team_duration_ms = (time.time() - red_team_started) * 1000
-            stage_metrics["red_team"] = _stage_metric(
-                status="completed",
-                model_name=reasoning_model or active_model,
-                duration_ms=red_team_duration_ms,
-                item_count=len(effective_request.symbols),
-                reviewed_symbols=len(effective_request.symbols),
-            )
-            if red_team_debug:
-                red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
-        else:
-            red_team_review = None
-            red_team_debug = None
-            trading_signal = blue_team_signal
-            stage_metrics["red_team"] = _stage_metric(
-                status="skipped",
-                model_name=reasoning_model or active_model,
-                duration_ms=0.0,
-                item_count=len(effective_request.symbols),
-                reason="disabled in config",
-            )
-        quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
-        if trading_signal.entry_symbol in quotes_by_symbol:
-            trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
-
-        backtest_results = None
-        processing_time_ms = (time.time() - start_time) * 1000
-
-        response = AnalysisResponse(
-            request_id=request_id,
-            timestamp=datetime.utcnow(),
-            symbols_analyzed=effective_request.symbols,
-            posts_scraped=len(posts),
-            sentiment_scores={
-                symbol: SentimentScore(
-                    market_bluster=sentiment.get('bluster_score', 0.0),
-                    policy_change=sentiment.get('policy_score', 0.0),
-                    confidence=sentiment.get('confidence', 0.5),
-                    reasoning=sentiment.get('reasoning', ''),
-                )
-                for symbol, sentiment in sentiment_results.items()
-            },
-            aggregated_sentiment=_aggregate_sentiment(sentiment_results),
-            trading_signal=trading_signal,
-            blue_team_signal=blue_team_signal,
-            market_validation=market_validation,
-            red_team_review=red_team_review,
-            red_team_debug=red_team_debug,
-            stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
-            model_inputs=_build_model_input_debug(
-                posts,
-                price_context,
-                market_validation,
-                effective_request.symbols,
-                prompt_overrides,
-                web_context_by_symbol=web_context_by_symbol,
-                web_items_by_symbol=web_items_by_symbol,
-            ),
-            ingestion_trace=IngestionTraceDebug.model_validate(ingestion_trace),
-            backtest_results=backtest_results,
-            processing_time_ms=processing_time_ms,
-            status="SUCCESS",
-        )
-
-        secret_trace = _build_secret_trace(
-            request_id=request_id,
-            active_model=active_model,
-            extraction_model=extraction_model or "",
-            reasoning_model=reasoning_model or "",
-            risk_profile=_risk_profile,
-            request_payload=effective_request,
-            ingestion_trace=ingestion_trace,
-            price_context=price_context,
-            quotes_by_symbol=quotes_by_symbol,
-            market_validation=market_validation,
-            web_context_by_symbol=web_context_by_symbol,
-            web_items_by_symbol=web_items_by_symbol,
-            sentiment_results=sentiment_results,
-            sentiment_trace=sentiment_trace,
-            blue_team_signal=blue_team_signal,
-            trading_signal=trading_signal,
-            red_team_review=red_team_review.model_dump(mode="json") if red_team_review else None,
-            red_team_debug=red_team_debug.model_dump(mode="json") if red_team_debug else None,
-            backtest_results=backtest_results,
-            pipeline_events=pipeline_events,
-        )
-
-        _save_analysis_result(
-            db,
-            request_id,
-            response,
-            quotes_by_symbol,
-            posts=posts,
-            model_name=active_model,
-            prompt_overrides=prompt_overrides,
-            extraction_model=extraction_model or "",
-            reasoning_model=reasoning_model or "",
-            risk_profile=_risk_profile,
-            secret_trace=secret_trace,
-            sentiment_results=sentiment_results,
-            per_symbol_counts=_sym_counts,
-        )
-        _mark_scraped_articles_processed(db, ingestion_trace.get("selected_article_ids") or [])
-        mark_analysis_completed(db, request_id)
-        record_analysis_result(
-            status="success",
-            request_id=request_id,
-            duration_ms=processing_time_ms,
-            active_model=active_model,
-        )
-        await _emit_progress(progress_callback, "log", {"message": f"Analysis complete in {processing_time_ms / 1000:.2f}s"})
-        return response
-    except Exception as exc:
-        record_analysis_result(
-            status="failed",
-            request_id=request_id,
-            active_model=active_model,
-            error=str(exc),
-        )
-        raise
-    finally:
-        release_analysis_lock(db, request_id)
-
-
-async def run_analysis_for_pending_articles(
-    *,
-    db: Session,
-    symbols: List[str],
-    article_ids: Optional[List[int]] = None,
-    trigger_source: str = "worker",
-) -> Optional[AnalysisResponse]:
-    request = AnalysisRequest(
-        symbols=symbols,
-        max_posts=max(1, len(article_ids or []) or 50),
-        include_backtest=False,
-        lookback_days=14,
-    )
-    try:
-        return await _run_analysis_pipeline(
-            db=db,
-            request=request,
-            article_ids=article_ids,
-            trigger_source=trigger_source,
-        )
-    except AnalysisLockError as exc:
-        print(f"Skipping {trigger_source} analysis trigger because another run owns the lock: {exc}")
-        return None
-
-
-@router.post(
-    "/analyze/stream",
-    summary="Run full analysis pipeline with real-time progress",
-    tags=["Analysis"]
-)
-async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(get_db)):
-    """SSE endpoint streaming progress events then the final result."""
-
-    async def generate() -> AsyncGenerator[str, None]:
-        start_time = time.time()
-        request_id = str(uuid.uuid4())[:8]
-        pipeline_events: List[str] = []
-        stage_times: Dict[str, float] = {}
-
-        def emit(message: str) -> str:
-            pipeline_events.append(message)
-            return _sse(message)
-        
-        def mark_stage_complete(stage_name: str) -> None:
-            """Track when each pipeline stage completes for progress estimation."""
-            elapsed = time.time() - start_time
-            stage_times[stage_name] = elapsed
-
-        try:
-            config = get_or_create_app_config(db)
-            effective_request = _apply_request_defaults(request, config)
-            prompt_overrides = config.symbol_prompt_overrides or {}
-            # Apply admin-configured Ollama parallelism. Default 1 = serialized.
-            SentimentEngine.configure_parallelism(
-                int(getattr(config, "ollama_parallel_slots", 1) or 1)
-            )
-            # ── Preflight: verify Ollama is reachable ────────────────────────
-            try:
-                ollama_status = get_ollama_status()
-                ollama_root = str(ollama_status.get("ollama_root") or "")
-                active_model = str(ollama_status.get("active_model") or "").strip() or "unknown model"
-                yield emit(f"Ollama reachable — using {active_model}")
-            except Exception:
-                import os as _os
-
-                ollama_root = _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", "")
-                model = _os.getenv("OLLAMA_MODEL", "").strip() or "the first available served model"
-                yield _sse_error(
-                    f"Cannot reach Ollama at {ollama_root}. "
-                    f"Start it with: ollama run {model}"
-                )
-                return
-
-            # ── Step 1: Data Ingestion (live, feed-by-feed) ──────────────────
-            mark_analysis_started(db, request_id)
-            posts: List[Any] = []
-            stage_metrics: Dict[str, Dict[str, Any]] = {}
-            ingestion_trace: Dict[str, Any] = {
-                "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
-                "rss": {"status": "ok", "feeds": [], "total_count": 0, "error": None},
-                "total_items": 0,
-                "request_max_posts": effective_request.max_posts,
-            }
-
-            feed_map = build_enabled_rss_feed_map(config)
-            feed_labels = build_enabled_rss_feed_labels(config)
-            parser = RSSFeedParser(feeds=feed_map, feed_labels=feed_labels)
-            num_feeds = max(1, len(parser.feeds))
-            per_feed_cap = resolve_rss_articles_per_feed(config)
-            max_total_posts = max(effective_request.max_posts, per_feed_cap * num_feeds)
-            ingest_started = time.time()
-
-            for feed_name in parser.feeds:
-                label = feed_labels.get(feed_name) or feed_name.replace("_", " ").title()
-                yield emit(f"Fetching {label}…")
-                try:
-                    articles = await asyncio.to_thread(
-                        parser.parse_feeds, feed_names=[feed_name]
-                    )
-                    articles = parser.filter_by_keywords(articles, min_keywords=1)
-                    articles = articles[:per_feed_cap]
-                    ingestion_trace["rss"]["feeds"].append(
-                        {
-                            "feed_key": feed_name,
-                            "feed_url": feed_map.get(feed_name, ""),
-                            "status": "ok",
-                            "count": len(articles),
-                            "articles": [_post_trace_summary(article) for article in articles],
-                        }
-                    )
-                    for a in articles:
-                        desc = a.content if a.content.strip() != a.title.strip() else ""
-                        yield _sse_article(label, a.title, desc, a.keywords[:6])
-                    posts.extend(articles)
-                    yield emit(f"{label}: {len(articles)} articles")
-                except Exception as e:
-                    ingestion_trace["rss"]["feeds"].append(
-                        {
-                            "feed_key": feed_name,
-                            "feed_url": feed_map.get(feed_name, ""),
-                            "status": "error",
-                            "count": 0,
-                            "articles": [],
-                            "error": str(e),
-                        }
-                    )
-                    yield emit(f"{label} error: {e}")
-
-            # Trim total after collecting from all feeds
-            posts = posts[:max_total_posts]
-            ingestion_trace["rss"]["per_feed_cap"] = per_feed_cap
-            ingestion_trace["rss"]["total_count"] = len(posts)
-            ingestion_trace["total_items"] = len(posts)
-            stage_metrics["ingest"] = _stage_metric(
-                status="completed",
-                duration_ms=(time.time() - ingest_started) * 1000,
-                item_count=len(posts),
-                trigger_source="stream",
-                feed_count=len(parser.feeds),
-                per_feed_cap=per_feed_cap,
-            )
-            yield emit(f"Ingestion complete — {len(posts)} items")
-            mark_stage_complete("ingestion")
-
-            # Step 2: Price Data
-            yield emit(f"Fetching real-time price data for {', '.join(effective_request.symbols)}...")
-            yield emit(f"Fetching structured validation data for {', '.join(effective_request.symbols)}...")
-            price_context, quotes_by_symbol, market_validation = await _get_market_snapshot(effective_request.symbols)
-            prices_found = [k for k in price_context if "_price" in k]
-            yield emit(f"Price data fetched: {', '.join(prices_found) or 'no data'}")
-            validation_ready = [symbol for symbol, payload in market_validation.items() if payload.get("status") != "unavailable"]
-            yield emit(f"Validation data fetched: {', '.join(validation_ready) or 'no structured data'}")
-            price_context = _inject_technical_context(price_context, effective_request.symbols, db)
-            tech_ready = [s for s in effective_request.symbols if f"technical_context_{s.lower()}" in price_context]
-            if tech_ready:
-                yield emit(f"Technical indicators loaded: {', '.join(tech_ready)}")
-            web_context_by_symbol, web_items_by_symbol = await _get_symbol_web_research(
-                effective_request.symbols,
-                bool(getattr(config, "web_research_enabled", False)),
-                resolve_web_research_items_per_symbol(config),
-                resolve_web_research_recency_days(config),
-                getattr(config, "symbol_company_aliases", {}) or {},
-            )
-            if any(web_context_by_symbol.values()):
-                researched = [symbol for symbol, summary in web_context_by_symbol.items() if summary]
-                yield emit(f"Light web research loaded: {', '.join(researched)}")
-                for symbol in researched:
-                    items = web_items_by_symbol.get(symbol) or []
-                    yield emit(f"{symbol} · Web research: {len(items)} recent items")
-                    for item in items:
-                        source = f"{symbol} · Web Research"
-                        title = str(item.get("title") or "Recent web item")
-                        source_name = str(item.get("source") or "Unknown source")
-                        published_at = str(item.get("published_at") or "").strip()
-                        url = str(item.get("url") or "").strip()
-                        summary = str(item.get("summary") or "").strip()
-                        details = []
-                        if source_name:
-                            details.append(f"Source: {source_name}")
-                        if published_at:
-                            details.append(f"Published: {published_at}")
-                        if url:
-                            details.append(f"Link: {url}")
-                        if summary:
-                            details.append(f"Summary: {summary}")
-                        yield _sse_article(source, title, "\n".join(details), [symbol.lower(), "web-research"])
-                empty_symbols = [symbol for symbol in effective_request.symbols if not (web_items_by_symbol.get(symbol) or [])]
-                recency_days = resolve_web_research_recency_days(config)
-                for symbol in empty_symbols:
-                    yield emit(f"{symbol} · Web research: no fresh items in last {recency_days} days")
-            mark_stage_complete("prices")
-
-            # Step 3: Sentiment Analysis
-            extraction_model, reasoning_model = _resolve_pipeline_models(config, active_model)
-            if extraction_model and reasoning_model and extraction_model == reasoning_model:
-                yield emit(f"Two-pass analysis (Light mode) with {extraction_model}...")
-            elif extraction_model and reasoning_model:
-                yield emit(f"Stage 1 entity mapping with {extraction_model}...")
-                yield emit(f"Stage 2 financial reasoning with {reasoning_model}...")
-            else:
-                yield emit(f"Running sentiment analysis with {active_model} on collected text...")
-            # Stage 2 serializes per-symbol Ollama calls behind a semaphore and
-            # can run silent for several minutes. Without periodic output the
-            # SSE pipe trips undici's 5-min body timeout in the Next.js proxy.
-            # Yield an SSE comment (": ...") every 20s — comments are ignored
-            # by the EventSource client but keep the byte stream alive.
-            sentiment_task = asyncio.create_task(_analyze_sentiment(
-                posts,
-                effective_request.symbols,
-                price_context,
-                prompt_overrides,
-                active_model,
-                extraction_model=extraction_model,
-                reasoning_model=reasoning_model,
-                web_context_by_symbol=web_context_by_symbol,
-            ))
-            while not sentiment_task.done():
-                done, _pending = await asyncio.wait({sentiment_task}, timeout=20)
-                if not done:
-                    yield ": stage2-heartbeat\n\n"
-            sentiment_results, sentiment_trace = sentiment_task.result()
-            stage_metrics.update(sentiment_trace.get("stage_metrics") or {})
-            for sym, s in sentiment_results.items():
-                bluster = s.get('bluster_score', 0)
-                policy = s.get('policy_score', 0)
-                yield emit(
-                    f"  {sym}: bluster={bluster:+.2f}  policy={policy:.2f}  "
-                    f"confidence={s.get('confidence', 0):.0%}"
-                )
-            mark_stage_complete("sentiment")
-
-            # Step 4: Trading Signal
-            yield emit("Generating trading signal...")
-            _stream_risk = str(getattr(config, "risk_profile", "moderate") or "moderate")
-            previous_state = _latest_previous_analysis_state(db)
-            previous_response = previous_state.get("response") if previous_state else None
-            use_closed_market_hysteresis = (
-                _is_closed_market_session(quotes_by_symbol)
-                and previous_response is not None
-                and abs(int(previous_response.posts_scraped or 0) - len(posts)) <= 5
-                and _max_sentiment_input_delta(sentiment_results, previous_response) <= 0.20
-            )
-            if use_closed_market_hysteresis:
-                yield emit("Closed-market hysteresis active: preserving prior signal unless the inputs moved materially.")
-            blue_team_signal = _generate_trading_signal(
-                sentiment_results,
-                quotes_by_symbol,
-                risk_profile=_stream_risk,
-                previous_signal=(previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None,
-                stability_mode="closed_market_hysteresis" if use_closed_market_hysteresis else "normal",
-                price_context=price_context,
-            )
-            _sym_counts = _count_symbol_articles(posts, effective_request.symbols)
-            if previous_response and not _material_change_gate(
-                symbols=effective_request.symbols,
-                posts_count=len(posts),
-                sentiment_results=sentiment_results,
-                price_context=price_context,
-                quotes_by_symbol=quotes_by_symbol,
-                previous_state=previous_state,
-                candidate_signal=blue_team_signal,
-                per_symbol_counts=_sym_counts,
-                db=db,
-            ):
-                yield emit("Material-change gate active: keeping prior thesis because the news/price move is not large enough to justify a flip.")
-                blue_team_signal = previous_response.blue_team_signal or previous_response.trading_signal or blue_team_signal
-            quotes_by_symbol = _ensure_execution_quotes(blue_team_signal, quotes_by_symbol)
-            if blue_team_signal.entry_symbol in quotes_by_symbol:
-                blue_team_signal.entry_price = quotes_by_symbol[blue_team_signal.entry_symbol].get("current_price")
-            yield emit(
-                f"Blue team: {blue_team_signal.signal_type}  |  "
-                f"Urgency: {blue_team_signal.urgency}  |  "
-                f"Entry: {blue_team_signal.entry_symbol}  |  "
-                f"Confidence: {blue_team_signal.confidence_score:.0%}"
-            )
-            if bool(getattr(config, "red_team_enabled", True)):
-                yield emit("Running red-team risk review...")
-                red_team_started = time.time()
-                red_team_review, red_team_debug = await _run_red_team_review(
-                    model_name=reasoning_model or active_model,
-                    symbols=effective_request.symbols,
-                    posts=posts,
-                    sentiment_results=sentiment_results,
-                    trading_signal=blue_team_signal,
-                    price_context=price_context,
-                    quotes_by_symbol=quotes_by_symbol,
-                    market_validation=market_validation,
-                )
-                trading_signal = _build_consensus_trading_signal(
-                    blue_team_signal,
-                    red_team_review,
-                    quotes_by_symbol=quotes_by_symbol,
-                    risk_profile=_stream_risk,
-                )
-                stage_metrics["red_team"] = _stage_metric(
-                    status="completed",
-                    model_name=reasoning_model or active_model,
-                    duration_ms=(time.time() - red_team_started) * 1000,
-                    item_count=len(effective_request.symbols),
-                    reviewed_symbols=len(effective_request.symbols),
-                )
-                if red_team_debug:
-                    red_team_debug.signal_changes = _build_red_team_signal_changes(blue_team_signal, trading_signal, red_team_review)
-            else:
-                yield emit("Red-team review disabled in config — skipping.")
-                red_team_review = None
-                red_team_debug = None
-                trading_signal = blue_team_signal
-                stage_metrics["red_team"] = _stage_metric(
-                    status="skipped",
-                    model_name=reasoning_model or active_model,
-                    duration_ms=0.0,
-                    item_count=len(effective_request.symbols),
-                    reason="disabled in config",
-                )
-            quotes_by_symbol = _ensure_execution_quotes(trading_signal, quotes_by_symbol)
-            if trading_signal.entry_symbol in quotes_by_symbol:
-                trading_signal.entry_price = quotes_by_symbol[trading_signal.entry_symbol].get("current_price")
-            if red_team_review and red_team_review.summary:
-                yield emit(f"Red team: {red_team_review.summary}")
-            yield emit(
-                f"Consensus: {trading_signal.signal_type}  |  "
-                f"Urgency: {trading_signal.urgency}  |  "
-                f"Entry: {trading_signal.entry_symbol}  |  "
-                f"Confidence: {trading_signal.confidence_score:.0%}"
-            )
-            mark_stage_complete("signal")
-
-            backtest_results = None
-
-            processing_time_ms = (time.time() - start_time) * 1000
-            yield emit(f"Analysis complete in {processing_time_ms / 1000:.2f}s")
-
-            response = AnalysisResponse(
-                request_id=request_id,
-                timestamp=datetime.utcnow(),
-                symbols_analyzed=effective_request.symbols,
-                posts_scraped=len(posts),
-                sentiment_scores={
-                    symbol: SentimentScore(
-                        market_bluster=sentiment.get('bluster_score', 0.0),
-                        policy_change=sentiment.get('policy_score', 0.0),
-                        confidence=sentiment.get('confidence', 0.5),
-                        reasoning=sentiment.get('reasoning', '')
-                    )
-                    for symbol, sentiment in sentiment_results.items()
-                },
-                aggregated_sentiment=_aggregate_sentiment(sentiment_results),
-                trading_signal=trading_signal,
-                blue_team_signal=blue_team_signal,
-                market_validation=market_validation,
-                red_team_review=red_team_review,
-                red_team_debug=red_team_debug,
-                stage_metrics={key: StageMetric.model_validate(value) for key, value in stage_metrics.items()},
-                model_inputs=_build_model_input_debug(
-                    posts,
-                    price_context,
-                    market_validation,
-                    effective_request.symbols,
-                    prompt_overrides,
-                    web_context_by_symbol=web_context_by_symbol,
-                    web_items_by_symbol=web_items_by_symbol,
-                ),
-                ingestion_trace=IngestionTraceDebug.model_validate(ingestion_trace),
-                backtest_results=backtest_results,
-                processing_time_ms=processing_time_ms,
-                status="SUCCESS"
-            )
-            secret_trace = _build_secret_trace(
-                request_id=request_id,
-                active_model=active_model,
-                extraction_model=extraction_model or "",
-                reasoning_model=reasoning_model or "",
-                risk_profile=_stream_risk,
-                request_payload=effective_request,
-                ingestion_trace=ingestion_trace,
-                price_context=price_context,
-                quotes_by_symbol=quotes_by_symbol,
-                market_validation=market_validation,
-                web_context_by_symbol=web_context_by_symbol,
-                web_items_by_symbol=web_items_by_symbol,
-                sentiment_results=sentiment_results,
-                sentiment_trace=sentiment_trace,
-                blue_team_signal=blue_team_signal,
-                trading_signal=trading_signal,
-                red_team_review=red_team_review.model_dump(mode="json") if red_team_review else None,
-                red_team_debug=red_team_debug.model_dump(mode="json") if red_team_debug else None,
-                backtest_results=backtest_results,
-                pipeline_events=pipeline_events,
-            )
-
-            _save_analysis_and_trades(
-                db, request_id, response, quotes_by_symbol, posts, prompt_overrides, active_model,
-                extraction_model=extraction_model or "",
-                reasoning_model=reasoning_model or "",
-                risk_profile=_stream_risk,
-                secret_trace=secret_trace,
-                sentiment_results=sentiment_results,
-                per_symbol_counts=_sym_counts,
-            )
-            mark_analysis_completed(db, request_id)
-            record_analysis_result(
-                status="success",
-                request_id=request_id,
-                duration_ms=processing_time_ms,
-                active_model=active_model,
-            )
-            yield _sse_result(response.model_dump(mode="json"))
-
-        except Exception as e:
-            record_analysis_result(
-                status="failed",
-                request_id=request_id,
-                active_model=active_model,
-                error=str(e),
-            )
-            yield _sse_error(str(e))
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@router.post(
-    "/analyze",
-    response_model=AnalysisResponse,
-    summary="Run full sentiment analysis pipeline",
-    tags=["Analysis"]
-)
-async def analyze_market(
-    request: AnalysisRequest,
-    db: Session = Depends(get_db)
-):
-    try:
-        response = await _run_analysis_pipeline(
-            db=db,
-            request=request,
-            trigger_source="api",
-        )
-        return response
-    except AnalysisLockError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "Analysis failed",
-                "message": str(exc),
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-        )
-
-
-async def _ingest_data(
-    request: AnalysisRequest,
-    config: Any,
-    db: Session,
-    article_ids: Optional[List[int]] = None,
-    trigger_source: str = "api",
-) -> Tuple[List[Any], Dict[str, Any]]:
-    """Load pending scraped articles from the DB-backed ingestion queue."""
-    query = db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False))
-    if article_ids:
-        normalized_ids = sorted({int(article_id) for article_id in article_ids})
-        query = query.filter(ScrapedArticle.id.in_(normalized_ids))
-
-    rows = (
-        query.order_by(
-            ScrapedArticle.discovered_at.asc(),
-            ScrapedArticle.id.asc(),
-        )
-        .limit(int(request.max_posts or getattr(config, "max_posts", 50) or 50))
-        .all()
-    )
-
-    posts = build_analysis_posts(rows)
-    usable_posts = [post for post in posts if _post_has_analysis_text(post)]
-    skipped_empty_ids = [
-        int(getattr(post, "id", 0) or 0)
-        for post in posts
-        if not _post_has_analysis_text(post) and getattr(post, "id", None) is not None
-    ]
-    selected_ids = [int(row.id) for row in rows]
-    fast_lane_ids = [int(row.id) for row in rows if bool(row.fast_lane_triggered)]
-    trace: Dict[str, Any] = {
-        "source": "db_queue",
-        "trigger_source": trigger_source,
-        "request_max_posts": request.max_posts,
-        "selected_article_ids": selected_ids,
-        "usable_article_ids": [int(getattr(post, "id", 0) or 0) for post in usable_posts if getattr(post, "id", None) is not None],
-        "skipped_empty_article_ids": skipped_empty_ids,
-        "selected_fast_lane_article_ids": fast_lane_ids,
-        "total_items": len(usable_posts),
-        "queue": {
-            "status": "ok",
-            "pending_count": int(
-                db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False)).count()
-            ),
-            "selected_count": len(rows),
-            "usable_count": len(usable_posts),
-            "skipped_empty_count": len(skipped_empty_ids),
-            "selected_articles": [_post_trace_summary(post) for post in usable_posts],
-            "skipped_empty_articles": [
-                _post_trace_summary(post)
-                for post in posts
-                if int(getattr(post, "id", 0) or 0) in skipped_empty_ids
-            ],
-            "skipped_empty_article_ids": skipped_empty_ids,
-            "selected_urls": [str(row.url or "") for row in rows],
-            "fast_lane_count": len(fast_lane_ids),
-        },
-        "truth_social": {"status": "skipped", "count": 0, "items": [], "error": None},
-        "rss": {"status": "replaced_by_db_queue", "feeds": [], "total_count": len(usable_posts), "error": None},
+    price_cache = get_price_cache_service()
+    return {
+        "config": config,
+        "sentiment": SentimentService(price_cache=price_cache, logic_config=_L),
+        "signal": SignalService(logic_config=_L),
+        "materiality": MaterialityService(logic_config=_L),
+        "hysteresis": HysteresisService(logic_config=_L),
+        "persistence": PersistenceService(logic_config=_L),
+        "backtest": BacktestService(logic_config=_L),
+        "market": MarketDataService(price_cache=price_cache, logic_config=_L),
+        "pipeline": PipelineService(db=db, price_cache=price_cache, logic_config=_L),
     }
-
-    record_data_pull(
-        status="ok",
-        source="analysis_ingestion_queue",
-        summary=(
-            f"Loaded {len(usable_posts)} usable pending articles from the DB queue"
-            + (f"; skipped {len(skipped_empty_ids)} empty items" if skipped_empty_ids else "")
-        ),
-        details={
-            "trigger_source": trigger_source,
-            "selected_article_ids": selected_ids,
-            "usable_article_ids": trace["usable_article_ids"],
-            "skipped_empty_article_ids": skipped_empty_ids,
-            "fast_lane_article_ids": fast_lane_ids,
-            "pending_count": trace["queue"]["pending_count"],
-        },
-        error=None,
-    )
-
-    return usable_posts, trace
 
 
 def _apply_request_defaults(request: AnalysisRequest, config: Any) -> AnalysisRequest:
     symbols = request.symbols or config.tracked_symbols or ["USO", "IBIT", "QQQ", "SPY"]
     return AnalysisRequest(
-        symbols=symbols,
+        symbols=[str(symbol).upper().strip() for symbol in symbols if str(symbol).strip()],
         max_posts=request.max_posts or config.max_posts,
         include_backtest=False,
         lookback_days=request.lookback_days or config.lookback_days,
     )
 
 
-async def _get_market_snapshot(symbols: List[str]) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """
-    Fetch market snapshot for base symbols and ALL their execution variants.
-    Ensures we have prices for SBIT, SQQQ, SPXS, SCO, etc.
-    """
-    from services.trading_instruments import INSTRUMENT_SPECS
-    
-    client = PriceClient()
-    validation_client = MarketValidationClient()
-    context = {}
-    quotes_by_symbol: Dict[str, Dict[str, Any]] = {}
-
-    # Expand symbols to include all execution variants
-    symbols_to_fetch = set(symbols)
-    for symbol in symbols:
-        spec = INSTRUMENT_SPECS.get(symbol)
-        if spec:
-            # Add all bull and bear ETFs for this underlying
-            symbols_to_fetch.update(spec.get("bull", {}).values())
-            symbols_to_fetch.update(spec.get("bear", {}).values())
-
-    # Fetch quotes for all symbols
-    for symbol in symbols_to_fetch:
-        quote = client.get_realtime_quote(symbol)
-        if quote and quote.get('current_price'):
-            context[f"{symbol.lower()}_price"] = quote['current_price']
-            quotes_by_symbol[symbol] = quote
-
-    # Ensure SPY and QQQ context for analysis
-    for extra in ["SPY", "QQQ"]:
-        key = f"{extra.lower()}_price"
-        if key not in context:
-            q = client.get_realtime_quote(extra)
-            if q and q.get('current_price'):
-                context[key] = q['current_price']
-
-    market_validation = await asyncio.to_thread(validation_client.get_validation_bundle, symbols)
-    validation_context = validation_client.build_prompt_context(market_validation)
-    if validation_context:
-        context["validation_context"] = validation_context
-        context["market_validation"] = market_validation
-
-    missing_quotes = [symbol for symbol in symbols if symbol not in quotes_by_symbol]
-    validation_unavailable = [
-        symbol for symbol, payload in market_validation.items() if payload.get("status") == "unavailable"
-    ]
-    validation_partial = [
-        symbol for symbol, payload in market_validation.items() if payload.get("status") == "partial"
-    ]
-    snapshot_status = "ok"
-    if missing_quotes or validation_unavailable:
-        snapshot_status = "partial"
-    if len(missing_quotes) == len(symbols) and len(validation_unavailable) == len(symbols):
-        snapshot_status = "error"
-
-    record_data_pull(
-        status=snapshot_status,
-        source="market_snapshot",
-        summary=f"Fetched {len(quotes_by_symbol)} live quotes (including execution symbols) for {len(symbols)} base symbols",
-        details={
-            "quotes_ok": sorted(quotes_by_symbol.keys()),
-            "quotes_missing": missing_quotes,
-            "base_symbols": symbols,
-            "execution_symbols": sorted(symbols_to_fetch - set(symbols)),
-            "validation_partial": validation_partial,
-            "validation_unavailable": validation_unavailable,
-        },
-        error=None if snapshot_status == "ok" else "Some price or validation feeds were unavailable",
-    )
-
-    return context, quotes_by_symbol, market_validation
-
-
-def _inject_technical_context(price_context: Dict[str, Any], symbols: List[str], db: Any) -> Dict[str, Any]:
-    """Compute technical indicators from price_history DB and add to price_context."""
-    client = PriceClient()
-    updated = dict(price_context)
-    for symbol in symbols:
+def _analysis_timeout_seconds(config: Any) -> int:
+    configured = getattr(config, "analysis_timeout_seconds", None)
+    env_value = os.getenv("ANALYSIS_TIMEOUT_SECONDS") or os.getenv("ANALYSIS_MAX_SECONDS")
+    for value in (configured, env_value, 900):
         try:
-            indicators = client.compute_technical_indicators(symbol, db)
-            if indicators:
-                tech_str = PriceClient.format_technical_context(symbol, indicators)
-                updated[f"technical_context_{symbol.lower()}"] = tech_str
-                updated[f"technical_indicators_{symbol.lower()}"] = indicators
-        except Exception:
-            pass
-    return updated
-
-
-def _resolve_pipeline_models(config: Any, active_model: str) -> tuple:
-    """
-    Return (extraction_model, reasoning_model) based on depth mode.
-
-    Light:    same model for Stage 1 and Stage 2 — no separate reasoning model
-    Normal:   two-stage only when both models are explicitly configured
-    Detailed: always two-stage — falls back to the same model for both stages if only one is set
-    """
-    depth_mode = str(getattr(config, "rss_article_detail_mode", "") or "").lower()
-    extraction_cfg = str(getattr(config, "extraction_model", "") or "").strip()
-    reasoning_cfg = str(getattr(config, "reasoning_model", "") or "").strip()
-
-    if depth_mode == "light":
-        single = extraction_cfg or active_model
-        return single, single
-
-    if depth_mode == "detailed":
-        extraction = extraction_cfg or reasoning_cfg or active_model
-        reasoning = reasoning_cfg or extraction_cfg or active_model
-        return extraction, reasoning
-
-    # Normal (default): two-stage only when both explicitly configured
-    if extraction_cfg and reasoning_cfg:
-        return extraction_cfg, reasoning_cfg
-    return None, None
-
-
-async def _analyze_sentiment(
-    posts: List[Any],
-    symbols: List[str],
-    price_context: Dict[str, Any],
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    model_name: Optional[str] = None,
-    extraction_model: Optional[str] = None,
-    reasoning_model: Optional[str] = None,
-    web_context_by_symbol: Optional[Dict[str, str]] = None,
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """
-    Two-stage analysis pipeline when extraction_model and reasoning_model are set:
-
-    Stage 1 (extraction_model): classify articles for relevance and extract proxy terms.
-    Stage 2 (reasoning_model):  per-symbol specialist analysis on filtered articles only,
-                                with proxy context injected into the prompt.
-
-    Falls back to single-stage (model_name) when orchestration models are not configured.
-    """
-    from services.sentiment.prompts import format_stage2_proxy_appendix
-
-    engine = SentimentEngine(model_name=model_name)
-    engine.clear_cache()
-    web_context_by_symbol = web_context_by_symbol or {}
-
-    # ── Stage 1: entity extraction (optional) ────────────────────────────────
-    stage1_result: Optional[Dict[str, Any]] = None
-    keyword_generation_trace_by_symbol: Dict[str, Any] = {}
-    exposure_hints_by_symbol: Dict[str, str] = {}
-    stage_metrics: Dict[str, Dict[str, Any]] = {}
-    if extraction_model and reasoning_model:
-        print(f"Two-stage pipeline: extraction={extraction_model} | reasoning={reasoning_model}")
-        stage1_started = time.time()
-        stage1_result = await engine.extract_relevant_articles(posts, symbols, extraction_model)
-        stage1_duration_ms = (time.time() - stage1_started) * 1000
-        analysis_posts = stage1_result["filtered_posts"]
-        proxy_terms_by_symbol = stage1_result["proxy_terms_by_symbol"]
-        exposure_hints_by_symbol = stage1_result.get("exposure_hints_by_symbol", {})
-        keyword_generation_trace_by_symbol = stage1_result.get("keyword_generation_trace_by_symbol", {}) or {}
-        stage_metrics["stage1"] = _stage_metric(
-            status="completed",
-            model_name=extraction_model,
-            duration_ms=stage1_duration_ms,
-            item_count=len(analysis_posts),
-            input_articles=len(posts),
-            matched_articles=len(analysis_posts),
-            analyzed_symbols=len(symbols),
-        )
-    else:
-        analysis_posts = posts
-        proxy_terms_by_symbol = {s: [] for s in symbols}
-        keyword_generation_trace_by_symbol = {}
-        stage_metrics["stage1"] = _stage_metric(
-            status="skipped",
-            model_name=extraction_model or "",
-            duration_ms=0.0,
-            item_count=len(posts),
-            reason="single-stage pipeline",
-            input_articles=len(posts),
-        )
-
-    aggregated = _build_aggregated_news_context(analysis_posts)
-    if not aggregated.strip():
-        raise ValueError("No post content available for sentiment analysis")
-    price_context = {**price_context, "source_count": len(analysis_posts)}
-
-    # ── Stage 2: per-symbol reasoning ────────────────────────────────────────
-    effective_reasoning_model = reasoning_model or model_name
-    stage2_started = time.time()
-    analyses = await asyncio.gather(*[
-        engine.analyze(
-            text=_build_symbol_specific_news_context(
-                analysis_posts,
-                symbol,
-                aggregated,
-                proxy_terms_by_symbol.get(symbol, []),
-            ),
-            text_source=f"aggregated_{symbol.lower()}",
-            include_context=True,
-            context_data=_build_symbol_specific_price_context(price_context, symbol),
-            specialist_symbol=symbol,
-            specialist_focus=_symbol_specialist_focus(symbol, prompt_overrides),
-            model_override=effective_reasoning_model,
-            proxy_context=format_stage2_proxy_appendix(symbol, proxy_terms_by_symbol.get(symbol, []), exposure_hints_by_symbol.get(symbol, "")),
-            web_research_context=web_context_by_symbol.get(symbol, ""),
-        )
-        for symbol in symbols
-    ])
-    stage2_duration_ms = (time.time() - stage2_started) * 1000
-    results: Dict[str, Dict[str, Any]] = {}
-
-    for symbol, sentiment in zip(symbols, analyses):
-        parsed_payload = getattr(sentiment, "parsed_payload", {}) or {}
-        bluster_phrases = list(parsed_payload.get("bluster_phrases") or [])
-        substance_phrases = list(parsed_payload.get("substance_phrases") or [])
-        directional_score = _coerce_score(
-            getattr(sentiment, "directional_score", None),
-            _derive_directional_score(
-                signal_type=getattr(sentiment, "signal_type", None) or "",
-                policy_score=sentiment.policy_score,
-                bluster_score=sentiment.bluster_score,
-                raw_reasoning=sentiment.reasoning,
-            ),
-            -1.0,
-            1.0,
-        )
-        results[symbol] = {
-            'bluster_score': _coerce_score(
-                None,
-                sentiment.bluster_score,
-                -1.0,
-                1.0,
-            ),
-            'policy_score': _coerce_score(
-                None,
-                sentiment.policy_score,
-                0.0,
-                1.0,
-            ),
-            'confidence': _coerce_score(
-                None,
-                sentiment.confidence,
-                0.0,
-                1.0,
-            ),
-            'directional_score': directional_score,
-            'signal_type': getattr(sentiment, "signal_type", "HOLD"),
-            'urgency': getattr(sentiment, "urgency", "LOW"),
-            'reasoning': (sentiment.analyst_writeup or sentiment.reasoning or '').strip(),
-            'is_bluster': sentiment.is_bluster,
-            'is_policy_change': sentiment.is_policy_change,
-            'impact_severity': sentiment.impact_severity,
-            'event_type': str(parsed_payload.get("event_type") or ""),
-            'confirmed': bool(parsed_payload.get("confirmed", False)),
-            'source_count': int(parsed_payload.get("source_count") or 0),
-            'exposure_type': str(
-                parsed_payload.get("exposure_type")
-                or getattr(sentiment, "parsed_payload", {}).get("exposure_type")
-                or ""
-            ).upper(),
-            'transmission_path': str(
-                parsed_payload.get("transmission_path")
-                or getattr(sentiment, "parsed_payload", {}).get("transmission_path")
-                or ""
-            ),
-            'bluster_phrases': bluster_phrases,
-            'substance_phrases': substance_phrases,
-        }
-
-    stage2_runs_by_symbol: Dict[str, Dict[str, Any]] = {}
-    for symbol, sentiment in zip(symbols, analyses):
-        parsed_payload = getattr(sentiment, "parsed_payload", {}) or {}
-        stage2_runs_by_symbol[symbol] = {
-            "model": effective_reasoning_model or "",
-            "prompt": getattr(sentiment, "prompt_used", "") or "",
-            "raw_response": getattr(sentiment, "raw_model_response", "") or "",
-            "parsed_payload": parsed_payload,
-            "bluster_phrases": list(parsed_payload.get("bluster_phrases") or []),
-            "substance_phrases": list(parsed_payload.get("substance_phrases") or []),
-            "final_reasoning": results[symbol]["reasoning"],
-            "signal_type": results[symbol]["signal_type"],
-            "confidence": results[symbol]["confidence"],
-        }
-
-    trace = {
-        "used_two_stage": bool(extraction_model and reasoning_model),
-        "pipeline_models": {
-            "analysis_model": model_name or "",
-            "extraction_model": extraction_model or "",
-            "reasoning_model": effective_reasoning_model or "",
-        },
-        "stage_metrics": {
-            **stage_metrics,
-            "stage2": _stage_metric(
-                status="completed",
-                model_name=effective_reasoning_model or "",
-                duration_ms=stage2_duration_ms,
-                item_count=len(symbols),
-                input_articles=len(analysis_posts),
-                analyzed_symbols=len(symbols),
-            ),
-        },
-        "aggregated_news_length": len(aggregated),
-        "analysis_article_count": len(analysis_posts),
-        "stage1": {
-            **_build_stage1_trace(posts, analysis_posts, proxy_terms_by_symbol),
-            "keyword_generation_trace_by_symbol": keyword_generation_trace_by_symbol,
-        },
-        "stage2_runs_by_symbol": stage2_runs_by_symbol,
-    }
-
-    return results, trace
-
-
-def _build_aggregated_news_context(posts: List[Any]) -> str:
-    """Build the exact compiled news text passed into the model."""
-    aggregated_sections: List[str] = []
-    for post in posts:
-        source = (
-            getattr(post, 'source', None)
-            or getattr(post, 'feed_name', None)
-            or getattr(post, 'author', None)
-            or "Unknown Source"
-        )
-        title = (getattr(post, 'title', '') or '').strip()
-        summary = (getattr(post, 'summary', '') or '').strip()
-        content = (getattr(post, 'content', '') or '').strip()
-        details = content or summary
-        section_lines: List[str] = []
-        if title:
-            section_lines.append(f"Source: {source}")
-            section_lines.append(f"Headline: {title}")
-        elif details:
-            section_lines.append(f"Source: {source}")
-        if details and details != title:
-            section_lines.append(f"Details: {details}")
-        if section_lines:
-            aggregated_sections.append("\n".join(section_lines))
-
-    return "\n\n".join(aggregated_sections)[:12000]
-
-
-def _post_has_analysis_text(post: Any) -> bool:
-    return any(
-        str(value or "").strip()
-        for value in [
-            getattr(post, "title", ""),
-            getattr(post, "summary", ""),
-            getattr(post, "content", ""),
-            " ".join(getattr(post, "keywords", None) or []),
-        ]
-    )
-
-
-def _ensure_execution_quotes(signal: TradingSignal, quotes_by_symbol: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Fallback: Fetch quotes for execution tickers that aren't already available.
-    Ensures we have prices for all symbols needed for trade execution and P&L.
-    """
-    hydrated_quotes = dict(quotes_by_symbol)
-    client = PriceClient()
-    
-    symbols_to_check = {signal.entry_symbol} if signal.entry_symbol else set()
-    for recommendation in signal.recommendations or []:
-        symbol = str(recommendation.get("symbol", "") or "").strip().upper()
-        if symbol:
-            symbols_to_check.add(symbol)
-
-    missing_symbols = [s for s in symbols_to_check if s and s not in hydrated_quotes]
-    
-    if missing_symbols:
-        print(f"[WARNING] Missing quotes for execution symbols: {missing_symbols}. Fetching now...")
-        for symbol in missing_symbols:
-            if not symbol:
-                continue
-            try:
-                quote = client.get_realtime_quote(symbol)
-                if quote and quote.get("current_price"):
-                    hydrated_quotes[symbol] = quote
-                    print(f"  ✓ Fetched {symbol}: ${quote.get('current_price'):.2f}")
-                else:
-                    print(f"  ✗ Failed to fetch {symbol}: no quote data")
-            except Exception as e:
-                print(f"  ✗ Error fetching {symbol}: {e}")
-
-    return hydrated_quotes
-
-
-def _serialize_snapshot_posts(posts: List[Any]) -> List[Dict[str, Any]]:
-    serialized: List[Dict[str, Any]] = []
-    for post in posts:
-        serialized.append(
-            {
-                "source": getattr(post, "source", None),
-                "feed_name": getattr(post, "feed_name", None),
-                "author": getattr(post, "author", None),
-                "title": getattr(post, "title", ""),
-                "summary": getattr(post, "summary", ""),
-                "content": getattr(post, "content", ""),
-                "keywords": list(getattr(post, "keywords", None) or []),
-            }
-        )
-    return serialized
+            seconds = int(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return seconds
+    return 900
 
 
 def _restore_snapshot_posts(posts: List[Dict[str, Any]]) -> List[Any]:
@@ -2190,178 +917,69 @@ def _restore_snapshot_quotes(quotes_by_symbol: Dict[str, Dict[str, Any]]) -> Dic
     return restored
 
 
-def _post_trace_summary(post: Any) -> Dict[str, Any]:
+def _aggregate_sentiment(sentiment_results: Dict[str, Dict[str, Any]]) -> Optional[SentimentScore]:
+    if not sentiment_results:
+        return None
+    avg_bluster = sum(float(r.get("bluster_score", 0.0) or 0.0) for r in sentiment_results.values()) / len(sentiment_results)
+    avg_policy = sum(float(r.get("policy_score", 0.0) or 0.0) for r in sentiment_results.values()) / len(sentiment_results)
+    avg_confidence = sum(float(r.get("confidence", 0.0) or 0.0) for r in sentiment_results.values()) / len(sentiment_results)
+    representative_reasoning = next(
+        ((result.get("reasoning") or "").strip() for result in sentiment_results.values() if (result.get("reasoning") or "").strip()),
+        "Aggregated across all analyzed sources",
+    )
+    return SentimentScore(
+        market_bluster=avg_bluster,
+        policy_change=avg_policy,
+        confidence=avg_confidence,
+        reasoning=representative_reasoning,
+    )
+
+
+def _normalize_signal_payload(signal: Any) -> Optional[Dict[str, Any]]:
+    if signal is None:
+        return None
+    if isinstance(signal, dict):
+        return signal
+    if hasattr(signal, "model_dump"):
+        return signal.model_dump(mode="json")
     return {
-        "source": getattr(post, "source", None) or getattr(post, "feed_name", None) or getattr(post, "author", None) or "Unknown",
-        "title": getattr(post, "title", "") or "",
-        "summary": getattr(post, "summary", "") or "",
-        "content": getattr(post, "content", "") or "",
-        "keywords": list(getattr(post, "keywords", None) or []),
+        "signal_type": str(getattr(signal, "signal_type", "HOLD") or "HOLD"),
+        "confidence_score": float(getattr(signal, "confidence_score", 0.0) or 0.0),
+        "entry_symbol": str(getattr(signal, "entry_symbol", "") or ""),
+        "recommendations": list(getattr(signal, "recommendations", None) or []),
     }
 
 
-def _build_stage1_trace(
-    posts: List[Any],
-    filtered_posts: List[Any],
-    proxy_terms_by_symbol: Dict[str, List[str]],
-) -> Dict[str, Any]:
-    filtered_ids = {id(post) for post in filtered_posts}
-    article_rows: List[Dict[str, Any]] = []
-    matched_count = 0
+def _normalize_previous_state(previous_state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not previous_state:
+        return None
+    response = previous_state.get("response")
+    if response is None:
+        return previous_state
+    if isinstance(response, dict):
+        return previous_state
 
-    for post in posts:
-        blob = (
-            f"{getattr(post, 'title', '') or ''} "
-            f"{getattr(post, 'summary', '') or ''} "
-            f"{getattr(post, 'content', '') or ''} "
-            f"{' '.join(getattr(post, 'keywords', None) or [])}"
-        ).lower()
-        matched_terms_by_symbol: Dict[str, List[str]] = {}
-        matched_symbols: List[str] = []
-        for symbol, terms in (proxy_terms_by_symbol or {}).items():
-            matched_terms = [term for term in terms if term and term.lower() in blob]
-            if matched_terms:
-                matched_symbols.append(symbol)
-                matched_terms_by_symbol[symbol] = matched_terms[:8]
-        if matched_symbols:
-            matched_count += 1
-        article_rows.append(
-            {
-                **_post_trace_summary(post),
-                "selected_for_reasoning": id(post) in filtered_ids,
-                "matched_symbols": matched_symbols,
-                "matched_terms_by_symbol": matched_terms_by_symbol,
-            }
-        )
-
-    return {
-        "proxy_terms_by_symbol": proxy_terms_by_symbol,
-        "matched_article_count": matched_count,
-        "filtered_article_count": len(filtered_posts),
-        "used_keyword_matches": bool(matched_count),
-        "articles": article_rows,
-    }
-
-
-def _build_secret_trace(
-    *,
-    request_id: str,
-    active_model: str,
-    extraction_model: str,
-    reasoning_model: str,
-    risk_profile: str,
-    request_payload: AnalysisRequest,
-    ingestion_trace: Dict[str, Any],
-    price_context: Dict[str, Any],
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    market_validation: Dict[str, Dict[str, Any]],
-    web_context_by_symbol: Dict[str, str],
-    web_items_by_symbol: Dict[str, List[Dict[str, Any]]],
-    sentiment_results: Dict[str, Dict[str, Any]],
-    sentiment_trace: Dict[str, Any],
-    blue_team_signal: Any,
-    trading_signal: Any,
-    red_team_review: Optional[Dict[str, Any]],
-    red_team_debug: Optional[Dict[str, Any]],
-    backtest_results: Any,
-    pipeline_events: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    return {
-        "request_id": request_id,
-        "models": {
-            "active_model": active_model,
-            "extraction_model": extraction_model,
-            "reasoning_model": reasoning_model,
-            "risk_profile": risk_profile,
-        },
-        "request": {
-            "symbols": list(request_payload.symbols),
-            "max_posts": request_payload.max_posts,
-            "include_backtest": request_payload.include_backtest,
-            "lookback_days": request_payload.lookback_days,
-        },
-        "pipeline_events": list(pipeline_events or []),
-        "ingestion": ingestion_trace,
-        "market_snapshot": {
-            "price_context_keys": sorted(price_context.keys()),
-            "quotes_by_symbol": {
-                symbol: {
-                    "current_price": quote.get("current_price"),
-                    "previous_close": quote.get("previous_close"),
-                    "day_low": quote.get("day_low"),
-                    "day_high": quote.get("day_high"),
-                    "timestamp": quote.get("timestamp").isoformat() if getattr(quote.get("timestamp"), "isoformat", None) else quote.get("timestamp"),
-                }
-                for symbol, quote in (quotes_by_symbol or {}).items()
-            },
-            "market_validation": market_validation,
-        },
-        "web_research": {
-            "web_context_by_symbol": web_context_by_symbol,
-            "web_items_by_symbol": web_items_by_symbol,
-        },
-        "sentiment": {
-            "stage_trace": sentiment_trace,
-            "symbol_results": sentiment_results,
-        },
-        "blue_team_signal": blue_team_signal.model_dump(mode="json") if getattr(blue_team_signal, "model_dump", None) else blue_team_signal,
-        "trading_signal": trading_signal.model_dump(mode="json") if getattr(trading_signal, "model_dump", None) else trading_signal,
-        "red_team_review": red_team_review or {},
-        "red_team_debug": red_team_debug or {},
-        "backtest_results": backtest_results.model_dump(mode="json") if getattr(backtest_results, "model_dump", None) else backtest_results,
-    }
-
-
-def _build_dataset_snapshot(
-    response: AnalysisResponse,
-    posts: List[Any],
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    model_name: str,
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    extraction_model: str = "",
-    reasoning_model: str = "",
-    risk_profile: str = "moderate",
-    secret_trace: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    model_inputs = response.model_inputs.model_dump(mode="json") if response.model_inputs else {}
-    visible_price_context = dict(model_inputs.get("price_context") or {})
-    market_validation = response.market_validation or {}
-    if model_inputs.get("validation_context"):
-        visible_price_context["validation_context"] = model_inputs["validation_context"]
-    if market_validation:
-        visible_price_context["market_validation"] = market_validation
-
-    snapshot_quotes: Dict[str, Dict[str, Any]] = {}
-    for symbol, quote in (quotes_by_symbol or {}).items():
-        snapshot_quotes[symbol] = {
-            "symbol": symbol,
-            "current_price": quote.get("current_price"),
-            "previous_close": quote.get("previous_close"),
-            "day_low": quote.get("day_low"),
-            "day_high": quote.get("day_high"),
-            "regular_market_volume": quote.get("regular_market_volume"),
-            "timestamp": quote.get("timestamp").isoformat() if getattr(quote.get("timestamp"), "isoformat", None) else quote.get("timestamp"),
+    sentiment_scores: Dict[str, Dict[str, Any]] = {}
+    for symbol, score in (getattr(response, "sentiment_scores", {}) or {}).items():
+        if isinstance(score, dict):
+            sentiment_scores[symbol] = score
+            continue
+        sentiment_scores[symbol] = {
+            "market_bluster": float(getattr(score, "market_bluster", 0.0) or 0.0),
+            "policy_change": float(getattr(score, "policy_change", 0.0) or 0.0),
+            "confidence": float(getattr(score, "confidence", 0.0) or 0.0),
+            "reasoning": str(getattr(score, "reasoning", "") or ""),
         }
 
-    return {
-        "version": 1,
-        "saved_at": datetime.utcnow().isoformat(),
-        "model_name": model_name,
-        "extraction_model": extraction_model,
-        "reasoning_model": reasoning_model,
-        "risk_profile": risk_profile,
-        "symbols": response.symbols_analyzed,
-        "posts": _serialize_snapshot_posts(posts),
-        "model_inputs": model_inputs,
-        "price_context": visible_price_context,
-        "quotes_by_symbol": snapshot_quotes,
-        "market_validation": market_validation,
-        "prompt_overrides": prompt_overrides or {},
-        "include_backtest": response.backtest_results is not None,
-        "lookback_days": response.backtest_results.lookback_days if response.backtest_results else 14,
-        "ingestion_trace": response.ingestion_trace.model_dump(mode="json") if response.ingestion_trace else {},
-        "secret_trace": secret_trace or {},
+    normalized_response = {
+        "posts_scraped": int(getattr(response, "posts_scraped", 0) or 0),
+        "sentiment_scores": sentiment_scores,
+        "blue_team_signal": _normalize_signal_payload(getattr(response, "blue_team_signal", None)),
+        "trading_signal": _normalize_signal_payload(getattr(response, "trading_signal", None)),
     }
+    normalized = dict(previous_state)
+    normalized["response"] = normalized_response
+    return normalized
 
 
 def _build_symbol_specific_news_context(
@@ -2370,554 +988,34 @@ def _build_symbol_specific_news_context(
     fallback: str,
     proxy_terms: Optional[List[str]] = None,
 ) -> str:
-    """Prefer symbol-relevant articles so specialists do not all see the same noise."""
-    raw_terms = list(proxy_terms or []) or SYMBOL_RELEVANCE_TERMS.get(symbol.upper(), [])
-    terms = expand_proxy_terms_for_matching(raw_terms)
-    if not terms:
-        brief_titles = [
-            str(getattr(post, "title", "") or "").strip()
-            for post in posts[:3]
-            if str(getattr(post, "title", "") or "").strip()
-        ]
-        spillover = "\n".join(f"- {title}" for title in brief_titles)
-        return (
-            f"No symbol-specific matches were found for {symbol}. "
-            f"Do NOT assume DIRECT exposure.\n"
-            f"Treat {symbol} as BROAD or UNRELATED unless the text explicitly names "
-            f"the company, asset, sector, or a clear transmission path.\n"
-            f"Shared macro headlines:\n{spillover}"
-        ).strip()
-
-    relevant_posts: List[Any] = []
-    for post in posts:
-        text_blob = normalize_text_for_matching(" ".join(
-            [
-                str(getattr(post, "title", "") or ""),
-                str(getattr(post, "summary", "") or ""),
-                str(getattr(post, "content", "") or ""),
-                " ".join(getattr(post, "keywords", None) or []),
-            ]
-        ))
-        if any(term in text_blob for term in terms):
-            relevant_posts.append(post)
-
-    relevant_context = _build_aggregated_news_context(relevant_posts)
-    if relevant_context:
-        return relevant_context
-
-    brief_titles = [
-        str(getattr(post, "title", "") or "").strip()
-        for post in posts[:3]
-        if str(getattr(post, "title", "") or "").strip()
-    ]
-    spillover = "\n".join(f"- {title}" for title in brief_titles)
-    return (
-        f"No article in this batch matched {symbol} proxy terms: "
-        f"{', '.join(raw_terms[:12]) or symbol}.\n"
-        f"Do NOT assume DIRECT exposure for {symbol}. "
-        f"Use BROAD or UNRELATED unless the text shows a specific causal chain.\n"
-        f"Shared macro headlines:\n{spillover}"
-    ).strip()
-
-
-def _build_symbol_specific_price_context(price_context: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Keep general price context but narrow validation text to the active symbol."""
-    context = dict(price_context)
-    context["active_symbol"] = symbol
-    context["active_symbol_price"] = context.get(f"{symbol.lower()}_price", 0.0)
-    market_validation = context.get("market_validation") or {}
-    symbol_payload = market_validation.get(symbol, {})
-    if symbol_payload:
-        summary = str(symbol_payload.get("summary", "") or "").strip()
-        status = str(symbol_payload.get("status", "unavailable")).upper()
-        context["validation_context"] = f"{symbol} [{status}]: {summary}" if summary else ""
-    # Promote per-symbol technical context key into a flat field
-    tech_key = f"technical_context_{symbol.lower()}"
-    if tech_key in price_context:
-        context["technical_context"] = price_context[tech_key]
-    return context
-
-
-async def _get_symbol_web_research(
-    symbols: List[str],
-    enabled: bool,
-    max_items_per_symbol: int,
-    max_age_days: int,
-    symbol_company_aliases: Optional[Dict[str, str]] = None,
-) -> tuple[Dict[str, str], Dict[str, List[Dict[str, str]]]]:
-    if not enabled:
-        print("Light web research disabled.")
-        return {}, {}
-
-    print(
-        f"Light web research enabled for: {', '.join(symbols)} "
-        f"({max_items_per_symbol} items per symbol, last {max_age_days} days)"
-    )
-    symbol_company_aliases = symbol_company_aliases or {}
-
-    results = await asyncio.gather(
-        *[
-            asyncio.to_thread(
-                fetch_recent_symbol_web_context,
-                symbol,
-                company_alias=str(symbol_company_aliases.get(symbol, "") or "").strip(),
-                max_items=max_items_per_symbol,
-                max_age_days=max_age_days,
-            )
-            for symbol in symbols
-        ],
-        return_exceptions=True,
-    )
-
-    web_context_by_symbol: Dict[str, str] = {}
-    web_items_by_symbol: Dict[str, List[Dict[str, str]]] = {}
-    for symbol, result in zip(symbols, results):
-        if isinstance(result, Exception):
-            print(f"Light web research error for {symbol}: {result}")
-            web_context_by_symbol[symbol] = ""
-            web_items_by_symbol[symbol] = []
-            continue
-        web_context_by_symbol[symbol] = str(result.get("summary", "") or "").strip()
-        web_items_by_symbol[symbol] = list(result.get("items") or [])
-        print(
-            f"Light web research for {symbol}: "
-            f"{len(web_items_by_symbol[symbol])} fresh items"
-        )
-
-    return web_context_by_symbol, web_items_by_symbol
-
-
-def _build_model_input_debug(
-    posts: List[Any],
-    price_context: Dict[str, Any],
-    market_validation: Dict[str, Dict[str, Any]],
-    symbols: Optional[List[str]] = None,
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    web_context_by_symbol: Optional[Dict[str, str]] = None,
-    web_items_by_symbol: Optional[Dict[str, List[Dict[str, str]]]] = None,
-) -> ModelInputDebug:
-    """Return a frontend-friendly view of the exact prompt inputs."""
-    validation_context = str(price_context.get("validation_context", "") or "")
-    visible_price_context = {
-        key: value
-        for key, value in price_context.items()
-        if key.endswith("_price")
-    }
-    articles: List[ModelInputArticle] = []
-    for post in posts:
-        source = (
-            getattr(post, 'source', None)
-            or getattr(post, 'feed_name', None)
-            or getattr(post, 'author', None)
-            or "Unknown Source"
-        )
-        title = (getattr(post, 'title', '') or '').strip()
-        description = (getattr(post, 'content', '') or '').strip()
-        keywords = [
-            str(keyword).strip()
-            for keyword in (getattr(post, 'keywords', None) or [])
-            if str(keyword).strip()
-        ]
-        if not title and not description:
-            continue
-        articles.append(
-            ModelInputArticle(
-                source=str(source),
-                title=title,
-                description="" if description == title else description,
-                content=description,
-                keywords=keywords[:8],
-            )
-        )
-
-    return ModelInputDebug(
-        news_context=_build_aggregated_news_context(posts),
-        validation_context=validation_context,
-        price_context=visible_price_context,
-        articles=articles,
-        per_symbol_prompts=_build_per_symbol_prompts(
-            posts,
-            price_context,
-            symbols or [],
-            prompt_overrides,
-            web_context_by_symbol=web_context_by_symbol,
-        ),
-        web_context_by_symbol=web_context_by_symbol or {},
-        web_items_by_symbol=web_items_by_symbol or {},
+    sentiment_service = SentimentService(price_cache=get_price_cache_service(), logic_config=_L)
+    return sentiment_service._build_symbol_specific_news_context(
+        posts=posts,
+        symbol=symbol,
+        fallback=fallback,
+        proxy_terms=proxy_terms,
     )
 
 
-def _build_per_symbol_prompts(
-    posts: List[Any],
-    price_context: Dict[str, Any],
-    symbols: List[str],
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    web_context_by_symbol: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
-    """Build the exact specialist prompt preview for each requested symbol."""
-    aggregated = _build_aggregated_news_context(posts)
-    if not aggregated.strip():
-        return {}
-
-    prompts: Dict[str, str] = {}
-    web_context_by_symbol = web_context_by_symbol or {}
-    for symbol in symbols:
-        symbol_context = _build_symbol_specific_price_context(price_context, symbol)
-        symbol_text = _build_symbol_specific_news_context(posts, symbol, aggregated)
-        validation_ctx = str(symbol_context.get("validation_context", "") or "")
-        technical_ctx  = str(symbol_context.get("technical_context", "") or "")
-        combined_validation = "\n\n".join(filter(None, [validation_ctx, technical_ctx]))
-        prompts[symbol] = format_symbol_specialist_context_prompt(
-            symbol=symbol,
-            specialist_focus=_symbol_specialist_focus(symbol, prompt_overrides),
-            text=symbol_text,
-            date=datetime.utcnow().strftime("%Y-%m-%d"),
-            active_symbol=str(symbol_context.get("active_symbol", symbol)),
-            active_symbol_price=float(symbol_context.get("active_symbol_price", 0.0) or 0.0),
-            uso_price=float(symbol_context.get("uso_price", 0.0) or 0.0),
-            bito_price=float(symbol_context.get("bito_price", 0.0) or 0.0),
-            qqq_price=float(symbol_context.get("qqq_price", 0.0) or 0.0),
-            spy_price=float(symbol_context.get("spy_price", 0.0) or 0.0),
-            recent_sentiment=str(symbol_context.get("recent_sentiment", "") or ""),
-            validation_context=combined_validation,
-            web_research_context=web_context_by_symbol.get(symbol, ""),
-        )
-    return prompts
-
-
-def _coerce_score(value: Any, default: float, lower: float, upper: float) -> float:
-    """Safely coerce model-provided scores into bounded floats."""
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        numeric = float(default)
-    return max(lower, min(upper, numeric))
-
-
-def _get_symbol_specialist_focus_with_overrides(symbol: str, prompt_overrides: Optional[Dict[str, str]] = None) -> str:
-    """Get specialist focus for a symbol, optionally with admin overrides."""
-    base_focus = get_symbol_specialist_focus(symbol)
-    override = ((prompt_overrides or {}).get(symbol) or "").strip()
-    if override:
-        return f"{base_focus}\n\nAdditional admin guidance for {symbol}:\n{override}"
-    return base_focus
-
-
-def _symbol_specialist_focus(symbol: str, prompt_overrides: Optional[Dict[str, str]] = None) -> str:
-    """Describe the specialist lens to use for a given symbol.
-    
-    Deprecated: Use _get_symbol_specialist_focus_with_overrides instead.
-    Kept for backwards compatibility.
-    """
-    return _get_symbol_specialist_focus_with_overrides(symbol, prompt_overrides)
-
-
-def _derive_directional_score(
-    signal_type: str,
-    policy_score: float,
-    bluster_score: float,
-    raw_reasoning: str,
-) -> float:
-    """Map specialist output onto a signed per-symbol direction score."""
-    normalized_signal = (signal_type or "").upper().strip()
-    if normalized_signal == "LONG":
-        return min(1.0, max(0.15, policy_score))
-    if normalized_signal == "SHORT":
-        return max(-1.0, min(-0.15, -max(abs(bluster_score), policy_score)))
-
-    reasoning = (raw_reasoning or "").lower()
-    positive_hints = ["bullish", "beneficiary", "re-rate higher", "rally", "positive for"]
-    negative_hints = ["bearish", "headwind", "sell-off", "negative for", "pressure on"]
-    if any(token in reasoning for token in positive_hints):
-        return min(1.0, max(0.1, policy_score * 0.8))
-    if any(token in reasoning for token in negative_hints):
-        return max(-1.0, min(-0.1, -max(abs(bluster_score), policy_score * 0.8)))
-    return 0.0
-
-
-def _resolve_leverage(confidence: float, risk_profile: str, action: str = "", atr_pct: float = 0.0) -> str:
-    profile = str(risk_profile or "moderate").lower().strip()
-    if profile == "conservative":
-        return "inverse" if str(action).upper() == "SELL" else "1x"
-
-    # Profile-based raw leverage
-    if profile == "moderate":
-        raw = 2 if confidence > 0.75 else 1
-    elif profile == "crazy":
-        raw = 3
-    else:
-        # aggressive
-        raw = 3 if confidence > 0.75 else 1
-
-    # ATR-based volatility cap — applied after profile, before returning
-    _lev_cfg = _L.get("leverage", {})
-    high_vol = float(_lev_cfg.get("high_vol_atr_pct", 3.0))
-    med_vol  = float(_lev_cfg.get("medium_vol_atr_pct", 1.5))
-    if atr_pct >= high_vol:
-        cap = 1
-    elif atr_pct >= med_vol:
-        cap = 2
-    else:
-        cap = 3
-
-    return f"{min(raw, cap)}x"
-
-
-def _is_closed_market_session(quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]]) -> bool:
-    """Return True when all fetched quotes indicate the market is fully closed."""
-    if not quotes_by_symbol:
-        return False
-    sessions = {
-        str((quote or {}).get("session") or "").lower().strip()
-        for quote in quotes_by_symbol.values()
-        if isinstance(quote, dict)
-    }
-    sessions.discard("")
-    return bool(sessions) and sessions.issubset({"closed"})
-
-
-def _latest_previous_analysis_response(
-    db: Optional[Session],
-    max_age_hours: int = 8,
-) -> Optional[AnalysisResponse]:
-    """Load the most recent saved analysis if it is still recent enough to use for hysteresis."""
-    if db is None:
-        return None
-    latest = (
-        db.query(AnalysisResult)
-        .order_by(AnalysisResult.timestamp.desc())
-        .first()
+def _generate_trading_signal(
+    sentiment_results: Dict[str, Dict],
+    quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
+    risk_profile: str = "aggressive",
+    previous_signal: Optional[TradingSignal] = None,
+    stability_mode: str = "normal",
+    entry_threshold_override: Optional[float] = None,
+    price_context: Optional[Dict[str, Any]] = None,
+) -> TradingSignal:
+    signal_service = SignalService(logic_config=_L)
+    return signal_service.generate_trading_signal(
+        sentiment_results=sentiment_results,
+        quotes_by_symbol=quotes_by_symbol,
+        risk_profile=risk_profile,
+        previous_signal=previous_signal,
+        stability_mode=stability_mode,
+        entry_threshold_override=entry_threshold_override,
+        price_context=price_context,
     )
-    if not latest:
-        return None
-    response = _load_saved_analysis_response(latest)
-    latest_ts = latest.timestamp
-    if latest_ts.tzinfo is None:
-        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
-    else:
-        latest_ts = latest_ts.astimezone(timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 3600.0
-    if age_hours > max_age_hours:
-        return None
-    return response
-
-
-def _latest_previous_analysis_state(
-    db: Optional[Session],
-    max_age_hours: int = 8,
-) -> Optional[Dict[str, Any]]:
-    """Return the most recent saved analysis plus its reconstructed response and snapshot metadata."""
-    if db is None:
-        return None
-    latest = (
-        db.query(AnalysisResult)
-        .order_by(AnalysisResult.timestamp.desc())
-        .first()
-    )
-    if not latest:
-        return None
-    latest_ts = latest.timestamp
-    if latest_ts.tzinfo is None:
-        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
-    else:
-        latest_ts = latest_ts.astimezone(timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 3600.0
-    if age_hours > max_age_hours:
-        return None
-    metadata = latest.run_metadata or {}
-    snapshot = metadata.get("dataset_snapshot") or {}
-    return {
-        "analysis": latest,
-        "response": _load_saved_analysis_response(latest),
-        "snapshot": snapshot,
-        "quotes_by_symbol": snapshot.get("quotes_by_symbol") or {},
-    }
-
-
-def _max_sentiment_input_delta(
-    current_sentiment_results: Dict[str, Dict[str, Any]],
-    previous_response: Optional[AnalysisResponse],
-) -> float:
-    """Compare current vs previous sentiment inputs to avoid freezing legitimate regime changes."""
-    if not previous_response or not previous_response.sentiment_scores:
-        return 999.0
-    deltas: List[float] = []
-    for symbol, current in current_sentiment_results.items():
-        previous = previous_response.sentiment_scores.get(symbol)
-        if not previous:
-            continue
-        deltas.append(abs(float(current.get("policy_score", 0.0)) - float(previous.policy_change)))
-        deltas.append(abs(float(current.get("bluster_score", 0.0)) - float(previous.market_bluster)))
-        deltas.append(abs(float(current.get("confidence", 0.0)) - float(previous.confidence)))
-    return max(deltas) if deltas else 999.0
-
-
-def _max_price_move_vs_previous_pct(
-    symbols: List[str],
-    current_quotes: Optional[Dict[str, Dict[str, Any]]],
-    previous_quotes: Optional[Dict[str, Dict[str, Any]]],
-) -> float:
-    """Compare current prices to the previous run's prices and return the largest absolute move."""
-    if not current_quotes or not previous_quotes:
-        return 999.0
-    moves: List[float] = []
-    for symbol in symbols:
-        current_quote = current_quotes.get(symbol) or {}
-        previous_quote = previous_quotes.get(symbol) or {}
-        current_price = float(current_quote.get("current_price") or 0.0)
-        previous_price = float(previous_quote.get("current_price") or 0.0)
-        if current_price > 0 and previous_price > 0:
-            moves.append(abs(current_price - previous_price) / previous_price * 100.0)
-    return max(moves) if moves else 999.0
-
-
-def _max_atr_pct(symbols: List[str], price_context: Optional[Dict[str, Any]]) -> float:
-    """Return the largest available ATR percent across active symbols for price-move gating."""
-    if not price_context:
-        return 0.0
-    atr_values: List[float] = []
-    for symbol in symbols:
-        indicators = price_context.get(f"technical_indicators_{str(symbol).lower()}") or {}
-        try:
-            atr_pct = float(indicators.get("atr_14_pct") or 0.0)
-        except (TypeError, ValueError):
-            atr_pct = 0.0
-        if atr_pct > 0:
-            atr_values.append(atr_pct)
-    return max(atr_values) if atr_values else 0.0
-
-
-def _symbol_atr_pct(symbol: str, price_context: Optional[Dict[str, Any]]) -> float:
-    """Return ATR percent for a single symbol so leverage caps are applied per instrument."""
-    if not price_context:
-        return 0.0
-    indicators = price_context.get(f"technical_indicators_{str(symbol).lower()}") or {}
-    try:
-        atr_pct = float(indicators.get("atr_14_pct") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-    return atr_pct if atr_pct > 0 else 0.0
-
-
-def _signals_differ_materially(
-    previous_signal: Optional[TradingSignal],
-    current_signal: Optional[TradingSignal],
-) -> bool:
-    """Check whether two signals differ in thesis or recommendation composition."""
-    if previous_signal is None or current_signal is None:
-        return True
-    if str(previous_signal.signal_type or "HOLD").upper() != str(current_signal.signal_type or "HOLD").upper():
-        return True
-    prev_map = _recommendations_by_underlying(previous_signal)
-    cur_map = _recommendations_by_underlying(current_signal)
-    if set(prev_map.keys()) != set(cur_map.keys()):
-        return True
-    for symbol in prev_map:
-        prev = prev_map.get(symbol) or {}
-        cur = cur_map.get(symbol) or {}
-        if (
-            str(prev.get("action") or "").upper() != str(cur.get("action") or "").upper()
-            or str(prev.get("symbol") or "").upper() != str(cur.get("symbol") or "").upper()
-            or str(prev.get("leverage") or "") != str(cur.get("leverage") or "")
-        ):
-            return True
-    return False
-
-
-def _recommendation_structure_changed_without_thesis_flip(
-    previous_signal: Optional[TradingSignal],
-    current_signal: Optional[TradingSignal],
-) -> bool:
-    """
-    Allow leverage/execution-ticker changes to pass through without the materiality gate.
-
-    The materiality gate is intended to suppress noisy thesis flips, not to pin a symbol at
-    an old execution instrument when the current risk/volatility regime now supports a
-    different leverage tier for the same directional view.
-    """
-    if previous_signal is None or current_signal is None:
-        return False
-
-    if str(previous_signal.signal_type or "HOLD").upper() != str(current_signal.signal_type or "HOLD").upper():
-        return False
-
-    prev_map = _recommendations_by_underlying(previous_signal)
-    cur_map = _recommendations_by_underlying(current_signal)
-    if set(prev_map.keys()) != set(cur_map.keys()):
-        return False
-
-    structure_changed = False
-    for symbol in prev_map:
-        prev = prev_map.get(symbol) or {}
-        cur = cur_map.get(symbol) or {}
-        prev_thesis = str(prev.get("thesis") or "").upper().strip()
-        cur_thesis = str(cur.get("thesis") or "").upper().strip()
-        if not prev_thesis:
-            prev_thesis = "LONG" if str(prev.get("action") or "").upper() == "BUY" else "SHORT"
-        if not cur_thesis:
-            cur_thesis = "LONG" if str(cur.get("action") or "").upper() == "BUY" else "SHORT"
-        if prev_thesis != cur_thesis:
-            return False
-
-        if (
-            str(prev.get("symbol") or "").upper() != str(cur.get("symbol") or "").upper()
-            or str(prev.get("leverage") or "") != str(cur.get("leverage") or "")
-        ):
-            structure_changed = True
-
-    return structure_changed
-
-
-def _count_symbol_articles(posts: List[Any], symbols: List[str]) -> Dict[str, int]:
-    """Count articles relevant to each symbol by keyword matching."""
-    counts: Dict[str, int] = {}
-    for symbol in symbols:
-        sym_upper = symbol.upper()
-        terms_raw = SYMBOL_RELEVANCE_TERMS.get(sym_upper)
-        if not terms_raw:
-            counts[sym_upper] = len(posts)
-            continue
-        terms = expand_proxy_terms_for_matching(terms_raw)
-        count = 0
-        for post in posts:
-            text = normalize_text_for_matching(" ".join([
-                str(getattr(post, "title", "") or (post.get("title", "") if isinstance(post, dict) else "")),
-                str(getattr(post, "content", "") or (post.get("content", "") if isinstance(post, dict) else "")),
-                str(getattr(post, "description", "") or (post.get("description", "") if isinstance(post, dict) else "")),
-            ]))
-            if any(term in text for term in terms):
-                count += 1
-        counts[sym_upper] = count
-    return counts
-
-
-def _rolling_article_baseline(db, symbols: List[str], n_runs: int = 20) -> Dict[str, Dict[str, float]]:
-    """Compute rolling mean and stddev of per-symbol article counts from recent analysis runs."""
-    import math
-    from database.models import AnalysisResult as _AR
-    recent = (
-        db.query(_AR)
-        .filter(_AR.run_metadata.isnot(None))
-        .order_by(_AR.timestamp.desc())
-        .limit(n_runs)
-        .all()
-    )
-    history: Dict[str, List[int]] = {s.upper(): [] for s in symbols}
-    for row in recent:
-        counts = (row.run_metadata or {}).get("per_symbol_article_counts") or {}
-        for sym in symbols:
-            val = counts.get(sym.upper())
-            if val is not None:
-                history[sym.upper()].append(int(val))
-    stats: Dict[str, Dict[str, float]] = {}
-    for sym, vals in history.items():
-        if not vals:
-            stats[sym] = {"mean": 0.0, "stddev": 0.0, "n": 0}
-        else:
-            mean = sum(vals) / len(vals)
-            stddev = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
-            stats[sym] = {"mean": mean, "stddev": stddev, "n": len(vals)}
-    return stats
 
 
 def _material_change_gate(
@@ -2934,796 +1032,258 @@ def _material_change_gate(
     per_symbol_counts: Optional[Dict[str, int]] = None,
     db: Optional[Any] = None,
 ) -> bool:
-    """Return True when a thesis flip is justified by meaningful news or price movement."""
-    if previous_state is None:
-        return True
-    previous_response = previous_state.get("response")
-    previous_quotes = previous_state.get("quotes_by_symbol") or {}
-    previous_signal = (previous_response.blue_team_signal or previous_response.trading_signal) if previous_response else None
-    if not _signals_differ_materially(previous_signal, candidate_signal):
-        return True
-    if _recommendation_structure_changed_without_thesis_flip(previous_signal, candidate_signal):
-        return True
-
-    _mg = _L["materiality_gate"]
-    _min_posts = min_posts_delta if min_posts_delta is not None else _mg["min_posts_delta"]
-    _min_sent = min_sentiment_delta if min_sentiment_delta is not None else _mg["min_sentiment_delta"]
-
-    # Dynamic per-symbol article baseline when history is available
-    article_material = False
-    if db is not None and per_symbol_counts:
-        _min_hist = int(_mg.get("rolling_baseline_min_runs", 5))
-        _n_runs   = int(_mg.get("rolling_baseline_runs", 20))
-        _mult     = float(_mg.get("rolling_baseline_stddev_multiplier", 1.0))
-        baseline  = _rolling_article_baseline(db, symbols, n_runs=_n_runs)
-        for sym, count in per_symbol_counts.items():
-            b = baseline.get(sym.upper(), {})
-            if b.get("n", 0) >= _min_hist:
-                threshold = b["mean"] + _mult * b["stddev"]
-                if count > threshold:
-                    article_material = True
-                    break
-            else:
-                # Cold start: fall back to total-posts delta
-                prev_total = int(getattr(previous_response, "posts_scraped", 0) or 0)
-                if abs(prev_total - int(posts_count or 0)) >= _min_posts:
-                    article_material = True
-                    break
-    else:
-        posts_delta = abs(int(getattr(previous_response, "posts_scraped", 0) or 0) - int(posts_count or 0)) if previous_response else 999
-        article_material = posts_delta >= _min_posts
-
-    sentiment_delta = _max_sentiment_input_delta(sentiment_results, previous_response)
-    price_move_pct = _max_price_move_vs_previous_pct(symbols, quotes_by_symbol, previous_quotes)
-    atr_pct = _max_atr_pct(symbols, price_context)
-    material_price_threshold = max(
-        _mg["price_move_floor_pct"],
-        min(_mg["price_move_ceiling_pct"], atr_pct * _mg["atr_multiplier"] if atr_pct > 0 else 1.0),
-    )
-
-    return (
-        article_material
-        or sentiment_delta >= _min_sent
-        or price_move_pct >= material_price_threshold
-    )
-
-
-def _generate_trading_signal(
-    sentiment_results: Dict[str, Dict],
-    quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
-    risk_profile: str = "aggressive",
-    previous_signal: Optional[TradingSignal] = None,
-    stability_mode: str = "normal",
-    entry_threshold_override: Optional[float] = None,
-    price_context: Optional[Dict[str, Any]] = None,
-) -> TradingSignal:
-    if not sentiment_results:
-        return TradingSignal(
-            signal_type="HOLD", confidence_score=0.0,
-            entry_symbol="USO",
-            stop_loss_pct=_L["stop_loss_pct"],
-            take_profit_pct=_L["take_profit_pct"],
-            urgency="LOW",
-            conviction_level="LOW",
-            holding_period_hours=_L["conviction"]["holding_minutes"]["VOLATILE_EVENT"] / 60,
-            trading_type="VOLATILE_EVENT",
-            action_if_already_in_position="HOLD"
-        )
-
-    symbols = list(sentiment_results.keys())
-    recommendations: List[Dict[str, str]] = []
-    urgency_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    overall_urgency = "LOW"
-    strongest_symbol = symbols[0] if symbols else "USO"
-    strongest_execution_symbol = strongest_symbol
-    strongest_score = -1.0
-    net_direction_score = 0.0
-    total_weight = 0.0
-    long_recommendations = 0
-    short_recommendations = 0
-    hold_recommendations = 0
-    previous_recommendations = _recommendations_by_underlying(previous_signal)
-    _et = _L["entry_thresholds"]
-    is_closed_hysteresis = stability_mode == "closed_market_hysteresis"
-    entry_threshold = _et["closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["normal"])
-    keep_threshold = _et["keep_closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["keep_normal"])
-
-    for sym, result in sentiment_results.items():
-        directional = result.get('directional_score', 0.0)
-        confidence = result['confidence']
-        specialist_signal = str(result.get('signal_type', 'HOLD')).upper()
-        specialist_urgency = str(result.get('urgency', 'LOW')).upper()
-        previous_action = str((previous_recommendations.get(sym) or {}).get("action", "")).upper().strip()
-
-        if directional <= -entry_threshold or (previous_action == "SELL" and directional <= -keep_threshold):
-            action = "SELL"
-            urgency = specialist_urgency if specialist_signal == "SHORT" else ("HIGH" if abs(directional) > 0.7 else "MEDIUM")
-            short_recommendations += 1
-        elif directional >= entry_threshold or (previous_action == "BUY" and directional >= keep_threshold):
-            action = "BUY"
-            urgency = specialist_urgency if specialist_signal == "LONG" else ("HIGH" if directional > 0.7 else "MEDIUM")
-            long_recommendations += 1
-        else:
-            action = ""
-            urgency = specialist_urgency if specialist_signal == "HOLD" else "LOW"
-            hold_recommendations += 1
-
-        leverage = _resolve_leverage(
-            confidence,
-            risk_profile,
-            action=action,
-            atr_pct=_symbol_atr_pct(sym, price_context),
-        )
-        recommendation = None
-        if action:
-            recommendation = build_execution_recommendation(sym, action, leverage)
-            recommendations.append(recommendation)
-
-        conviction = abs(directional) * confidence
-        actual_leverage_label = recommendation["leverage"] if recommendation else leverage
-        leverage_weight = float(actual_leverage_label.lower().replace("x", "")) if actual_leverage_label else 1.0
-        directional_weight = max(abs(directional), 0.1) * leverage_weight
-        net_direction_score += directional * directional_weight
-        total_weight += directional_weight
-
-        if conviction > strongest_score:
-            strongest_score = conviction
-            strongest_symbol = sym
-            strongest_execution_symbol = recommendation["symbol"] if action else sym
-
-        if urgency_rank[urgency] > urgency_rank[overall_urgency]:
-            overall_urgency = urgency
-
-    normalized_basket_score = (net_direction_score / total_weight) if total_weight > 0 else 0.0
-    avg_confidence = sum(result['confidence'] for result in sentiment_results.values()) / len(sentiment_results)
-
-    if long_recommendations == len(symbols) and len(symbols) > 0:
-        signal_type = "LONG"
-    elif short_recommendations == len(symbols) and len(symbols) > 0:
-        signal_type = "SHORT"
-    elif hold_recommendations == len(symbols) and len(symbols) > 0:
-        signal_type = "HOLD"
-    elif long_recommendations > 0 and short_recommendations == 0:
-        signal_type = "LONG"
-    elif short_recommendations > 0 and long_recommendations == 0:
-        signal_type = "SHORT"
-    elif recommendations:
-        strongest_recommendation = max(
-            recommendations,
-            key=lambda rec: abs(float(sentiment_results[rec["underlying_symbol"]].get("directional_score", 0.0)))
-            * float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0)),
-        )
-        signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
-        strongest_symbol = strongest_recommendation["underlying_symbol"]
-        strongest_execution_symbol = strongest_recommendation["symbol"]
-    else:
-        signal_type = "HOLD"
-
-    if signal_type == "HOLD":
-        confidence_score = avg_confidence
-        overall_urgency = "LOW"
-    elif recommendations:
-        actionable_confidences = [
-            float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0))
-            for rec in recommendations
-            if rec.get("thesis") == signal_type
-        ]
-        confidence_score = max(actionable_confidences) if actionable_confidences else avg_confidence
-    else:
-        confidence_score = avg_confidence
-
-    # ── Determine conviction level and trading type ──────────────────────────
-    # Conviction levels: LOW (reactive), MEDIUM (data-driven), HIGH (structural)
-    
-    # Extract conviction_level from sentiment engine output if available
-    conviction_level_from_engine = None
-    trading_type_from_engine = None
-    holding_period_from_engine = None
-    
-    for sym, result in sentiment_results.items():
-        eng_conviction = str(result.get("conviction_level", "")).upper()
-        if eng_conviction in ("LOW", "MEDIUM", "HIGH"):
-            conviction_level_from_engine = eng_conviction
-            break
-        eng_trading_type = str(result.get("trading_type", "")).upper()
-        if eng_trading_type in ("SCALP", "SWING", "POSITION", "VOLATILE_EVENT"):
-            trading_type_from_engine = eng_trading_type
-            break
-        eng_holding = result.get("holding_period_hours")
-        if isinstance(eng_holding, int) and 1 <= eng_holding <= 720:
-            holding_period_from_engine = eng_holding
-            break
-    
-    # Fallback to logic based on confidence and urgency if not provided
-    _cv = _L["conviction"]
-    if conviction_level_from_engine:
-        conviction_level = conviction_level_from_engine
-    else:
-        if signal_type == "HOLD":
-            conviction_level = "LOW"
-        elif strongest_score > _cv["high_score_threshold"] and confidence_score > _cv["high_confidence_threshold"]:
-            conviction_level = "HIGH"  # Strong structural signal
-        elif overall_urgency == "HIGH" and confidence_score < _cv["high_score_threshold"]:
-            conviction_level = "LOW"  # Reactive bluster
-        else:
-            conviction_level = "MEDIUM"  # Data-driven swing
-    
-    if trading_type_from_engine:
-        trading_type = trading_type_from_engine
-    else:
-        if conviction_level == "LOW":
-            trading_type = "VOLATILE_EVENT"
-        elif conviction_level == "MEDIUM":
-            trading_type = "SWING"
-        else:  # HIGH
-            trading_type = "POSITION"
-    
-    if holding_period_from_engine:
-        holding_period_hours = holding_period_from_engine
-    else:
-        holding_period_hours = _cv["holding_minutes"].get(trading_type, 720) / 60
-    
-    # Determine action if already in position
-    action_if_already_in_position = "HOLD"  # Default: let existing position run
-    
-    return TradingSignal(
-        signal_type=signal_type,
-        confidence_score=min(confidence_score, 1.0),
-        entry_symbol=strongest_execution_symbol,
-        entry_price=(quotes_by_symbol or {}).get(strongest_execution_symbol, {}).get("current_price") if symbols else None,
-        stop_loss_pct=_L["stop_loss_pct"],
-        take_profit_pct=_L["take_profit_pct"],
-        urgency=overall_urgency,
-        conviction_level=conviction_level,
-        holding_period_hours=holding_period_hours,
-        trading_type=trading_type,
-        action_if_already_in_position=action_if_already_in_position,
-        recommendations=recommendations,
-    )
-
-
-def _build_consensus_trading_signal(
-    blue_team_signal: TradingSignal,
-    red_team_review: Optional[RedTeamReview],
-    quotes_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
-    risk_profile: str = "moderate",
-) -> TradingSignal:
-    """Combine the blue-team signal with the red-team review, using red-team adjustments as final consensus."""
-    if not red_team_review or not red_team_review.symbol_reviews:
-        return blue_team_signal
-
-    recommendations: List[Dict[str, str]] = []
-    urgency_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    overall_urgency = "LOW"
-    strongest_symbol = blue_team_signal.entry_symbol or "USO"
-    strongest_execution_symbol = strongest_symbol
-    strongest_confidence = -1.0
-    signed_scores: List[float] = []
-    stop_loss_candidates: List[float] = []
-
-    blue_signal_type = str(blue_team_signal.signal_type or "HOLD").upper()
-    source_bias = bool(red_team_review.source_bias_penalty_applied)
-    blue_rec_map = _recommendations_by_underlying(blue_team_signal)
-
-    for review in red_team_review.symbol_reviews:
-        symbol = str(review.symbol or "").upper().strip()
-        adjusted_signal = str(review.adjusted_signal or "HOLD").upper().strip()
-        adjusted_urgency = str(review.adjusted_urgency or "LOW").upper().strip()
-        blue_rec = blue_rec_map.get(symbol) or {}
-        blue_symbol_signal = str(blue_rec.get("action") or ("HOLD" if not blue_rec else blue_signal_type)).upper().strip()
-        if blue_symbol_signal in {"LONG", "SHORT"}:
-            blue_symbol_signal = "BUY" if blue_symbol_signal == "LONG" else "SELL"
-        if not SentimentEngine.red_team_override_is_material(
-            adjusted_signal=adjusted_signal,
-            blue_signal=blue_symbol_signal,
-            evidence=list(review.evidence or []),
-            key_risks=list(review.key_risks or []),
-            source_bias_applied=source_bias,
-        ):
-            adjusted_signal = blue_symbol_signal or "HOLD"
-        # Python computes confidence and stop-loss — LLM no longer outputs raw floats
-        adjusted_confidence = SentimentEngine.compute_red_team_confidence(
-            adjusted_signal=adjusted_signal,
-            blue_signal=blue_symbol_signal or blue_signal_type,
-            evidence=list(review.evidence or []),
-            key_risks=list(review.key_risks or []),
-            source_bias_applied=source_bias,
-        )
-        stop_loss = SentimentEngine.compute_red_team_stop_loss(adjusted_urgency)
-
-        if adjusted_urgency in urgency_rank and urgency_rank[adjusted_urgency] > urgency_rank[overall_urgency]:
-            overall_urgency = adjusted_urgency
-
-        stop_loss_candidates.append(stop_loss)
-
-        if adjusted_signal == "BUY":
-            action = "BUY"
-            signed_scores.append(max(0.1, adjusted_confidence))
-        elif adjusted_signal == "SELL":
-            action = "SELL"
-            signed_scores.append(-max(0.1, adjusted_confidence))
-        else:
-            action = ""
-            signed_scores.append(0.0)
-
-        if not action or not symbol:
-            continue
-
-        leverage = _resolve_leverage(adjusted_confidence, risk_profile, action=action)
-        recommendation = build_execution_recommendation(symbol, action, leverage)
-        recommendations.append(recommendation)
-
-        if adjusted_confidence > strongest_confidence:
-            strongest_confidence = adjusted_confidence
-            strongest_symbol = symbol
-            strongest_execution_symbol = recommendation["symbol"]
-
-    # Confidence is now Python-computed per review and collected in signed_scores magnitude
-    computed_confidences = []
-    for rv in red_team_review.symbol_reviews:
-        rv_symbol = str(rv.symbol or "").upper().strip()
-        rv_blue_signal = str((blue_rec_map.get(rv_symbol) or {}).get("action") or blue_signal_type).upper()
-        rv_adjusted_signal = str(rv.adjusted_signal or "HOLD").upper()
-        if not SentimentEngine.red_team_override_is_material(
-            adjusted_signal=rv_adjusted_signal,
-            blue_signal=rv_blue_signal,
-            evidence=list(rv.evidence or []),
-            key_risks=list(rv.key_risks or []),
-            source_bias_applied=source_bias,
-        ):
-            rv_adjusted_signal = str((blue_rec_map.get(rv_symbol) or {}).get("action") or "HOLD").upper()
-        computed_confidences.append(
-            SentimentEngine.compute_red_team_confidence(
-                adjusted_signal=rv_adjusted_signal,
-                blue_signal=rv_blue_signal,
-                evidence=list(rv.evidence or []),
-                key_risks=list(rv.key_risks or []),
-                source_bias_applied=source_bias,
-            )
-        )
-
-    if recommendations:
-        buy_recommendations = [rec for rec in recommendations if str(rec.get("action") or "").upper() == "BUY" and str(rec.get("thesis") or "").upper() == "LONG"]
-        sell_recommendations = [rec for rec in recommendations if str(rec.get("action") or "").upper() == "BUY" and str(rec.get("thesis") or "").upper() == "SHORT"]
-        if buy_recommendations and not sell_recommendations:
-            signal_type = "LONG"
-        elif sell_recommendations and not buy_recommendations:
-            signal_type = "SHORT"
-        else:
-            strongest_recommendation = max(
-                recommendations,
-                key=lambda rec: abs(float(next(
-                    (
-                        computed_confidences[idx]
-                        for idx, rv in enumerate(red_team_review.symbol_reviews)
-                        if str(rv.symbol or "").upper().strip() == str(rec.get("underlying_symbol") or "").upper().strip()
-                    ),
-                    0.0,
-                ))),
-            )
-            signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
-            strongest_execution_symbol = strongest_recommendation["symbol"]
-        confidence_score = max(computed_confidences) if computed_confidences else 0.0
-    else:
-        signal_type = "HOLD"
-        confidence_score = sum(computed_confidences) / max(1, len(computed_confidences))
-        strongest_execution_symbol = blue_team_signal.entry_symbol or strongest_execution_symbol
-
-    if confidence_score >= 0.75:
-        conviction_level = "HIGH"
-    elif confidence_score >= 0.45:
-        conviction_level = "MEDIUM"
-    else:
-        conviction_level = "LOW"
-
-    if signal_type == "HOLD":
-        conviction_level = "LOW"
-
-    if conviction_level == "HIGH":
-        trading_type = "POSITION"
-        holding_period_hours = max(24, blue_team_signal.holding_period_hours or 24)
-    elif conviction_level == "MEDIUM":
-        trading_type = "SWING"
-        holding_period_hours = min(max(4, blue_team_signal.holding_period_hours or 12), 24)
-    else:
-        trading_type = "VOLATILE_EVENT"
-        holding_period_hours = 2
-
-    stop_loss_pct = sum(stop_loss_candidates) / len(stop_loss_candidates) if stop_loss_candidates else blue_team_signal.stop_loss_pct
-
-    consensus_signal = TradingSignal(
-        signal_type=signal_type,
-        confidence_score=min(confidence_score, 1.0),
-        entry_symbol=strongest_execution_symbol,
-        entry_price=(quotes_by_symbol or {}).get(strongest_execution_symbol, {}).get("current_price"),
-        stop_loss_pct=round(float(stop_loss_pct or blue_team_signal.stop_loss_pct or 2.0), 2),
-        take_profit_pct=blue_team_signal.take_profit_pct,
-        position_size_usd=blue_team_signal.position_size_usd,
-        urgency=overall_urgency,
-        conviction_level=conviction_level,
-        holding_period_hours=holding_period_hours,
-        trading_type=trading_type,
-        action_if_already_in_position=blue_team_signal.action_if_already_in_position,
-        recommendations=recommendations,
-    )
-    return consensus_signal
-
-
-def _build_red_team_context(
-    *,
-    symbols: List[str],
-    posts: List[Any],
-    sentiment_results: Dict[str, Dict[str, Any]],
-    trading_signal: TradingSignal,
-    price_context: Dict[str, Any],
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    market_validation: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    latest_news = []
-    for post in posts[:10]:
-        latest_news.append(
-            {
-                "source": str(getattr(post, "source", "") or ""),
-                "title": str(getattr(post, "title", "") or ""),
-                "summary": str(getattr(post, "summary", "") or getattr(post, "content", "") or "")[:400],
-                "keywords": list(getattr(post, "keywords", None) or [])[:8],
-            }
-        )
-
-    source_counts: Dict[str, int] = {}
-    for item in latest_news:
-        source = item["source"] or "Unknown"
-        source_counts[source] = source_counts.get(source, 0) + 1
-
-    symbol_payloads = []
-    rec_map = {
-        (rec.get("underlying_symbol") or rec.get("symbol")): rec
-        for rec in (trading_signal.recommendations or [])
-    }
-    for symbol in symbols:
-        symbol_payloads.append(
-            {
-                "symbol": symbol,
-                "recommendation": rec_map.get(symbol, {}),
-                "sentiment": sentiment_results.get(symbol, {}),
-                "quote": quotes_by_symbol.get(symbol, {}),
-                "technical_indicators": price_context.get(f"technical_indicators_{symbol.lower()}", {}),
-                "technical_context": price_context.get(f"technical_context_{symbol.lower()}", ""),
-                "market_validation": market_validation.get(symbol, {}),
-            }
-        )
-
-    return {
-        "symbols": symbols,
-        "portfolio_signal": trading_signal.model_dump(mode="json"),
-        "latest_news": latest_news,
-        "source_counts": source_counts,
-        "symbol_context": symbol_payloads,
-    }
-
-
-async def _run_red_team_review(
-    *,
-    model_name: str,
-    symbols: List[str],
-    posts: List[Any],
-    sentiment_results: Dict[str, Dict[str, Any]],
-    trading_signal: TradingSignal,
-    price_context: Dict[str, Any],
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    market_validation: Dict[str, Dict[str, Any]],
-) -> Tuple[Optional[RedTeamReview], Optional[RedTeamDebug]]:
-    if not symbols:
-        return None, None
-
-    context = _build_red_team_context(
+    materiality_service = MaterialityService(logic_config=_L)
+    normalized_previous_state = _normalize_previous_state(previous_state)
+    return materiality_service.material_change_gate(
+        db=db,
         symbols=symbols,
-        posts=posts,
+        posts_count=posts_count,
         sentiment_results=sentiment_results,
-        trading_signal=trading_signal,
         price_context=price_context,
         quotes_by_symbol=quotes_by_symbol,
-        market_validation=market_validation,
+        previous_state=normalized_previous_state,
+        candidate_signal=candidate_signal,
+        min_posts_delta=min_posts_delta,
+        min_sentiment_delta=min_sentiment_delta,
+        per_symbol_counts=per_symbol_counts,
     )
-    prompt = format_red_team_review_prompt(json.dumps(context, ensure_ascii=True, default=str, indent=2))
-    engine = SentimentEngine(model_name=model_name)
-    raw = await engine._call_ollama(prompt, model_override=model_name, force_json=True, max_tokens=700)
-    raw_text = engine._strip_thinking(raw.get("response", ""))
-    payload = engine._extract_json_value(raw_text)
-    if not isinstance(payload, dict):
-        raise ValueError("Red-team review returned non-object JSON")
-    review = RedTeamReview.model_validate(payload)
-    debug = RedTeamDebug(
-        context=context,
-        prompt=prompt,
-        raw_response=raw_text,
-        parsed_payload=payload,
-        signal_changes=[],
-    )
-    return review, debug
 
 
-async def _run_backtest(
+async def run_analysis_for_pending_articles(
+    *,
+    db: Session,
     symbols: List[str],
-    sentiment_results: Dict[str, Dict],
-    lookback_days: int = 14
-) -> BacktestResults:
-    optimizer = RollingWindowOptimizer(
-        lookback_days=lookback_days,
-        test_period_days=7,
-        step_days=1,
-        leverage=3.0
+    article_ids: Optional[List[int]] = None,
+    trigger_source: str = "worker",
+) -> Optional[AnalysisResponse]:
+    services = _analysis_services(db)
+    config = services["config"]
+    pipeline: PipelineService = services["pipeline"]
+    request = AnalysisRequest(
+        symbols=symbols,
+        max_posts=max(1, len(article_ids or []) or 50),
+        include_backtest=False,
+        lookback_days=14,
     )
-
-    client = PriceClient()
-    prices_data = {}
-
-    for symbol in symbols:
-        try:
-            prices_df = client.get_historical_data([symbol], period="6mo")
-            if symbol in prices_df and not prices_df[symbol].empty:
-                prices_data[symbol] = prices_df[symbol]['Close']
-        except Exception as e:
-            print(f"Error fetching {symbol} data: {e}")
-
-    if not prices_data:
-        return BacktestResults(
-            total_return=0.0,
-            annualized_return=0.0,
-            sharpe_ratio=0.0,
-            max_drawdown=0.0,
-            win_rate=0.0,
-            total_trades=0,
-            lookback_days=lookback_days,
-            walk_forward_steps=0
+    try:
+        return await pipeline.run(
+            request=_apply_request_defaults(request, config),
+            db=db,
+            config=config,
+            prompt_overrides=config.symbol_prompt_overrides or {},
+            article_ids=article_ids,
+            trigger_source=trigger_source,
         )
-
-    symbol = list(prices_data.keys())[0]
-    result = optimizer.optimize(
-        prices=prices_data[symbol],
-        signal_thresholds=[-0.5, -0.3, -0.1, 0.1, 0.3]
-    )
-
-    summary = result.get('summary', {})
-
-    return BacktestResults(
-        total_return=summary.get('avg_total_return', 0.0),
-        annualized_return=summary.get('avg_sharpe_ratio', 0.0) * 10,
-        sharpe_ratio=summary.get('avg_sharpe_ratio', 0.0),
-        max_drawdown=summary.get('avg_max_drawdown', 0.0),
-        win_rate=0.0,
-        total_trades=0,
-        lookback_days=lookback_days,
-        walk_forward_steps=result.get('num_windows', 0)
-    )
-
-
-def _aggregate_sentiment(sentiment_results: Dict[str, Dict]) -> Optional[SentimentScore]:
-    if not sentiment_results:
+    except Exception as exc:
+        print(f"Skipping {trigger_source} analysis trigger: {exc}")
         return None
 
-    avg_bluster = sum(r['bluster_score'] for r in sentiment_results.values()) / len(sentiment_results)
-    avg_policy = sum(r['policy_score'] for r in sentiment_results.values()) / len(sentiment_results)
-    avg_confidence = sum(r['confidence'] for r in sentiment_results.values()) / len(sentiment_results)
-    representative_reasoning = next(
-        (
-            (result.get('reasoning') or '').strip()
-            for result in sentiment_results.values()
-            if (result.get('reasoning') or '').strip()
-        ),
-        "Aggregated across all analyzed sources"
-    )
 
-    return SentimentScore(
-        market_bluster=avg_bluster,
-        policy_change=avg_policy,
-        confidence=avg_confidence,
-        reasoning=representative_reasoning
-    )
+@router.post(
+    "/analyze/stream",
+    summary="Run full analysis pipeline with real-time progress",
+    tags=["Analysis"]
+)
+async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(get_db)):
+    """SSE endpoint streaming heartbeat comments and the final result."""
 
+    async def generate() -> AsyncGenerator[str, None]:
+        services = _analysis_services(db)
+        config = services["config"]
+        pipeline: PipelineService = services["pipeline"]
+        effective_request = _apply_request_defaults(request, config)
+        prompt_overrides = config.symbol_prompt_overrides or {}
+        timeout_seconds = _analysis_timeout_seconds(config)
+        SentimentEngine.configure_parallelism(int(getattr(config, "ollama_parallel_slots", 1) or 1))
+        run_marker = str(uuid.uuid4())
+        run_marked = False
 
-def _prune_saved_analyses(db: Session, keep_limit: int) -> None:
-    """Keep only the most recent saved analyses and delete related trade history for older ones."""
-    normalized_limit = max(1, min(100, int(keep_limit)))
-    stale_analyses = (
-        db.query(AnalysisResult)
-        .order_by(AnalysisResult.timestamp.desc())
-        .offset(normalized_limit)
-        .all()
-    )
-    if not stale_analyses:
-        return
-
-    stale_analysis_ids = [analysis.id for analysis in stale_analyses]
-    stale_trades = db.query(Trade).filter(Trade.analysis_id.in_(stale_analysis_ids)).all()
-    stale_trade_ids = [trade.id for trade in stale_trades]
-
-    if stale_trade_ids:
-        db.query(TradeExecution).filter(TradeExecution.trade_id.in_(stale_trade_ids)).delete(synchronize_session=False)
-        db.query(TradeSnapshot).filter(TradeSnapshot.trade_id.in_(stale_trade_ids)).delete(synchronize_session=False)
-        db.query(Trade).filter(Trade.id.in_(stale_trade_ids)).delete(synchronize_session=False)
-
-    db.query(TradingSignalModel).filter(TradingSignalModel.analysis_id.in_(stale_analysis_ids)).delete(synchronize_session=False)
-    db.query(AnalysisResult).filter(AnalysisResult.id.in_(stale_analysis_ids)).delete(synchronize_session=False)
-
-
-def _save_analysis_result(
-    db: Session,
-    request_id: str,
-    response: AnalysisResponse,
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    posts: Optional[List[Any]] = None,
-    model_name: str = "",
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    dataset_snapshot: Optional[Dict[str, Any]] = None,
-    extraction_model: str = "",
-    reasoning_model: str = "",
-    risk_profile: str = "moderate",
-    secret_trace: Optional[Dict[str, Any]] = None,
-    sentiment_results: Optional[Dict[str, Any]] = None,
-    per_symbol_counts: Optional[Dict[str, int]] = None,
-) -> None:
-    try:
-        frozen_snapshot = dataset_snapshot or _build_dataset_snapshot(
-            response=response,
-            posts=posts or [],
-            quotes_by_symbol=quotes_by_symbol,
-            model_name=model_name,
-            prompt_overrides=prompt_overrides,
-            extraction_model=extraction_model,
-            reasoning_model=reasoning_model,
-            risk_profile=risk_profile,
-            secret_trace=secret_trace,
-        )
-        analysis = AnalysisResult(
-            request_id=request_id,
-            sentiment_data={
-                "sentiment_scores": {
-                    symbol: {
-                        "market_bluster": score.market_bluster,
-                        "policy_change": score.policy_change,
-                        "confidence": score.confidence,
-                        "reasoning": score.reasoning
-                    }
-                    for symbol, score in response.sentiment_scores.items()
-                },
-                "aggregated_sentiment": {
-                    "market_bluster": response.aggregated_sentiment.market_bluster if response.aggregated_sentiment else 0,
-                    "policy_change": response.aggregated_sentiment.policy_change if response.aggregated_sentiment else 0,
-                    "confidence": response.aggregated_sentiment.confidence if response.aggregated_sentiment else 0
-                },
-                "market_validation": response.market_validation,
-            },
-            signal={
-                "signal_type": response.trading_signal.signal_type if response.trading_signal else "HOLD",
-                "confidence_score": response.trading_signal.confidence_score if response.trading_signal else 0,
-                "urgency": response.trading_signal.urgency if response.trading_signal else "LOW",
-                "entry_symbol": response.trading_signal.entry_symbol if response.trading_signal else "",
-                "recommendations": response.trading_signal.recommendations if response.trading_signal else [],
-            },
-            backtest_results={
-                "total_return": response.backtest_results.total_return if response.backtest_results else 0,
-                "sharpe_ratio": response.backtest_results.sharpe_ratio if response.backtest_results else 0
-            } if response.backtest_results else None,
-            run_metadata={
-                "symbols": response.symbols_analyzed,
-                "posts_scraped": response.posts_scraped,
-                "processing_time_ms": response.processing_time_ms,
-                "model_name": model_name,
-                "risk_profile": risk_profile,
-                "stage_metrics": {
-                    key: value.model_dump(mode="json")
-                    for key, value in (response.stage_metrics or {}).items()
-                },
-                "blue_team_signal": response.blue_team_signal.model_dump(mode="json") if response.blue_team_signal else None,
-                "red_team_review": response.red_team_review.model_dump(mode="json") if response.red_team_review else None,
-                "red_team_debug": response.red_team_debug.model_dump(mode="json") if response.red_team_debug else None,
-                "dataset_snapshot": frozen_snapshot,
-                "secret_trace": secret_trace or frozen_snapshot.get("secret_trace") or {},
-                "per_symbol_article_counts": per_symbol_counts or {},
-            }
-        )
-        db.add(analysis)
-        db.flush()
-        persist_recommendation_trades(
-            db=db,
-            analysis_id=analysis.id,
-            request_id=request_id,
-            response=response,
-            quotes_by_symbol=quotes_by_symbol,
-        )
-        config = get_or_create_app_config(db)
-        # Paper trading — auto-simulate $100 per signal during market hours
         try:
-            from services.paper_trading import process_signals as _paper_process_signals
-            recs_by_underlying = {}
-            if response.trading_signal:
-                for r in (response.trading_signal.recommendations or []):
-                    sym = (r.get("underlying_symbol") or "").upper()
-                    if sym:
-                        recs_by_underlying[sym] = r
-            recs_for_paper = []
-            for sym, sym_result in (sentiment_results or {}).items():
-                sym_upper = sym.upper()
-                rec = recs_by_underlying.get(sym_upper, {})
-                signal_type = str(sym_result.get("signal_type") or "HOLD").upper()
-                # Derive per-symbol conviction from its own scores
-                _conf = float(sym_result.get("confidence") or 0.0)
-                _dir  = abs(float(sym_result.get("directional_score") or 0.0))
-                _urg  = str(sym_result.get("urgency") or "LOW").upper()
-                _cv   = _L["conviction"]
-                if signal_type == "HOLD":
-                    _conviction = "LOW"
-                elif _dir > _cv["high_score_threshold"] and _conf > _cv["high_confidence_threshold"]:
-                    _conviction = "HIGH"
-                elif _urg == "HIGH" and _conf < _cv["high_score_threshold"]:
-                    _conviction = "LOW"
-                else:
-                    _conviction = "MEDIUM"
-                _trade_type = {"HIGH": "POSITION", "MEDIUM": "SWING", "LOW": "VOLATILE_EVENT"}.get(_conviction, "SWING")
-                _hold_mins  = _cv["holding_minutes"].get(_trade_type, 720)
-                recs_for_paper.append({
-                    "underlying": sym_upper,
-                    "execution_ticker": rec.get("symbol", sym_upper) if rec else sym_upper,
-                    "signal_type": signal_type,
-                    "leverage": rec.get("leverage", "1x") if rec else "1x",
-                    "conviction_level": _conviction,
-                    "trading_type": _trade_type,
-                    "holding_minutes": _hold_mins,
-                })
-            if recs_for_paper:
-                _paper_process_signals(
-                    db=db,
-                    recommendations=recs_for_paper,
-                    quotes_by_symbol=quotes_by_symbol,
-                    request_id=request_id,
-                    trade_amount=float(getattr(config, "paper_trade_amount", None) or 0) or None,
+            try:
+                mark_analysis_started(db, run_marker)
+                run_marked = True
+            except Exception:
+                run_marked = False
+            # Prime upstream/proxy buffers so the browser gets immediate stream bytes.
+            yield f": {' ' * 2048}\n\n"
+            try:
+                ollama_status = get_ollama_status()
+                runtime_model = str(ollama_status.get("active_model") or "").strip() or "unknown model"
+            except Exception:
+                runtime_model = "unknown model"
+
+            configured_extract = str(getattr(config, "extraction_model", "") or "").strip()
+            configured_reason = str(getattr(config, "reasoning_model", "") or "").strip()
+            configured_pipeline_model = configured_reason or configured_extract
+            if configured_extract and configured_reason:
+                configured_label = f"{configured_extract} → {configured_reason}"
+            else:
+                configured_label = configured_pipeline_model
+
+            if configured_label:
+                log_message = (
+                    f"Ollama reachable — runtime: {runtime_model}; pipeline: {configured_label}"
                 )
-        except Exception as _pe:
-            print(f"Paper trading hook error: {_pe}")
-        retention_limit = int(getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT))
-        _prune_saved_analyses(db, retention_limit)
-        db.commit()
-        trigger_remote_snapshot_delivery(request_id)
-    except Exception as e:
-        print(f"Error saving analysis result: {e}")
-        db.rollback()
+            else:
+                log_message = f"Ollama reachable — runtime: {runtime_model}"
+
+            yield f"data: {json.dumps({'type': 'log', 'message': log_message}, default=str)}\n\n"
+            symbols_label = ", ".join(effective_request.symbols)
+            yield f"data: {json.dumps({'type': 'log', 'message': f'Fetching real-time price data for {symbols_label}...'}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 1/4: Ingesting queued articles and market context...'}, default=str)}\n\n"
+
+            task = asyncio.create_task(
+                pipeline.run(
+                    request=effective_request,
+                    db=db,
+                    config=config,
+                    prompt_overrides=prompt_overrides,
+                    article_ids=None,
+                    trigger_source="stream",
+                )
+            )
+            started_at = time.monotonic()
+            heartbeat_count = 0
+            while not task.done():
+                elapsed = int(time.monotonic() - started_at)
+                remaining = timeout_seconds - elapsed
+                if remaining <= 0:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    timeout_msg = f"Analysis timed out after {timeout_seconds}s"
+                    yield f"data: {json.dumps({'type': 'log', 'message': timeout_msg}, default=str)}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'message': timeout_msg})}\n\n"
+                    return
+
+                done, _ = await asyncio.wait({task}, timeout=min(20, remaining))
+                if not done:
+                    heartbeat_count += 1
+                    if heartbeat_count == 1:
+                        yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 2/4: Running symbol specialists...'}, default=str)}\n\n"
+                    elif heartbeat_count == 2:
+                        yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 3/4: Building signal and red-team review...'}, default=str)}\n\n"
+                    elif heartbeat_count % 3 == 0:
+                        yield f"data: {json.dumps({'type': 'log', 'message': f'Still analyzing ({elapsed}s elapsed)...'}, default=str)}\n\n"
+                    yield ": stage2-heartbeat\n\n"
+            response = task.result()
+            yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 4/4: Persisting results and snapshots...'}, default=str)}\n\n"
+
+            # ── Verbose diagnostics ─────────────────────────────────────────
+            # Articles that were ingested and passed Stage 0
+            model_inputs = response.model_inputs
+            if model_inputs and model_inputs.articles:
+                yield f"data: {json.dumps({'type': 'log', 'message': f'Ingested {response.posts_scraped} articles — showing {len(model_inputs.articles)} selected for analysis'}, default=str)}\n\n"
+                for art in model_inputs.articles:
+                    yield f"data: {json.dumps({'type': 'article', 'source': art.source or 'Unknown', 'title': art.title or '', 'description': '', 'keywords': []}, default=str)}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'log', 'message': f'Ingested {response.posts_scraped} articles'}, default=str)}\n\n"
+
+            # Per-symbol Stage 1 + Stage 2 diagnostic summary
+            response_dict = response.model_dump(mode="json")
+            stage2_details = ((response_dict.get("stage_metrics") or {}).get("stage2") or {}).get("details") or {}
+            posts_by_sym_counts = stage2_details.get("posts_by_symbol_counts") or {}
+            exposure_hints = stage2_details.get("exposure_hints_by_symbol") or {}
+            kw_by_sym = stage2_details.get("keyword_terms_by_symbol") or {}
+
+            for sym, score in (response_dict.get("sentiment_scores") or {}).items():
+                count = posts_by_sym_counts.get(sym)
+                hint = exposure_hints.get(sym, "")
+                terms = kw_by_sym.get(sym) or []
+                conf = round(float(score.get("confidence") or 0) * 100)
+                exposure = str(score.get("reasoning") or "").split(".")[0]  # first sentence
+                count_str = f"{count} matched articles" if count is not None else "article count unknown"
+                kw_str = f" | keywords: {', '.join(terms[:6])}" if terms else ""
+                hint_str = f" ({hint})" if hint else ""
+                yield f"data: {json.dumps({'type': 'log', 'message': f'{sym}: {count_str}{hint_str} → {conf}% confidence{kw_str}'}, default=str)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'log', 'message': 'Analysis complete'}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'result', 'data': response_dict}, default=str)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, default=str)}\n\n"
+            return
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, default=str)}\n\n"
+        finally:
+            if run_marked:
+                try:
+                    mark_analysis_completed(db, run_marker)
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-def _save_analysis_and_trades(
-    db: Session,
-    request_id: str,
-    response: AnalysisResponse,
-    quotes_by_symbol: Dict[str, Dict[str, Any]],
-    posts: Optional[List[Any]] = None,
-    prompt_overrides: Optional[Dict[str, str]] = None,
-    model_name: str = "",
-    extraction_model: str = "",
-    reasoning_model: str = "",
-    risk_profile: str = "moderate",
-    secret_trace: Optional[Dict[str, Any]] = None,
-    sentiment_results: Optional[Dict[str, Any]] = None,
-    per_symbol_counts: Optional[Dict[str, int]] = None,
-) -> None:
-    _counts = per_symbol_counts or (
-        _count_symbol_articles(posts, list(response.symbols_analyzed or []))
-        if posts else {}
-    )
-    _save_analysis_result(
-        db,
-        request_id,
-        response,
-        quotes_by_symbol,
-        posts=posts,
-        model_name=model_name,
-        prompt_overrides=prompt_overrides,
-        extraction_model=extraction_model,
-        reasoning_model=reasoning_model,
-        risk_profile=risk_profile,
-        secret_trace=secret_trace,
-        sentiment_results=sentiment_results,
-        per_symbol_counts=_counts,
-    )
+@router.post(
+    "/analyze",
+    response_model=AnalysisResponse,
+    summary="Run full sentiment analysis pipeline",
+    tags=["Analysis"]
+)
+async def analyze_market(
+    request: AnalysisRequest,
+    db: Session = Depends(get_db)
+):
+    services = _analysis_services(db)
+    config = services["config"]
+    pipeline: PipelineService = services["pipeline"]
+    effective_request = _apply_request_defaults(request, config)
+    timeout_seconds = _analysis_timeout_seconds(config)
+    SentimentEngine.configure_parallelism(int(getattr(config, "ollama_parallel_slots", 1) or 1))
+    run_marker = str(uuid.uuid4())
+    run_marked = False
+
+    try:
+        try:
+            mark_analysis_started(db, run_marker)
+            run_marked = True
+        except Exception:
+            run_marked = False
+        return await asyncio.wait_for(
+            pipeline.run(
+                request=effective_request,
+                db=db,
+                config=config,
+                prompt_overrides=config.symbol_prompt_overrides or {},
+                article_ids=None,
+                trigger_source="api",
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "error": "Analysis timed out",
+                "message": f"Analysis exceeded {timeout_seconds} seconds",
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "Analysis failed",
+                "message": str(exc),
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+    finally:
+        if run_marked:
+            try:
+                mark_analysis_completed(db, run_marker)
+            except Exception:
+                pass
 
 
 @router.get("/paper-trading/summary", tags=["Paper Trading"])

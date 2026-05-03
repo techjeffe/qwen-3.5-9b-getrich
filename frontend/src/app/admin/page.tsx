@@ -134,7 +134,8 @@ export default function AdminPage() {
 
     const trackedSet = useMemo(() => new Set(config.tracked_symbols), [config.tracked_symbols]);
     const enabledFeeds = useMemo(() => new Set(config.enabled_rss_feeds), [config.enabled_rss_feeds]);
-    const customSymbolSlots = Array.from({ length: config.max_custom_symbols }, (_, index) => config.custom_symbols[index] ?? "");
+    // Always show all saved custom symbols plus one empty slot for the next entry.
+    const customSymbolSlots = [...config.custom_symbols, ""];
     const customFeedSlots = Array.from({ length: config.max_custom_rss_feeds }, (_, index) => {
         const url = config.custom_rss_feeds[index] ?? "";
         return {
@@ -237,6 +238,7 @@ export default function AdminPage() {
             config.trail_on_window_expiry !== d.trail_on_window_expiry ||
             config.reentry_cooldown_minutes !== d.reentry_cooldown_minutes ||
             config.min_same_day_exit_edge_pct !== d.min_same_day_exit_edge_pct ||
+            config.vol_sizing_portfolio_cap_usd !== d.vol_sizing_portfolio_cap_usd ||
             config.paper_trade_amount !== d.paper_trade_amount ||
             config.entry_threshold !== d.entry_threshold ||
             config.stop_loss_pct !== d.stop_loss_pct ||
@@ -507,7 +509,7 @@ export default function AdminPage() {
             } else {
                 nextCustomSymbols.splice(index, 1);
             }
-            const filteredCustomSymbols = nextCustomSymbols.filter(Boolean).slice(0, current.max_custom_symbols);
+            const filteredCustomSymbols = nextCustomSymbols.filter(Boolean);
             if (previousValue && previousValue !== nextValue) {
                 delete nextAliases[previousValue];
             }

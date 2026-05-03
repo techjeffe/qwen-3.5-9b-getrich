@@ -35,6 +35,7 @@ class SignalService:
         stability_mode: str = "normal",
         entry_threshold_override: Optional[float] = None,
         price_context: Optional[Dict[str, Any]] = None,
+        signal_age_hours: float = 0.0,
     ) -> TradingSignal:
         """Generate a blue-team TradingSignal from sentiment results."""
         if not sentiment_results:
@@ -75,20 +76,25 @@ class SignalService:
             specialist_urgency = str(result.get('urgency', 'LOW')).upper()
             previous_action = str((previous_recommendations.get(sym) or {}).get("action", "") or "").upper().strip()
 
+            # Apply half-life decay: reduces effective signal strength as news ages.
+            # Fresh analysis (signal_age_hours=0) → decay_factor=1.0, no effect.
+            decay_factor = self._compute_decay_factor(sym, signal_age_hours)
+            effective_directional = directional * decay_factor if directional is not None else directional
+
             # Explicit null check — use `is not None` for numeric comparisons
-            if directional is not None and (
-                directional <= -entry_threshold or 
-                (previous_action == "SELL" and directional is not None and directional <= -keep_threshold)
+            if effective_directional is not None and (
+                effective_directional <= -entry_threshold or
+                (previous_action == "SELL" and effective_directional <= -keep_threshold)
             ):
                 action = "SELL"
-                urgency = specialist_urgency if specialist_signal == "SHORT" else ("HIGH" if abs(directional) > 0.7 else "MEDIUM")
+                urgency = specialist_urgency if specialist_signal == "SHORT" else ("HIGH" if abs(effective_directional) > 0.7 else "MEDIUM")
                 short_recommendations += 1
-            elif directional is not None and (
-                directional >= entry_threshold or 
-                (previous_action == "BUY" and directional is not None and directional >= keep_threshold)
+            elif effective_directional is not None and (
+                effective_directional >= entry_threshold or
+                (previous_action == "BUY" and effective_directional >= keep_threshold)
             ):
                 action = "BUY"
-                urgency = specialist_urgency if specialist_signal == "LONG" else ("HIGH" if directional > 0.7 else "MEDIUM")
+                urgency = specialist_urgency if specialist_signal == "LONG" else ("HIGH" if effective_directional > 0.7 else "MEDIUM")
                 long_recommendations += 1
             else:
                 action = ""
@@ -585,6 +591,23 @@ class SignalService:
             cap = 3
 
         return f"{min(raw, cap)}x"
+
+    def _compute_decay_factor(self, symbol: str, age_hours: float) -> float:
+        """
+        Return the decay multiplier for a signal that is `age_hours` old.
+
+        Uses per-symbol half-lives from logic_config signal_decay block.
+        At age=0 the factor is 1.0 (no decay); it approaches min_decay_factor asymptotically.
+        When signal_decay.enabled is False, always returns 1.0.
+        """
+        decay_cfg = self._L.get("signal_decay", {})
+        if not decay_cfg.get("enabled", True) or age_hours <= 0.0:
+            return 1.0
+        half_lives = decay_cfg.get("symbol_half_lives", {})
+        half_life = float(half_lives.get(str(symbol).upper(), decay_cfg.get("default_half_life_hours", 3.0)))
+        min_factor = float(decay_cfg.get("min_decay_factor", 0.10))
+        raw = 0.5 ** (age_hours / half_life)
+        return max(min_factor, raw)
 
     def _symbol_atr_pct(self, symbol: str, price_context: Optional[Dict[str, Any]]) -> float:
         if not price_context:

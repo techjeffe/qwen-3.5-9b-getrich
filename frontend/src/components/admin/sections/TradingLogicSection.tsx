@@ -152,6 +152,19 @@ export function TradingLogicSection({ config, setConfig }: TradingLogicSectionPr
                 </label>
 
                 <label className="block">
+                    <span className="text-xs text-slate-400">Portfolio Cap ($)</span>
+                    <p className="text-[11px] text-slate-600 mt-0.5">Maximum total open exposure across all symbols. Trades are scaled down to stay within this limit. Leave blank for no cap.</p>
+                    <input
+                        type="number"
+                        min={1} max={10000000} step={1}
+                        value={config.vol_sizing_portfolio_cap_usd ?? ""}
+                        placeholder="No cap"
+                        onChange={(e) => setConfig((c) => ({ ...c, vol_sizing_portfolio_cap_usd: e.target.value === "" ? null : Number(e.target.value) }))}
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
+                    />
+                </label>
+
+                <label className="block">
                     <span className="text-xs text-slate-400">Entry Threshold (directional score)</span>
                     <p className="text-[11px] text-slate-600 mt-0.5">Minimum directional score needed to open a trade (0.05–1.0). Default: {ld.entry_threshold}</p>
                     <input

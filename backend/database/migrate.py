@@ -70,6 +70,7 @@ def migrate():
 
             # ── app_config: nullable trading-logic override columns ─────────
             for column_name, column_type in [
+                ("vol_sizing_portfolio_cap_usd", "REAL"),
                 ("paper_trade_amount", "REAL"),
                 ("entry_threshold", "REAL"),
                 ("stop_loss_pct", "REAL"),
@@ -337,6 +338,7 @@ def migrate():
 
             # ── app_config: nullable trading-logic override columns ─────────
             for column_name, column_type in [
+                ("vol_sizing_portfolio_cap_usd", "FLOAT"),
                 ("paper_trade_amount", "FLOAT"),
                 ("entry_threshold", "FLOAT"),
                 ("stop_loss_pct", "FLOAT"),

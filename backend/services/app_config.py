@@ -42,7 +42,7 @@ DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
 VALID_REMOTE_SNAPSHOT_MODES = {"telegram", "signed_link", "email"}
 DEFAULT_ALPACA_EXECUTION_MODE = "off"
 VALID_ALPACA_EXECUTION_MODES = {"off", "paper", "live"}
-MAX_CUSTOM_SYMBOLS = 3
+MAX_CUSTOM_SYMBOLS = 50
 MAX_CUSTOM_RSS_FEEDS = 3
 MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
 DEFAULT_ESTIMATED_ANALYSIS_SECONDS = 82
@@ -796,6 +796,8 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         except (TypeError, ValueError):
             value = getattr(config, "remote_snapshot_max_recommendations", 4)
         config.remote_snapshot_max_recommendations = max(1, min(12, value))
+    if "vol_sizing_portfolio_cap_usd" in payload:
+        config.vol_sizing_portfolio_cap_usd = _normalize_trading_logic_float(payload.get("vol_sizing_portfolio_cap_usd"), 1.0, 10_000_000.0)
     if "paper_trade_amount" in payload:
         config.paper_trade_amount = _normalize_trading_logic_float(payload.get("paper_trade_amount"), 1.0, 100000.0)
     if "entry_threshold" in payload:
@@ -1031,6 +1033,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "remote_snapshot_include_closed_trades": bool(getattr(config, "remote_snapshot_include_closed_trades", False)),
         "remote_snapshot_max_recommendations": remote_snapshot_max_recommendations,
         # Trading logic overrides — null means "use JSON default"
+        "vol_sizing_portfolio_cap_usd": getattr(config, "vol_sizing_portfolio_cap_usd", None),
         "paper_trade_amount": getattr(config, "paper_trade_amount", None),
         "entry_threshold": getattr(config, "entry_threshold", None),
         "stop_loss_pct": getattr(config, "stop_loss_pct", None),

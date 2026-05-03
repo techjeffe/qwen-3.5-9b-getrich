@@ -172,9 +172,21 @@ class MaterialityService:
                 structure_changed = True
         return structure_changed
 
-    def _recommendations_by_underlying(self, signal: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _recommendations_by_underlying(self, signal: Optional[Any]) -> Dict[str, Dict[str, Any]]:
+        payload: Dict[str, Any] = {}
+        if signal is None:
+            return {}
+        if isinstance(signal, dict):
+            payload = signal
+        elif hasattr(signal, "model_dump"):
+            payload = signal.model_dump(mode="json")
+        else:
+            payload = {
+                "recommendations": list(getattr(signal, "recommendations", None) or []),
+            }
+
         recs: Dict[str, Dict[str, Any]] = {}
-        for rec in (signal.get("recommendations") if signal else []):
+        for rec in (payload.get("recommendations") or []):
             key = str(rec.get("underlying_symbol") or rec.get("symbol") or "").upper().strip()
             if key:
                 recs[key] = rec
@@ -243,15 +255,16 @@ class MaterialityService:
         self,
         posts: List[Any],
         symbols: List[str],
-        relevance_terms: Dict[str, List[str]],
+        relevance_terms: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, int]:
         """Count articles relevant to each symbol by keyword matching."""
         from services.sentiment.prompts import expand_proxy_terms_for_matching, normalize_text_for_matching
 
+        terms_by_symbol = relevance_terms or {}
         counts: Dict[str, int] = {}
         for symbol in symbols:
             sym_upper = symbol.upper()
-            terms_raw = relevance_terms.get(sym_upper)
+            terms_raw = terms_by_symbol.get(sym_upper)
             if not terms_raw:
                 counts[sym_upper] = len(posts)
                 continue

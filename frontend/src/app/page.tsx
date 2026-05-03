@@ -35,6 +35,9 @@ import {
 import {
     clamp,
     estimateRunTiming,
+    sanitizeTimingSamples,
+    appendTimingSample,
+    mergeTimingSamples,
     formatSignedScore,
     livePnl,
     paperPnlUsd,
@@ -106,6 +109,37 @@ function ReturnCell({ pct, label, sub }: { pct: number; label: string; sub?: str
     );
 }
 
+const RECENT_ANALYSIS_TIMES_KEY = "recentAnalysisTimes";
+const MAX_RECENT_ANALYSIS_TIMES = 12;
+
+function averageTimingSeconds(samples: number[], fallbackSeconds: number) {
+    const cleaned = sanitizeTimingSamples(samples, MAX_RECENT_ANALYSIS_TIMES);
+    if (cleaned.length === 0) return Math.max(15, Math.round(fallbackSeconds || 82));
+    return Math.max(15, Math.round(cleaned.reduce((sum, value) => sum + value, 0) / cleaned.length));
+}
+
+function loadRecentTimingSamples(): number[] {
+    if (typeof window === "undefined") return [];
+    try {
+        const raw = localStorage.getItem(RECENT_ANALYSIS_TIMES_KEY);
+        if (!raw) return [];
+        return sanitizeTimingSamples(JSON.parse(raw), MAX_RECENT_ANALYSIS_TIMES);
+    } catch {
+        return [];
+    }
+}
+
+function saveRecentTimingSamples(samples: number[]) {
+    if (typeof window === "undefined") return;
+    try {
+        localStorage.setItem(RECENT_ANALYSIS_TIMES_KEY, JSON.stringify(
+            sanitizeTimingSamples(samples, MAX_RECENT_ANALYSIS_TIMES),
+        ));
+    } catch {
+        // best effort only
+    }
+}
+
 // ─── Main Page ──────────────────────────────
 
 export default function Home() {
@@ -144,6 +178,10 @@ export default function Home() {
     const [restoringLastResult, setRestoringLastResult] = useState(true);
     const articleCounter = useRef(0);
     const autoRunStartedRef = useRef(false);
+    const runAttemptedRef = useRef(false);
+    const lastRunFailedRef = useRef(false);
+    const analysisStartedAtRef = useRef<number | null>(null);
+    const streamStartedAtRef = useRef<number | null>(null);
     const historySectionRef = useRef<HTMLDivElement | null>(null);
     const trackedSymbols = config.tracked_symbols.length > 0 ? config.tracked_symbols : DEFAULT_APP_CONFIG.tracked_symbols;
     const pricePanelSymbols = useMemo(() => {
@@ -165,32 +203,49 @@ export default function Home() {
             const response = await fetch("/api/config", { cache: "no-store" });
             if (!response.ok) return;
             const nextConfig = await response.json() as AppConfig;
-
-            const storedTimes = typeof window !== "undefined"
-                ? localStorage.getItem("recentAnalysisTimes")
-                : null;
-            if (storedTimes) {
-                const recentTimes = JSON.parse(storedTimes) as number[];
-                nextConfig.recent_analysis_seconds = recentTimes;
-                nextConfig.estimated_analysis_seconds = Math.ceil(recentTimes.reduce((a: number, b: number) => a + b, 0) / recentTimes.length);
+            const backendTimes = sanitizeTimingSamples(nextConfig.recent_analysis_seconds, MAX_RECENT_ANALYSIS_TIMES);
+            const localTimes = loadRecentTimingSamples();
+            const mergedTimes = backendTimes.length >= localTimes.length
+                ? backendTimes
+                : mergeTimingSamples(localTimes, backendTimes, MAX_RECENT_ANALYSIS_TIMES);
+            nextConfig.recent_analysis_seconds = mergedTimes;
+            nextConfig.estimated_analysis_seconds = averageTimingSeconds(
+                mergedTimes,
+                nextConfig.estimated_analysis_seconds || DEFAULT_APP_CONFIG.estimated_analysis_seconds,
+            );
+            if (mergedTimes.length > 0) {
+                saveRecentTimingSamples(mergedTimes);
             }
 
             setConfig(nextConfig);
             setTimeZone(nextConfig.display_timezone || "");
-            setCountdown(nextConfig.seconds_until_next_auto_run);
+            const configuredIntervalSeconds = Math.max(1, nextConfig.auto_run_interval_minutes * 60);
+            const nextCountdown = lastRunFailedRef.current
+                ? configuredIntervalSeconds
+                : nextConfig.seconds_until_next_auto_run;
+            countdownRef.current = nextCountdown;
+            setCountdown(nextCountdown);
             setConfigLoaded(true);
         } catch { }
     }, [setTimeZone]);
 
     const handleAnalyze = useCallback(async () => {
         if (isAnalyzingRef.current) return;
+        const runStartedAt = Date.now();
+        runAttemptedRef.current = true;
+        autoRunStartedRef.current = true;
+        lastRunFailedRef.current = false;
+        analysisStartedAtRef.current = runStartedAt;
+        streamStartedAtRef.current = null;
         setIsAnalyzing(true);
         setError(null);
         setFeed([]);
         setExpandedIdxs(new Set());
         setResult(null);
-        setCountdown(config.auto_run_interval_minutes * 60);
-        setAnalysisStartedAt(Date.now());
+        const restartSeconds = Math.max(1, config.auto_run_interval_minutes * 60);
+        countdownRef.current = restartSeconds;
+        setCountdown(restartSeconds);
+        setAnalysisStartedAt(runStartedAt);
         setStreamStartedAt(null);
         setElapsedSeconds(0);
         setLatestLogMessage("Connecting to backend...");
@@ -217,6 +272,7 @@ export default function Home() {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
+            let shouldStop = false;
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -227,8 +283,9 @@ export default function Home() {
                     if (!line.startsWith("data: ")) continue;
                     try {
                         const event = JSON.parse(line.slice(6));
-                        if (!streamStartedAt) {
-                            setStreamStartedAt(Date.now());
+                        if (!streamStartedAtRef.current) {
+                            streamStartedAtRef.current = Date.now();
+                            setStreamStartedAt(streamStartedAtRef.current);
                         }
                         if (event.type === "log") {
                             setLatestLogMessage(event.message);
@@ -237,38 +294,62 @@ export default function Home() {
                             const idx = articleCounter.current++;
                             setFeed((p) => [...p, { kind: "article", idx, source: event.source, title: event.title, description: event.description ?? "", keywords: event.keywords ?? [] }]);
                         } else if (event.type === "result") {
+                            setLatestLogMessage("Analysis complete");
                             setResult(event.data);
                             setShowCompletedProgressUntil(Date.now() + 1200);
-                            if (analysisStartedAt) {
-                                const completionSeconds = Math.round((Date.now() - analysisStartedAt) / 1000);
-                                const storedTimes = localStorage.getItem("recentAnalysisTimes");
-                                const recentTimes = storedTimes ? JSON.parse(storedTimes) : [];
-                                const updatedTimes = [...recentTimes, completionSeconds].slice(-10);
-                                localStorage.setItem("recentAnalysisTimes", JSON.stringify(updatedTimes));
-
-                                const avgSeconds = Math.ceil(updatedTimes.reduce((a, b) => a + b, 0) / updatedTimes.length);
-                                setConfig((prev) => ({
+                            const startedAt = analysisStartedAtRef.current ?? runStartedAt;
+                            const completionSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+                            setConfig((prev) => {
+                                const updatedTimes = appendTimingSample(
+                                    prev.recent_analysis_seconds,
+                                    completionSeconds,
+                                    MAX_RECENT_ANALYSIS_TIMES,
+                                );
+                                saveRecentTimingSamples(updatedTimes);
+                                return {
                                     ...prev,
                                     recent_analysis_seconds: updatedTimes,
-                                    estimated_analysis_seconds: avgSeconds,
-                                }));
-                            }
+                                    estimated_analysis_seconds: averageTimingSeconds(
+                                        updatedTimes,
+                                        prev.estimated_analysis_seconds || DEFAULT_APP_CONFIG.estimated_analysis_seconds,
+                                    ),
+                                };
+                            });
                             void fetchPnl();
                         } else if (event.type === "error") {
+                            lastRunFailedRef.current = true;
+                            setLatestLogMessage("Analysis failed");
                             setError(event.message);
+                        } else if (event.type === "done") {
+                            shouldStop = true;
+                            break;
                         }
                     } catch { /* malformed */ }
                 }
+                if (shouldStop) {
+                    try {
+                        await reader.cancel();
+                    } catch { }
+                    break;
+                }
             }
         } catch (err: any) {
+            lastRunFailedRef.current = true;
             setError(err.message || "Failed to connect to backend");
         } finally {
+            if (lastRunFailedRef.current) {
+                const retryDelaySeconds = config.auto_run_interval_minutes * 60;
+                countdownRef.current = retryDelaySeconds;
+                setCountdown(retryDelaySeconds);
+            }
             setIsAnalyzing(false);
             setAnalysisStartedAt(null);
             setStreamStartedAt(null);
+            analysisStartedAtRef.current = null;
+            streamStartedAtRef.current = null;
             void fetchConfig();
         }
-    }, [config.lookback_days, config.max_posts, config.auto_run_interval_minutes, trackedSymbols, fetchConfig, streamStartedAt]);
+    }, [config.lookback_days, config.max_posts, config.auto_run_interval_minutes, trackedSymbols, fetchConfig]);
 
     const fetchPnl = useCallback(async () => {
         try {
@@ -477,7 +558,7 @@ export default function Home() {
     }, [fetchConfig]);
 
     useEffect(() => {
-        if (!configLoaded || restoringLastResult || isAnalyzing || autoRunStartedRef.current) return;
+        if (!configLoaded || restoringLastResult || isAnalyzing || autoRunStartedRef.current || runAttemptedRef.current) return;
         if (config.auto_run_enabled && config.can_auto_run_now && !result && feed.length === 0) {
             autoRunStartedRef.current = true;
             void handleAnalyze();
@@ -553,9 +634,25 @@ export default function Home() {
         });
     };
 
-    const isOllamaError = error?.toLowerCase().includes("ollama");
+    const errorText = String(error || "");
+    const errorLower = errorText.toLowerCase();
+    const isModelNotFoundError = errorLower.includes("model not found");
+    const isOllamaError = isModelNotFoundError
+        || errorLower.includes("ollama api")
+        || errorLower.includes("cannot connect to ollama")
+        || errorLower.includes("is ollama running")
+        || errorLower.includes("ollama endpoint not found");
     const activeModelLabel = ollamaStatus?.active_model || ollamaStatus?.configured_model || "No model detected";
-    const ollamaCommandModel = ollamaStatus?.active_model || ollamaStatus?.configured_model || "the-first-model-you-served";
+    const configuredPipelineModel = config.reasoning_model?.trim() || config.extraction_model?.trim() || "";
+    const missingModelMatch = errorText.match(/model not found:\s*`?([^`\s]+)`?/i);
+    const missingModelName = missingModelMatch?.[1]?.trim() || "";
+    const ollamaCommandModel = missingModelName || configuredPipelineModel || ollamaStatus?.active_model || ollamaStatus?.configured_model || "the-first-model-you-served";
+    const ollamaHintCommand = isModelNotFoundError ? `ollama pull ${ollamaCommandModel}` : `ollama run ${ollamaCommandModel}`;
+    const errorBannerTitle = isModelNotFoundError
+        ? "Model not available in Ollama"
+        : isOllamaError
+            ? "Ollama runtime issue"
+            : "Error";
     const feedCountLabel = `${config.enabled_rss_feeds.length || DEFAULT_APP_CONFIG.enabled_rss_feeds.length} RSS sources`;
     const currentRequestTrades = (pnlSummary?.trades ?? []).filter((trade) => trade.request_id === result?.request_id);
     const selectedTrade = selectedRecommendation
@@ -737,7 +834,7 @@ export default function Home() {
                                     {ollamaStatus?.reachable
                                         ? (config.extraction_model?.trim() && config.reasoning_model?.trim()
                                             ? `${config.extraction_model} → ${config.reasoning_model}`
-                                            : `Using served model: ${config.extraction_model?.trim() || activeModelLabel}`)
+                                            : `Pipeline model: ${configuredPipelineModel || activeModelLabel}`)
                                         : "The dashboard will use whichever local model Ollama is currently serving."}
                                 </p>
                             </div>
@@ -825,11 +922,11 @@ export default function Home() {
                                         : "bg-red-950/60 border-red-700/50 text-red-300"}`}>
                                     <WifiOff size={16} className="mt-0.5 shrink-0" />
                                     <div>
-                                        <p className="font-semibold text-sm">{isOllamaError ? "Ollama not reachable" : "Error"}</p>
+                                        <p className="font-semibold text-sm">{errorBannerTitle}</p>
                                         <p className="text-sm mt-0.5 opacity-80">{error}</p>
                                         {isOllamaError && (
                                             <code className="text-xs mt-2 block bg-black/40 px-3 py-1.5 rounded font-mono">
-                                                ollama run {ollamaCommandModel}
+                                                {ollamaHintCommand}
                                             </code>
                                         )}
                                     </div>

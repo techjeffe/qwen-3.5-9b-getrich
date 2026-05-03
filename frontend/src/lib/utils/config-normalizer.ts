@@ -44,6 +44,7 @@ export type AppConfig = {
     remote_snapshot_send_on_position_change: boolean;
     remote_snapshot_include_closed_trades: boolean;
     remote_snapshot_max_recommendations: number;
+    vol_sizing_portfolio_cap_usd: number | null;
     paper_trade_amount: number | null;
     entry_threshold: number | null;
     stop_loss_pct: number | null;
@@ -102,7 +103,7 @@ export const EMPTY_CONFIG: AppConfig = {
     tracked_symbols: ["USO", "IBIT", "QQQ", "SPY"],
     custom_symbols: [],
     default_symbols: ["USO", "IBIT", "QQQ", "SPY"],
-    max_custom_symbols: 3,
+    max_custom_symbols: 50,
     max_posts: 50,
     lookback_days: 14,
     symbol_prompt_overrides: {},
@@ -127,6 +128,7 @@ export const EMPTY_CONFIG: AppConfig = {
     remote_snapshot_send_on_position_change: true,
     remote_snapshot_include_closed_trades: false,
     remote_snapshot_max_recommendations: 4,
+    vol_sizing_portfolio_cap_usd: null,
     paper_trade_amount: null,
     entry_threshold: null,
     stop_loss_pct: null,
@@ -186,6 +188,7 @@ export const BASIC_MODE_DEFAULTS: Partial<AppConfig> = {
     trail_on_window_expiry: true,
     reentry_cooldown_minutes: null,
     min_same_day_exit_edge_pct: null,
+    vol_sizing_portfolio_cap_usd: null,
     paper_trade_amount: null,
     entry_threshold: null,
     stop_loss_pct: null,

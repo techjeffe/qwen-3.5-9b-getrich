@@ -25,11 +25,41 @@ export async function POST(request: NextRequest) {
         );
     }
 
-    return new Response(backendResponse.body, {
+    const encoder = new TextEncoder();
+    const reader = backendResponse.body.getReader();
+    const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+            controller.enqueue(
+                encoder.encode(
+                    `data: ${JSON.stringify({ type: "log", message: "Connected to backend stream..." })}\n\n`
+                )
+            );
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value) controller.enqueue(value);
+                }
+            } catch (error) {
+                const message = error instanceof Error ? error.message : "Stream interrupted";
+                controller.enqueue(
+                    encoder.encode(
+                        `data: ${JSON.stringify({ type: "error", message })}\n\n`
+                    )
+                );
+            } finally {
+                reader.releaseLock();
+                controller.close();
+            }
+        },
+    });
+
+    return new Response(stream, {
         headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     });
 }

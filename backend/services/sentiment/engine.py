@@ -210,8 +210,10 @@ class SentimentEngine:
         self._cache = {}
     
     def clear_cache(self):
-        """Clear all cached analysis results."""
+        """Clear all cached analysis and LLM-generated keyword results."""
         self._cache = {}
+        _keyword_cache.clear()
+        _keyword_trace_cache.clear()
     
     async def analyze(
         self,
@@ -450,15 +452,27 @@ class SentimentEngine:
             base_conf -= _ss["confidence_unconfirmed_penalty"]
         confidence_cap = float((_ss.get("exposure_confidence_caps") or {}).get(exposure_type, _ss["confidence_max"]))
         base_conf = min(base_conf, confidence_cap)
-        confidence = round(max(_ss["confidence_min"], min(_ss["confidence_max"], base_conf)), 3)
+        # Don't apply the confidence floor for UNRELATED exposure — "no coverage
+        # found" should score near zero so the UI can distinguish it from a genuine
+        # weak signal. The floor only makes sense when there IS relevant coverage.
+        min_conf = _ss["confidence_min"] if exposure_type != "UNRELATED" else 0.0
+        confidence = round(max(min_conf, min(_ss["confidence_max"], base_conf)), 3)
 
         # ── Signal type: rule-based from scores and direction ─────────────────
         _min_mag = _ss["directional_score_min_magnitude"]
         # bluster_short_threshold is intentionally more negative than the old -0.35
         # to require stronger bluster before auto-triggering SHORT without policy backing
+        # Pure-rhetoric bearish overrides should only fire when the symbol has a
+        # credible, non-broad transmission path. Otherwise broad or unrelated
+        # headlines make the whole board look falsely bearish.
+        allow_bluster_only_short = (
+            relevant
+            and exposure_type in {"DIRECT", "INDIRECT"}
+            and direction != "bullish"
+        )
         if (bluster_score < _ss["bluster_short_threshold"]
                 and policy_score < _ss["policy_signal_threshold"]
-                and direction != "bearish"):
+                and allow_bluster_only_short):
             signal_type = "SHORT"
         elif policy_score >= _ss["policy_signal_threshold"] and relevant:
             if direction == "bullish" and confidence >= _ss["direction_confidence_min"]:
@@ -819,7 +833,7 @@ class SentimentEngine:
                 prompt,
                 model_override=model,
                 force_json=True,
-                max_tokens=512,
+                max_tokens=768,
                 response_schema=build_keyword_response_schema(),
             )
             raw_text = self._strip_thinking(raw.get("response", ""))
@@ -830,7 +844,7 @@ class SentimentEngine:
                 data.get("terms") or data.get("keywords")
                 or data.get("proxy_terms") or []
             )
-            terms = [str(t).lower().strip() for t in raw_terms if t][:30]
+            terms = [str(t).lower().strip() for t in raw_terms if t][:50]
 
             if terms:
                 _keyword_cache[sym] = terms
@@ -852,7 +866,9 @@ class SentimentEngine:
         except Exception as exc:
             print(f"Stage 1: keyword generation failed for {sym} ({exc}) — using ticker name as fallback")
 
-        fallback = [sym.lower()]
+        # Fallback: use the ticker in both common forms plus a handful of generic
+        # equity-news terms so at least broad macro articles can be matched.
+        fallback = [sym.lower(), sym.upper(), "earnings", "revenue", "guidance", "analyst"]
         _keyword_cache[sym] = fallback
         _keyword_trace_cache[sym] = {
             "symbol": sym,
@@ -909,18 +925,21 @@ class SentimentEngine:
             f" | using {'keyword matches' if keyword_relevant else 'all articles (no keyword hits)'}"
         )
 
-        # Derive per-symbol exposure quality: what fraction of filtered articles
-        # directly matched *this* symbol's own proxy terms (vs being pulled in by
-        # another symbol's terms).  Passed to Stage 2 so specialists can calibrate
-        # their exposure_type and confidence when the match is weak.
+        # Build per-symbol article subsets and exposure-quality hints in one pass.
+        # posts_by_symbol[sym] contains only articles that matched sym's own proxy
+        # terms — a much tighter pool than the global union used previously.
+        # Stage 2 passes this subset to each specialist instead of the shared pool,
+        # so NVDA only analyses articles about chips/AI/export bans, not SPY macro.
         exposure_hints_by_symbol: Dict[str, str] = {}
+        posts_by_symbol: Dict[str, List[Any]] = {}
         for sym, terms in proxy_terms_by_symbol.items():
             if not terms:
                 exposure_hints_by_symbol[sym] = "BROAD"
+                posts_by_symbol[sym] = []
                 continue
             sym_expanded = expand_proxy_terms_for_matching(terms)
-            sym_matches = sum(
-                1 for post in filtered
+            sym_posts = [
+                post for post in filtered
                 if any(
                     t in normalize_text_for_matching(
                         f"{getattr(post, 'title', '') or ''} "
@@ -928,8 +947,9 @@ class SentimentEngine:
                     )
                     for t in sym_expanded
                 )
-            )
-            ratio = sym_matches / max(1, len(filtered))
+            ]
+            posts_by_symbol[sym] = sym_posts
+            ratio = len(sym_posts) / max(1, len(filtered))
             if ratio >= 0.5:
                 exposure_hints_by_symbol[sym] = "DIRECT"
             elif ratio >= 0.15:
@@ -937,8 +957,15 @@ class SentimentEngine:
             else:
                 exposure_hints_by_symbol[sym] = "BROAD"
 
+        per_sym_summary = " | ".join(
+            f"{sym}: {len(posts_by_symbol.get(sym, []))} articles ({exposure_hints_by_symbol.get(sym, '?')})"
+            for sym in sorted(proxy_terms_by_symbol.keys())
+        )
+        print(f"Stage 1 per-symbol pools: {per_sym_summary}")
+
         return {
             "filtered_posts": filtered,
+            "posts_by_symbol": posts_by_symbol,
             "proxy_terms_by_symbol": proxy_terms_by_symbol,
             "exposure_hints_by_symbol": exposure_hints_by_symbol,
             "keyword_generation_trace_by_symbol": {
@@ -993,6 +1020,7 @@ class SentimentEngine:
             payload["keep_alive"] = "10m"
 
         start_time = time.time()
+        response = None
 
         try:
             response = self.session.post(
@@ -1011,6 +1039,27 @@ class SentimentEngine:
             raise Exception("Ollama API timeout")
         except requests.exceptions.ConnectionError:
             raise Exception("Cannot connect to Ollama. Is it running?")
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            body_text = ""
+            if response is not None:
+                try:
+                    body_payload = response.json()
+                    body_text = str(body_payload.get("error") or body_payload)
+                except Exception:
+                    body_text = str(getattr(response, "text", "") or "")
+            detail = body_text.strip() or str(e)
+            detail_lower = detail.lower()
+            if status_code == 404 and "model" in detail_lower:
+                raise Exception(
+                    f"Model not found: `{model}`. Pull it with: ollama pull {model}"
+                )
+            if status_code == 404:
+                raise Exception(
+                    f"Ollama endpoint not found at {self.api_url}. "
+                    "Verify OLLAMA_URL is correct (expected base like http://localhost:11434/api/generate)."
+                )
+            raise Exception(f"Ollama API HTTP {status_code}: {detail}")
         except json.JSONDecodeError as e:
             raise Exception(f"Invalid JSON response from Ollama: {e}")
         except Exception as e:
@@ -1211,9 +1260,17 @@ class SentimentEngine:
         }.get(direction, "Neutral")
 
         if exposure_type == "UNRELATED" or signal_type == "HOLD" and policy_score < 0.05:
+            _generic_fallback = "no direct catalyst found in current news"
+            _mech_lower = mechanism.lower() if mechanism else ""
+            _skip_mechanism = not mechanism or _mech_lower in (
+                "no direct price mechanism.", "no direct price mechanism", "none", ""
+            )
+            mechanism_note = (
+                f" {mechanism.rstrip('.')}." if not _skip_mechanism else f" {_generic_fallback.capitalize()}."
+            )
             return (
                 f"{exposure_type.title()} exposure to {symbol or 'this symbol'} — "
-                f"{event_type}, {confirmed_label}. No direct price mechanism in the current news. "
+                f"{event_type}, {confirmed_label}.{mechanism_note} "
                 f"Signal: {signal_type}. policy={policy_score:.2f} bluster={bluster_score:+.2f} "
                 f"confidence={confidence:.0%}."
             )

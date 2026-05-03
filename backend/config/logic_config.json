@@ -3,6 +3,17 @@
 
   "paper_trade_amount": 100.0,
 
+  "vol_sizing": {
+    "_comment": "Volatility-normalized sizing: size = (target_daily_vol_pct/100 × base_amount) / (ATR_14d_pct/100), scaled by conviction. Applies to paper trades and Alpaca notional.",
+    "enabled": true,
+    "target_daily_vol_pct": 1.0,
+    "conviction_scalars": {"HIGH": 1.5, "MEDIUM": 1.0, "LOW": 0.5},
+    "min_size_multiple": 0.25,
+    "max_size_multiple": 5.0,
+    "_comment_cap": "portfolio_cap_usd: maximum total open exposure across all symbols. null = no cap. When set, individual trade sizes are scaled down to fit within the remaining capacity.",
+    "portfolio_cap_usd": null
+  },
+
   "entry_thresholds": {
     "normal": 0.42,
     "closed_market": 0.42,
@@ -108,6 +119,20 @@
       "MEDIUM": 2.5,
       "LOW":    1.8
     }
+  },
+
+  "signal_decay": {
+    "_comment": "Exponential decay on directional_score based on hours since previous analysis. decay_factor = max(min_decay_factor, 0.5^(age/half_life)). Prevents stale news from sustaining positions.",
+    "enabled": true,
+    "default_half_life_hours": 3.0,
+    "symbol_half_lives": {
+      "SPY": 2.0,
+      "QQQ": 2.0,
+      "USO": 4.0,
+      "BITO": 6.0,
+      "IBIT": 6.0
+    },
+    "min_decay_factor": 0.10
   },
 
   "conviction": {

@@ -9,6 +9,7 @@ execution variants (SBIT, SQQQ, SPXS, SCO, etc.).
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -193,15 +194,56 @@ class MarketDataService:
             "rss": {"status": "replaced_by_db_queue", "feeds": [], "total_count": len(usable_posts), "error": None},
         }
 
+        used_snapshot_fallback = False
+        fallback_request_id: Optional[str] = None
+        if not usable_posts and self._should_reuse_snapshot_articles(trigger_source=trigger_source, article_ids=article_ids):
+            fallback_posts, fallback_request_id = self._load_latest_snapshot_posts(
+                db=db,
+                max_posts=int(request.max_posts or getattr(config, "max_posts", 50) or 50),
+            )
+            if fallback_posts:
+                usable_posts = fallback_posts
+                used_snapshot_fallback = True
+                trace.update({
+                    "source": "analysis_snapshot_fallback",
+                    "usable_article_ids": [],
+                    "total_items": len(usable_posts),
+                    "fallback_snapshot_request_id": fallback_request_id,
+                    "fallback_articles": [self._post_trace_summary(post) for post in usable_posts],
+                })
+                trace["queue"] = {
+                    **dict(trace.get("queue") or {}),
+                    "status": "empty_fallback_snapshot",
+                    "usable_count": len(usable_posts),
+                    "fallback_snapshot_request_id": fallback_request_id,
+                }
+                record_data_pull(
+                    status="ok",
+                    source="analysis_ingestion_snapshot_fallback",
+                    summary=f"Reused {len(usable_posts)} articles from latest saved snapshot",
+                    details={
+                        "trigger_source": trigger_source,
+                        "snapshot_request_id": fallback_request_id,
+                        "request_max_posts": request.max_posts,
+                    },
+                    error=None,
+                )
+
         record_data_pull(
             status="ok",
             source="analysis_ingestion_queue",
             summary=(
-                f"Loaded {len(usable_posts)} usable pending articles from the DB queue"
-                + (f"; skipped {len(skipped_empty_ids)} empty items" if skipped_empty_ids else "")
+                f"Queue empty; reused {len(usable_posts)} articles from latest saved snapshot"
+                if used_snapshot_fallback
+                else (
+                    f"Loaded {len(usable_posts)} usable pending articles from the DB queue"
+                    + (f"; skipped {len(skipped_empty_ids)} empty items" if skipped_empty_ids else "")
+                )
             ),
             details={
                 "trigger_source": trigger_source,
+                "source": trace.get("source"),
+                "fallback_snapshot_request_id": fallback_request_id,
                 "selected_article_ids": selected_ids,
                 "usable_article_ids": trace["usable_article_ids"],
                 "skipped_empty_article_ids": skipped_empty_ids,
@@ -214,6 +256,69 @@ class MarketDataService:
         return usable_posts, trace
 
     # ── Helpers (private) ───────────────────────────────────────────────
+
+    def _should_reuse_snapshot_articles(
+        self,
+        *,
+        trigger_source: str,
+        article_ids: Optional[List[int]],
+    ) -> bool:
+        """Only manual runs should reuse snapshot articles when the queue is empty."""
+        if article_ids:
+            return False
+        return str(trigger_source or "").lower() in {"api", "stream", "manual"}
+
+    def _load_latest_snapshot_posts(
+        self,
+        *,
+        db: Session,
+        max_posts: int,
+    ) -> Tuple[List[Any], Optional[str]]:
+        from database.models import AnalysisResult
+
+        latest_runs = (
+            db.query(AnalysisResult)
+            .order_by(AnalysisResult.timestamp.desc())
+            .limit(20)
+            .all()
+        )
+        parser_keywords = RSSFeedParser.KEYWORDS
+
+        for run in latest_runs:
+            metadata = run.run_metadata or {}
+            snapshot = metadata.get("dataset_snapshot") or {}
+            dataset = snapshot.get("dataset") or {}
+            articles = list(dataset.get("articles") or snapshot.get("articles") or [])
+            if not articles:
+                continue
+
+            posts: List[Any] = []
+            for article in articles[:max(1, int(max_posts or 1))]:
+                title = str(article.get("title") or "")
+                summary = str(article.get("summary") or "")
+                content = str(article.get("content") or "")
+                blob = " ".join([title, summary, content]).lower()
+                keywords = [keyword for keyword in parser_keywords if keyword in blob][:8]
+                post = SimpleNamespace(
+                    id=None,
+                    source=str(article.get("source") or "saved_snapshot"),
+                    feed_name=str(article.get("source") or "saved_snapshot"),
+                    author=None,
+                    title=title,
+                    summary=summary,
+                    content=content or summary or title,
+                    keywords=keywords,
+                    published_date=None,
+                    discovered_at=None,
+                    url=str(article.get("url") or ""),
+                    fast_lane_triggered=False,
+                )
+                if self._post_has_analysis_text(post):
+                    posts.append(post)
+            if posts:
+                return posts, str(getattr(run, "request_id", "") or "")
+
+        return [], None
 
     def _post_has_analysis_text(self, post: Any) -> bool:
         return any(

@@ -355,6 +355,7 @@ class AppConfig(Base):
     remote_snapshot_max_recommendations = Column(Integer, nullable=False, default=4)
 
     # Trading logic overrides — null means "use logic_config.json default"
+    vol_sizing_portfolio_cap_usd = Column(Float, nullable=True, default=None)
     paper_trade_amount = Column(Float, nullable=True, default=None)
     entry_threshold = Column(Float, nullable=True, default=None)
     stop_loss_pct = Column(Float, nullable=True, default=None)

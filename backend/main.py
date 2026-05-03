@@ -25,6 +25,7 @@ from services.data_ingestion.worker import run_ingestion_cycle
 from services.data_ingestion.yfinance_client import PriceClient
 from services.ollama import get_ollama_status
 from services.runtime_health import get_runtime_snapshot, record_data_pull, record_request
+from services.analysis.cache_service import get_price_cache_service
 
 if sys.platform == "win32":
     try:
@@ -184,6 +185,8 @@ async def lifespan(app: FastAPI):
 
     init_db()
     print("Database initialized")
+    get_price_cache_service()
+    print("Price cache service initialized")
 
     try:
         from services.alpaca_broker import is_alpaca_configured, reconcile_on_startup

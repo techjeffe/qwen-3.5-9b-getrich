@@ -59,7 +59,10 @@ export default function SignalHero({
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         {recommendations.map((rec, idx) => {
                             const underlying = rec.underlying_symbol || rec.symbol;
+                            const executionSymbol = rec.symbol || underlying;
+                            const isProxy = executionSymbol !== underlying;
                             const isShort = rec.thesis === "SHORT" || rec.action === "SELL";
+                            const thesisLabel = rec.thesis || (isShort ? "SHORT" : "LONG");
                             return (
                                 <button
                                     key={idx}
@@ -72,10 +75,20 @@ export default function SignalHero({
                                     }`}
                                 >
                                     <div className="flex items-center justify-between mb-2">
-                                        <span className="text-lg font-bold text-white">{underlying}</span>
+                                        <div>
+                                            <span className="text-lg font-bold text-white">{executionSymbol}</span>
+                                            {isProxy && (
+                                                <p className="text-[11px] text-slate-500">Expresses a {thesisLabel} view on {underlying}</p>
+                                            )}
+                                        </div>
                                         <RecommendationBadge action={rec.action} />
                                     </div>
-                                    <p className="text-xs text-slate-400">{rec.leverage}</p>
+                                    <div className="flex items-center gap-2 text-xs">
+                                        <span className="text-slate-400">{rec.leverage}</span>
+                                        <span className={`font-bold ${isShort ? "text-red-400" : "text-emerald-400"}`}>
+                                            {thesisLabel}
+                                        </span>
+                                    </div>
                                 </button>
                             );
                         })}

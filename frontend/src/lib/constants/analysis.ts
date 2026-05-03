@@ -8,7 +8,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     tracked_symbols: ["USO", "IBIT", "QQQ", "SPY"],
     custom_symbols: [],
     default_symbols: ["USO", "IBIT", "QQQ", "SPY"],
-    max_custom_symbols: 3,
+    max_custom_symbols: 50,
     max_posts: 50,
     lookback_days: 14,
     symbol_prompt_overrides: {},
