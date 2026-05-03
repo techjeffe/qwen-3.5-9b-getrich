@@ -15,6 +15,7 @@ Commands:
 """
 
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import requests
@@ -44,6 +45,12 @@ def _send_generic_error(token: str, chat_id: str, action: str) -> None:
     _send(token, chat_id, f"{action} failed. Check backend logs for details.")
 
 
+def _set_remote_control_banner(config, message: str) -> None:
+    config.telegram_remote_control_banner_active = True
+    config.telegram_remote_control_banner_message = str(message or "").strip()
+    config.telegram_remote_control_banner_updated_at = datetime.now(timezone.utc)
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def _handle_status(token: str, chat_id: str) -> None:
@@ -71,10 +78,15 @@ def _handle_stop(token: str, chat_id: str) -> None:
         if current == "off":
             _send(token, chat_id, "Trading is already stopped.")
             return
+        config = update_app_config(db, {"alpaca_execution_mode": "off"})
         # Persist previous mode so /start can restore it
         config.alpaca_pre_stop_mode = current
+        _set_remote_control_banner(
+            config,
+            f"Remote Telegram control stopped trading. Previous mode {current.upper()} was saved for later resume.",
+        )
+        db.add(config)
         db.commit()
-        update_app_config(db, {"alpaca_execution_mode": "off"})
         _send(
             token, chat_id,
             f"Trading stopped. Previous mode (<b>{current.upper()}</b>) saved.\n"
@@ -107,10 +119,14 @@ def _handle_start(token: str, chat_id: str) -> None:
                 "Use the admin UI to set paper or live mode.",
             )
             return
-        update_app_config(db, {"alpaca_execution_mode": resume_mode})
+        config = update_app_config(db, {"alpaca_execution_mode": resume_mode})
         # Clear saved mode now that it's been consumed
-        db.refresh(config)
         config.alpaca_pre_stop_mode = None
+        _set_remote_control_banner(
+            config,
+            f"Remote Telegram control resumed trading in {resume_mode.upper()} mode.",
+        )
+        db.add(config)
         db.commit()
         _send(token, chat_id, f"Trading resumed in <b>{resume_mode.upper()}</b> mode.")
         print(f"[telegram-bot] /start — execution mode restored to {resume_mode}")
@@ -124,20 +140,21 @@ def _handle_start(token: str, chat_id: str) -> None:
 
 # ── Update dispatcher ─────────────────────────────────────────────────────────
 
-def _dispatch(update: dict, token: str, authorized_chat_id: str, authorized_user_id: str) -> None:
+def _dispatch(update: dict, token: str, authorized_chat_id: str) -> None:
     message = update.get("message")
     if not message:
         return
 
     chat_id = str(message.get("chat", {}).get("id", ""))
     chat_type = str(message.get("chat", {}).get("type", "")).strip().lower()
-    sender_id = str(message.get("from", {}).get("id", ""))
     text = str(message.get("text") or "").strip()
 
-    # Security gate — only one operator in one private chat may control trading.
+    # Security gate — only one private chat may control trading.
+    # In private chats, chat_id == user_id (same number), so verifying
+    # the chat is private and chat_id matches is sufficient.
     if chat_type != "private":
         return
-    if chat_id != authorized_chat_id or sender_id != authorized_user_id:
+    if chat_id != authorized_chat_id:
         return
 
     # Parse command, stripping optional @BotName suffix
@@ -190,14 +207,15 @@ def initialize_offset(token: str) -> int:
     return next_offset
 
 
-def verify_remote_control(token: str, chat_id: str, authorized_user_id: str) -> Dict[str, Any]:
-    """Validate bot token, private chat targeting, and operator binding assumptions."""
+def verify_remote_control(token: str, chat_id: str) -> Dict[str, Any]:
+    """Validate bot token and private chat targeting.
+    
+    In private Telegram chats, chat_id == user_id (same number),
+    so we only need to verify the chat is private and the chat_id is correct.
+    """
     normalized_chat_id = str(chat_id or "").strip()
-    normalized_user_id = str(authorized_user_id or "").strip()
     if not normalized_chat_id.isdigit():
         raise ValueError("chat_id must be a positive numeric Telegram private chat ID")
-    if not normalized_user_id.isdigit():
-        raise ValueError("authorized_user_id must be a positive numeric Telegram user ID")
 
     me_payload = _api(token, "getMe")
     chat_payload = _api(token, "getChat", chat_id=normalized_chat_id)
@@ -210,24 +228,22 @@ def verify_remote_control(token: str, chat_id: str, authorized_user_id: str) -> 
 
     is_private_chat = chat_type == "private"
     chat_matches = resolved_chat_id == normalized_chat_id
-    user_matches_private_chat = normalized_chat_id == normalized_user_id
 
     return {
-        "ok": bool(bot_ok and is_private_chat and chat_matches and user_matches_private_chat),
+        "ok": bool(bot_ok and is_private_chat and chat_matches),
         "bot_username": str(me.get("username") or "").strip() if isinstance(me, dict) else "",
         "chat_type": chat_type,
         "chat_id_matches": chat_matches,
         "private_chat_required": is_private_chat,
-        "authorized_user_matches_chat": user_matches_private_chat,
         "message": (
             "Telegram remote control verified."
-            if bot_ok and is_private_chat and chat_matches and user_matches_private_chat
-            else "Telegram setup must use a private chat where chat ID and authorized user ID match."
+            if bot_ok and is_private_chat and chat_matches
+            else "Telegram setup must use a private chat with the correct chat ID."
         ),
     }
 
 
-def poll_and_dispatch(token: str, authorized_chat_id: str, authorized_user_id: str, offset: int) -> int:
+def poll_and_dispatch(token: str, authorized_chat_id: str, offset: int) -> int:
     """
     One long-poll cycle against Telegram getUpdates.
     Blocks for up to _POLL_TIMEOUT_SECS seconds waiting for messages.
@@ -244,7 +260,7 @@ def poll_and_dispatch(token: str, authorized_chat_id: str, authorized_user_id: s
         update_id = update.get("update_id", 0)
         offset = max(offset, update_id + 1)
         try:
-            _dispatch(update, token, authorized_chat_id, authorized_user_id)
+            _dispatch(update, token, authorized_chat_id)
         except Exception as exc:
             print(f"[telegram-bot] dispatch error: {exc}")
 

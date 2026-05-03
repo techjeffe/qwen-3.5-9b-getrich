@@ -16,14 +16,13 @@ def test_verify_remote_control_requires_private_chat_and_matching_user(monkeypat
     }
     monkeypatch.setattr(telegram_bot, "_api", lambda token, method, **kwargs: responses[method])
 
-    result = telegram_bot.verify_remote_control("token", "123456789", "123456789")
+    result = telegram_bot.verify_remote_control("token", "123456789")
 
     assert result["ok"] is True
     assert result["chat_type"] == "private"
-    assert result["authorized_user_matches_chat"] is True
 
 
-def test_dispatch_ignores_messages_from_wrong_sender(monkeypatch):
+def test_dispatch_ignores_messages_from_wrong_chat(monkeypatch):
     sent_messages: list[str] = []
     monkeypatch.setattr(telegram_bot, "_send", lambda token, chat_id, text: sent_messages.append(text))
     monkeypatch.setattr(telegram_bot, "_handle_stop", lambda token, chat_id: sent_messages.append("STOP"))
@@ -32,13 +31,12 @@ def test_dispatch_ignores_messages_from_wrong_sender(monkeypatch):
         {
             "update_id": 1,
             "message": {
-                "chat": {"id": 123456789, "type": "private"},
+                "chat": {"id": 999999999, "type": "private"},
                 "from": {"id": 999999999},
                 "text": "/stop",
             },
         },
         "token",
-        "123456789",
         "123456789",
     )
 

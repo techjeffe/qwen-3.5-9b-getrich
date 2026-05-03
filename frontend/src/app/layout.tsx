@@ -1,4 +1,5 @@
 import "./globals.css";
+import GlobalRemoteControlBanner from "@/components/GlobalRemoteControlBanner";
 
 export const metadata = {
   title: "Sentiment Trading Alpha",
@@ -12,7 +13,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="bg-gray-900 text-white antialiased">{children}</body>
+      <body className="bg-gray-900 text-white antialiased">
+        <GlobalRemoteControlBanner />
+        {children}
+      </body>
     </html>
   );
 }

@@ -281,6 +281,9 @@ export type AppConfig = {
     reasoning_model?: string;
     rss_article_detail_mode?: "light" | "normal" | "detailed";
     risk_profile?: string;
+    telegram_remote_control_banner_active?: boolean;
+    telegram_remote_control_banner_message?: string;
+    telegram_remote_control_banner_updated_at?: string | null;
 };
 
 // Analysis result

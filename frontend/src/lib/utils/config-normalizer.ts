@@ -53,6 +53,9 @@ export type AppConfig = {
     min_same_day_exit_edge_pct: number | null;
     remote_snapshot_enabled: boolean;
     telegram_remote_control_enabled: boolean;
+    telegram_remote_control_banner_active: boolean;
+    telegram_remote_control_banner_message: string;
+    telegram_remote_control_banner_updated_at: string | null;
     remote_snapshot_mode: "telegram";
     remote_snapshot_interval_minutes: number;
     remote_snapshot_send_on_position_change: boolean;
@@ -163,6 +166,9 @@ export const EMPTY_CONFIG: AppConfig = {
     min_same_day_exit_edge_pct: null,
     remote_snapshot_enabled: false,
     telegram_remote_control_enabled: false,
+    telegram_remote_control_banner_active: false,
+    telegram_remote_control_banner_message: "",
+    telegram_remote_control_banner_updated_at: null,
     remote_snapshot_mode: "telegram",
     remote_snapshot_interval_minutes: 360,
     remote_snapshot_send_on_position_change: true,
@@ -272,6 +278,9 @@ export function normalizeConfigPayload(payload: Partial<AppConfig> | null | unde
             ...(next.logic_defaults ?? {}),
         },
         risk_policy: next.risk_policy ?? EMPTY_CONFIG.risk_policy,
+        telegram_remote_control_banner_active: !!next.telegram_remote_control_banner_active,
+        telegram_remote_control_banner_message: String(next.telegram_remote_control_banner_message || ""),
+        telegram_remote_control_banner_updated_at: next.telegram_remote_control_banner_updated_at || null,
         available_models: Array.isArray(next.available_models) ? next.available_models : [],
         supported_symbols: Array.isArray(next.supported_symbols) ? next.supported_symbols : EMPTY_CONFIG.supported_symbols,
         default_rss_feeds: Array.isArray(next.default_rss_feeds) ? next.default_rss_feeds : [],

@@ -252,15 +252,31 @@ async def verify_remote_snapshot_secrets(
         creds = get_telegram_credentials()
         token = str(creds.get("bot_token") or "").strip()
         chat_id = str(creds.get("chat_id") or "").strip()
-        authorized_user_id = str(creds.get("authorized_user_id") or "").strip()
-        if not token or not chat_id or not authorized_user_id:
-            raise HTTPException(status_code=400, detail="Telegram bot token, private chat ID, and authorized user ID must all be saved first.")
-        return verify_remote_control(token, chat_id, authorized_user_id)
+        if not token or not chat_id:
+            raise HTTPException(status_code=400, detail="Telegram bot token and private chat ID must be saved first.")
+        return verify_remote_control(token, chat_id)
     except HTTPException:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/admin/telegram-remote-control-banner/acknowledge", tags=["Admin"])
+async def acknowledge_telegram_remote_control_banner(
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    try:
+        config = get_or_create_app_config(db)
+        config.telegram_remote_control_banner_active = False
+        config.telegram_remote_control_banner_message = None
+        db.add(config)
+        db.commit()
+        return {"ok": True}
+    except Exception as exc:
+        db.rollback()
         raise HTTPException(status_code=503, detail=str(exc))
 
 

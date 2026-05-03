@@ -482,6 +482,9 @@ def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
         allow_extended_hours_trading=bool(row_value("allow_extended_hours_trading", True)),
         remote_snapshot_enabled=bool(row_value("remote_snapshot_enabled", False)),
         telegram_remote_control_enabled=bool(row_value("telegram_remote_control_enabled", False)),
+        telegram_remote_control_banner_active=bool(row_value("telegram_remote_control_banner_active", False)),
+        telegram_remote_control_banner_message=str(row_value("telegram_remote_control_banner_message", "") or "") or None,
+        telegram_remote_control_banner_updated_at=datetime.fromisoformat(row_value("telegram_remote_control_banner_updated_at")) if row_value("telegram_remote_control_banner_updated_at") else None,
         remote_snapshot_mode=_normalize_remote_snapshot_mode(row_value("remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
         remote_snapshot_min_pnl_change_usd=float(row_value("remote_snapshot_min_pnl_change_usd", 5.0) or 5.0),
         remote_snapshot_heartbeat_minutes=int(row_value("remote_snapshot_heartbeat_minutes", 360) or 360),
@@ -652,6 +655,9 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         if getattr(config, "telegram_remote_control_enabled", None) is None:
             config.telegram_remote_control_enabled = False
             changed = True
+        if getattr(config, "telegram_remote_control_banner_active", None) is None:
+            config.telegram_remote_control_banner_active = False
+            changed = True
         normalized_remote_snapshot_mode = _normalize_remote_snapshot_mode(
             getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)
         )
@@ -733,6 +739,9 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         alpaca_execution_mode=DEFAULT_ALPACA_EXECUTION_MODE,
         remote_snapshot_enabled=False,
         telegram_remote_control_enabled=False,
+        telegram_remote_control_banner_active=False,
+        telegram_remote_control_banner_message=None,
+        telegram_remote_control_banner_updated_at=None,
         remote_snapshot_mode=DEFAULT_REMOTE_SNAPSHOT_MODE,
         remote_snapshot_min_pnl_change_usd=5.0,
         remote_snapshot_heartbeat_minutes=360,
@@ -1144,6 +1153,9 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),
         "remote_snapshot_enabled": bool(getattr(config, "remote_snapshot_enabled", False)),
         "telegram_remote_control_enabled": bool(getattr(config, "telegram_remote_control_enabled", False)),
+        "telegram_remote_control_banner_active": bool(getattr(config, "telegram_remote_control_banner_active", False)),
+        "telegram_remote_control_banner_message": str(getattr(config, "telegram_remote_control_banner_message", "") or ""),
+        "telegram_remote_control_banner_updated_at": config.telegram_remote_control_banner_updated_at.isoformat() if getattr(config, "telegram_remote_control_banner_updated_at", None) else None,
         "remote_snapshot_mode": _normalize_remote_snapshot_mode(getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
         "remote_snapshot_interval_minutes": remote_snapshot_interval_minutes,
         "remote_snapshot_send_on_position_change": bool(getattr(config, "remote_snapshot_send_on_position_change", True)),

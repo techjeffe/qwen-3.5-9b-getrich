@@ -31,6 +31,9 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     reasoning_model: "",
     rss_article_detail_mode: "normal",
     risk_profile: "standard",
+    telegram_remote_control_banner_active: false,
+    telegram_remote_control_banner_message: "",
+    telegram_remote_control_banner_updated_at: null,
 };
 
 export const LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY = "lastViewedAnalysisRequestId";

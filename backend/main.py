@@ -164,15 +164,14 @@ async def _telegram_bot_loop():
             creds   = get_telegram_credentials()
             token   = (creds.get("bot_token") or "").strip()
             chat_id = (creds.get("chat_id")   or "").strip()
-            authorized_user_id = (creds.get("authorized_user_id") or "").strip()
-            if not token or not chat_id or not authorized_user_id:
+            if not token or not chat_id:
                 # Credentials were removed at runtime — stop the loop
                 print("[telegram-bot] credentials removed, stopping bot loop")
                 return
             if offset is None:
                 offset = await asyncio.to_thread(initialize_offset, token)
                 print(f"[telegram-bot] initialized polling offset at {offset}")
-            offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, authorized_user_id, offset)
+            offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, offset)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
