@@ -86,6 +86,8 @@ Secure secrets (Telegram + Alpaca):
 - On Windows, secrets saved from the Admin UI go to Credential Manager
 - On macOS, secrets go to Keychain Access
 - If you prefer to install it directly: `pip install keyring`
+- Telegram setup now stores three values: `bot token`, `private chat id`, and `authorized user id`
+- Telegram remote control is restricted to one private 1:1 chat and one authorized Telegram user; group chats and channels are rejected
 
 #### 3. Start the frontend
 
@@ -170,6 +172,8 @@ Secure secrets (Telegram + Alpaca):
 - `keyring` is included in `requirements.txt` and is used to store Telegram and Alpaca API keys in the OS keychain
 - On macOS, secrets saved from the Admin UI go to Keychain Access
 - If you prefer to install it directly: `python3.12 -m pip install keyring`
+- Telegram setup now stores three values: `bot token`, `private chat id`, and `authorized user id`
+- Telegram remote control is restricted to one private 1:1 chat and one authorized Telegram user; group chats and channels are rejected
 
 #### 3. Start the frontend
 
@@ -217,9 +221,13 @@ The following are configurable from the Admin page and persist in the database:
 
 Remote snapshot delivery can also be configured from Admin:
 
-- enable/disable remote snapshot delivery and tune resend thresholds
-- save Telegram `bot token` and `chat id` securely from the UI without storing them in the repo
-- secrets are stored in the OS keychain through `keyring` and only masked status is shown back in the UI
+- save Telegram credentials securely from the UI without storing them in the repo:
+  `bot token`, `private chat id`, and `authorized user id`
+- credentials are stored in the OS keychain through `keyring` and only masked status is shown back in the UI
+- run built-in Telegram verification from Admin to confirm the bot token works and the saved IDs point to the same private 1:1 chat
+- enable/disable **Remote Snapshots** separately from **Remote Control**
+- remote snapshots are currently Telegram-only and send a PNG photo after qualifying runs or when **Send Snapshot Now** is used
+- remote control is opt-in and only supports `/status`, `/stop`, `/start`, and `/help`
 
 Alpaca live trading can be configured from Admin (Live Trading section):
 
@@ -370,7 +378,8 @@ The migration script will detect any missing columns and add them with safe defa
 | `analysis_lock_acquired_at` | `app_config` | `NULL` | Analysis lease start time |
 | `analysis_lock_expires_at` | `app_config` | `NULL` | Analysis lease expiry time |
 | `remote_snapshot_enabled` | `app_config` | `false` | Enable outbound remote PNG delivery |
-| `remote_snapshot_mode` | `app_config` | `'telegram'` | Delivery backend |
+| `telegram_remote_control_enabled` | `app_config` | `false` | Enable hardened Telegram `/status` `/stop` `/start` `/help` control |
+| `remote_snapshot_mode` | `app_config` | `'telegram'` | Delivery backend (currently fixed to Telegram) |
 | `remote_snapshot_min_pnl_change_usd` | `app_config` | `5.0` | Re-send threshold |
 | `remote_snapshot_heartbeat_minutes` | `app_config` | `360` | Re-send heartbeat |
 | `remote_snapshot_include_closed_trades` | `app_config` | `false` | Include recent closed positions in image |
@@ -504,7 +513,7 @@ The Admin page is organized around the things users change most often first.
 5. **RSS Sources** — enable/disable the built-in feeds, add up to 3 custom feeds, and set a display label for each custom feed
 6. **Prompt Overrides** — per-symbol specialist prompt guidance
 7. **Scheduling & System** — auto-run cadence, snapshot retention, display timezone
-8. **Remote Snapshot Delivery** — enable outbound PNG delivery after qualifying runs; configure Telegram bot token and chat ID securely (stored in the OS keychain, never in the repo); tune resend interval, P&L threshold, and heartbeat; **Send Snapshot Now** button bypasses all gates and immediately queues the most recent run for delivery
+8. **Telegram** — manage shared Telegram credentials (`bot token`, `private chat id`, `authorized user id`) in the OS keychain, verify hardened setup, enable **Remote Snapshots** and **Remote Control** independently, tune snapshot resend settings, and use **Send Snapshot Now** to bypass normal gates and immediately queue the most recent run for delivery
 9. **Price History** — pull and status panel: per-symbol row count, date range, ready/needs-pull indicator, and a pull trigger button; the `price_history` table is independent of the analysis database and is never cleared by reset-data
 10. **Live Trading — Alpaca** — API key entry (stored in OS keychain), paper/live mode selector, Test Connection button with account equity display, guardrail fields, PDT-aware live execution protections, and an Enable/Disable Live toggle with a "type LIVE to confirm" modal
 

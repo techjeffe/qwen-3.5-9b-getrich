@@ -1,5 +1,44 @@
 # Release Notes — May 3, 2026
 
+## Telegram Hardening, Split Admin Controls, and Telegram-Only Snapshots
+
+Telegram snapshot delivery and Telegram bot control were tightened and separated into clearer admin-facing controls.
+
+**Telegram credentials and verification:**
+
+- Telegram setup now stores three values in the OS keychain: `bot token`, `private chat id`, and `authorized user id`
+- Added built-in Telegram verification from Admin so the app can confirm the bot token works and the saved IDs point to the same private 1:1 chat
+- Added an in-app Telegram setup help modal with BotFather and user-ID instructions
+
+**Remote control hardening:**
+
+- Telegram remote control is now bound to exactly one private chat and one authorized Telegram user
+- Group chats and channels are intentionally rejected
+- The bot only supports `/status`, `/stop`, `/start`, and `/help`
+- `/status` reports the current Alpaca execution mode
+- `/stop` switches Alpaca execution mode to `off` and stores the previous mode for later resumption
+- `/start` restores the previously saved execution mode after `/stop`
+- Backlogged Telegram updates are discarded on startup so stale `/start` or `/stop` messages do not replay after a restart
+- Remote Telegram errors now return generic failure messages to chat while detailed exceptions stay in backend logs
+
+**Admin UI changes:**
+
+- The old single Telegram setup flow was split into two independent feature toggles:
+  **Remote Snapshots** and **Remote Control**
+- Saving Telegram credentials no longer silently enables snapshot delivery
+- The system/Telegram area in Admin now shows the supported bot commands with clear descriptions of what they do and do not do
+- Left-rail admin wording was updated so the Telegram/system area more clearly covers both snapshots and remote control
+
+**Remote snapshots simplified:**
+
+- Removed Signed Link and Email snapshot delivery options from Admin and backend routing
+- Remote snapshot delivery is now explicitly Telegram-only
+- `remote_snapshot_mode` remains in config/storage for compatibility, but normalizes to `telegram`
+
+**Files changed:** `backend/services/telegram_bot.py`, `backend/services/secret_store.py`, `backend/routers/config.py`, `backend/main.py`, `backend/services/remote_snapshot.py`, `backend/services/app_config.py`, `backend/database/models.py`, `backend/database/migrate.py`, `frontend/src/app/admin/page.tsx`, `frontend/src/components/admin/modals/RemoteSnapshotSetupModal.tsx`, `frontend/src/components/admin/sections/RemoteSnapshotSection.tsx`, `frontend/src/lib/utils/config-normalizer.ts`, `README.md`
+
+---
+
 ## Admin UI Redesign, Order Sizing Toggle, and Domain Cookie Injection
 
 ### Admin UI redesign
