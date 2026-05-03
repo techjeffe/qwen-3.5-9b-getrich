@@ -43,7 +43,7 @@ LEGACY_RISK_PROFILE_ALIASES = {
     "aggressive": "standard",
 }
 DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
-VALID_REMOTE_SNAPSHOT_MODES = {"telegram", "signed_link", "email"}
+VALID_REMOTE_SNAPSHOT_MODES = {"telegram"}
 DEFAULT_ALPACA_EXECUTION_MODE = "off"
 VALID_ALPACA_EXECUTION_MODES = {"off", "paper", "live"}
 MAX_CUSTOM_SYMBOLS = 50
@@ -481,6 +481,7 @@ def _maybe_import_legacy_app_config(db: Session) -> AppConfig | None:
         web_research_enabled=bool(row_value("web_research_enabled", False)),
         allow_extended_hours_trading=bool(row_value("allow_extended_hours_trading", True)),
         remote_snapshot_enabled=bool(row_value("remote_snapshot_enabled", False)),
+        telegram_remote_control_enabled=bool(row_value("telegram_remote_control_enabled", False)),
         remote_snapshot_mode=_normalize_remote_snapshot_mode(row_value("remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
         remote_snapshot_min_pnl_change_usd=float(row_value("remote_snapshot_min_pnl_change_usd", 5.0) or 5.0),
         remote_snapshot_heartbeat_minutes=int(row_value("remote_snapshot_heartbeat_minutes", 360) or 360),
@@ -648,6 +649,9 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         if getattr(config, "remote_snapshot_enabled", None) is None:
             config.remote_snapshot_enabled = False
             changed = True
+        if getattr(config, "telegram_remote_control_enabled", None) is None:
+            config.telegram_remote_control_enabled = False
+            changed = True
         normalized_remote_snapshot_mode = _normalize_remote_snapshot_mode(
             getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)
         )
@@ -728,6 +732,7 @@ def get_or_create_app_config(db: Session) -> AppConfig:
         allow_extended_hours_trading=True,
         alpaca_execution_mode=DEFAULT_ALPACA_EXECUTION_MODE,
         remote_snapshot_enabled=False,
+        telegram_remote_control_enabled=False,
         remote_snapshot_mode=DEFAULT_REMOTE_SNAPSHOT_MODE,
         remote_snapshot_min_pnl_change_usd=5.0,
         remote_snapshot_heartbeat_minutes=360,
@@ -861,6 +866,8 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.allow_extended_hours_trading = bool(payload.get("allow_extended_hours_trading"))
     if "remote_snapshot_enabled" in payload:
         config.remote_snapshot_enabled = bool(payload.get("remote_snapshot_enabled"))
+    if "telegram_remote_control_enabled" in payload:
+        config.telegram_remote_control_enabled = bool(payload.get("telegram_remote_control_enabled"))
     if "remote_snapshot_mode" in payload:
         config.remote_snapshot_mode = _normalize_remote_snapshot_mode(payload.get("remote_snapshot_mode"))
     if "remote_snapshot_min_pnl_change_usd" in payload:
@@ -1136,6 +1143,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
         "allow_extended_hours_trading": bool(getattr(config, "allow_extended_hours_trading", True)),
         "remote_snapshot_enabled": bool(getattr(config, "remote_snapshot_enabled", False)),
+        "telegram_remote_control_enabled": bool(getattr(config, "telegram_remote_control_enabled", False)),
         "remote_snapshot_mode": _normalize_remote_snapshot_mode(getattr(config, "remote_snapshot_mode", DEFAULT_REMOTE_SNAPSHOT_MODE)),
         "remote_snapshot_interval_minutes": remote_snapshot_interval_minutes,
         "remote_snapshot_send_on_position_change": bool(getattr(config, "remote_snapshot_send_on_position_change", True)),

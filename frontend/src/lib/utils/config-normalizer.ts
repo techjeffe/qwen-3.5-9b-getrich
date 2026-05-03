@@ -52,7 +52,8 @@ export type AppConfig = {
     reentry_cooldown_minutes: number | null;
     min_same_day_exit_edge_pct: number | null;
     remote_snapshot_enabled: boolean;
-    remote_snapshot_mode: "telegram" | "signed_link" | "email";
+    telegram_remote_control_enabled: boolean;
+    remote_snapshot_mode: "telegram";
     remote_snapshot_interval_minutes: number;
     remote_snapshot_send_on_position_change: boolean;
     remote_snapshot_include_closed_trades: boolean;
@@ -161,6 +162,7 @@ export const EMPTY_CONFIG: AppConfig = {
     reentry_cooldown_minutes: null,
     min_same_day_exit_edge_pct: null,
     remote_snapshot_enabled: false,
+    telegram_remote_control_enabled: false,
     remote_snapshot_mode: "telegram",
     remote_snapshot_interval_minutes: 360,
     remote_snapshot_send_on_position_change: true,

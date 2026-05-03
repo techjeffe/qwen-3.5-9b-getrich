@@ -348,6 +348,7 @@ class AppConfig(Base):
     web_research_enabled = Column(Boolean, nullable=False, default=False)
     allow_extended_hours_trading = Column(Boolean, nullable=False, default=True)
     remote_snapshot_enabled = Column(Boolean, nullable=False, default=False)
+    telegram_remote_control_enabled = Column(Boolean, nullable=False, default=False)
     remote_snapshot_mode = Column(String(20), nullable=False, default="telegram")
     remote_snapshot_min_pnl_change_usd = Column(Float, nullable=False, default=5.0)
     remote_snapshot_heartbeat_minutes = Column(Integer, nullable=False, default=360)

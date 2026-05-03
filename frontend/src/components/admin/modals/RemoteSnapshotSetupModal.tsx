@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 type RemoteSnapshotSetupModalProps = {
     showRemoteSnapshotSetupModal: boolean;
     telegramBotToken: string;
@@ -45,21 +47,62 @@ export function RemoteSnapshotSetupModal({
     remoteSecrets,
     setShowRemoteSnapshotSetupModal,
 }: RemoteSnapshotSetupModalProps) {
+    const [showHelp, setShowHelp] = useState(false);
     if (!showRemoteSnapshotSetupModal) return null;
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
             <div className="w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-6 space-y-4 shadow-2xl">
                 <div className="flex items-center justify-between">
-                    <h2 className="text-lg font-semibold text-white">Telegram Remote Control</h2>
-                    <button
-                        type="button"
-                        onClick={() => setShowRemoteSnapshotSetupModal(false)}
-                        className="text-slate-500 hover:text-white text-lg"
-                    >
-                        &times;
-                    </button>
+                    <h2 className="text-lg font-semibold text-white">Telegram Setup</h2>
+                    <div className="flex items-center gap-2">
+                        <button
+                            type="button"
+                            onClick={() => setShowHelp((current) => !current)}
+                            className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-700 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
+                            title="How to get these Telegram values"
+                        >
+                            ?
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setShowRemoteSnapshotSetupModal(false)}
+                            className="text-slate-500 hover:text-white text-lg"
+                        >
+                            &times;
+                        </button>
+                    </div>
                 </div>
+                {showHelp && (
+                    <div className="max-h-80 overflow-y-auto rounded-xl border border-sky-900/40 bg-sky-950/20 p-4 text-xs text-slate-200 space-y-3">
+                        <p className="font-semibold text-sky-300">How to get your Telegram credentials</p>
+                        <p>To obtain these Telegram credentials, you will need to interact with the Telegram application and, in some cases, use a web browser to query the Telegram API.</p>
+                        <div className="space-y-1">
+                            <p className="font-semibold text-white">1. Telegram Bot Token</p>
+                            <p>The Bot Token is the unique identifier that allows your code to communicate with Telegram&apos;s servers.</p>
+                            <p>Open Telegram and search for <span className="font-mono text-slate-100">@BotFather</span>.</p>
+                            <p>Start a chat and send <span className="font-mono text-slate-100">/newbot</span>.</p>
+                            <p>Follow the prompts to name your bot and give it a username.</p>
+                            <p>Once created, <span className="font-mono text-slate-100">@BotFather</span> will provide the API Token.</p>
+                            <p>If you already have a bot, send <span className="font-mono text-slate-100">/mybots</span>, select your bot, and click <span className="font-mono text-slate-100">API Token</span>.</p>
+                        </div>
+                        <div className="space-y-1">
+                            <p className="font-semibold text-white">2. Authorized User ID</p>
+                            <p>Your User ID is a unique numerical string assigned to your account. It is not the same as your <span className="font-mono text-slate-100">@username</span>.</p>
+                            <p>Search for <span className="font-mono text-slate-100">@userinfobot</span> or <span className="font-mono text-slate-100">@GetIDBot</span> in Telegram.</p>
+                            <p>Start the bot. It will immediately reply with your ID, for example <span className="font-mono text-slate-100">123456789</span>.</p>
+                        </div>
+                        <div className="space-y-1">
+                            <p className="font-semibold text-white">3. Private Chat ID</p>
+                            <p>Start a direct 1:1 chat with your bot, then use the same positive ID from the private chat as your Chat ID.</p>
+                            <p>In hardened mode, group and channel IDs are rejected. Negative IDs like <span className="font-mono text-slate-100">-100123...</span> will not work.</p>
+                        </div>
+                        <div className="space-y-1">
+                            <p className="font-semibold text-white">Important security note</p>
+                            <p>Never share your Bot Token publicly. If someone gains access to it, they can send messages on your bot&apos;s behalf and inspect its activity.</p>
+                        </div>
+                    </div>
+                )}
                 {!remoteSecrets.available && (
                     <p className="text-xs text-amber-300 bg-amber-950/30 border border-amber-800/40 rounded-lg px-3 py-2">
                         Remote secrets storage is not available. Secrets will be stored in backend config instead.

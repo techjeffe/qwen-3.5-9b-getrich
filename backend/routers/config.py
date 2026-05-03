@@ -220,11 +220,6 @@ async def put_remote_snapshot_secrets(
             authorized_user_id=str(payload.get("authorized_user_id") or ""),
         )
         config = get_or_create_app_config(db)
-        if not bool(getattr(config, "remote_snapshot_enabled", False)):
-            config.remote_snapshot_enabled = True
-            db.add(config)
-            db.commit()
-            db.refresh(config)
 
         latest_analysis = (
             db.query(AnalysisResult)
@@ -240,7 +235,8 @@ async def put_remote_snapshot_secrets(
             saved["test_delivery_request_id"] = None
             if changed and not latest_analysis:
                 saved["test_delivery_note"] = "No completed analysis run is available yet."
-        saved["remote_snapshot_enabled"] = True
+        saved["remote_snapshot_enabled"] = bool(getattr(config, "remote_snapshot_enabled", False))
+        saved["telegram_remote_control_enabled"] = bool(getattr(config, "telegram_remote_control_enabled", False))
         return saved
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

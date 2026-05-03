@@ -250,15 +250,26 @@ async def lifespan(app: FastAPI):
     print("Alpaca order poll scheduler started (5 min interval)")
 
     try:
+        from services.app_config import get_or_create_app_config
         from services.secret_store import get_telegram_credentials
+        db = SessionLocal()
+        try:
+            cfg = get_or_create_app_config(db)
+            remote_control_enabled = bool(getattr(cfg, "telegram_remote_control_enabled", False))
+        finally:
+            db.close()
         _tg = get_telegram_credentials()
         if (
+            remote_control_enabled
+            and
             (_tg.get("bot_token") or "").strip()
             and (_tg.get("chat_id") or "").strip()
             and (_tg.get("authorized_user_id") or "").strip()
         ):
             telegram_bot_task = asyncio.create_task(_telegram_bot_loop())
             print("Telegram bot remote control started (long-polling)")
+        elif not remote_control_enabled:
+            print("Telegram bot remote control skipped (disabled in admin settings)")
         else:
             print("Telegram bot remote control skipped (credentials not configured)")
     except Exception as exc:

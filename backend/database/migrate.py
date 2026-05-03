@@ -42,6 +42,7 @@ def migrate():
             ("web_research_enabled", "BOOLEAN", "0"),
             ("allow_extended_hours_trading", "BOOLEAN", "1"),
             ("remote_snapshot_enabled", "BOOLEAN", "0"),
+            ("telegram_remote_control_enabled", "BOOLEAN", "0"),
             ("remote_snapshot_mode", "VARCHAR(20)", "'telegram'"),
             ("remote_snapshot_min_pnl_change_usd", "REAL", "5.0"),
             ("remote_snapshot_heartbeat_minutes", "INTEGER", "360"),

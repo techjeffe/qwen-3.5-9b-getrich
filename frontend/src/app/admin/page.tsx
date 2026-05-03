@@ -194,7 +194,7 @@ export default function AdminPage() {
         { value: "overview", label: "Overview", description: "Risk profile, depth, models, and pipeline posture." },
         { value: "trading", label: "Trading + Execution", description: "Guardrails and Alpaca routing." },
         { value: "symbols", label: "Symbols + RSS", description: "Tracked symbols, custom names, and feed sources." },
-        { value: "system", label: "System / Scheduling", description: "Auto-run, snapshots, and price-history status." },
+        { value: "system", label: "System / Telegram", description: "Auto-run, snapshots, remote control, and price-history status." },
     ];
     const riskOptions: Array<{
         key: string;
@@ -416,11 +416,21 @@ export default function AdminPage() {
     }, [isDirty]);
 
     const toggleRemoteSnapshotEnabled = (enabled: boolean) => {
-        setConfig((current) => ({ ...current, remote_snapshot_enabled: enabled }));
-        if (enabled) {
+        if (enabled && !remoteSecrets.configured) {
             setSecretStatus("");
             setShowRemoteSnapshotSetupModal(true);
+            return;
         }
+        setConfig((current) => ({ ...current, remote_snapshot_enabled: enabled }));
+    };
+
+    const toggleTelegramRemoteControlEnabled = (enabled: boolean) => {
+        if (enabled && !remoteSecrets.configured) {
+            setSecretStatus("");
+            setShowRemoteSnapshotSetupModal(true);
+            return;
+        }
+        setConfig((current) => ({ ...current, telegram_remote_control_enabled: enabled }));
     };
 
     const verifyRemoteSnapshotSecrets = useCallback(async (savedThisRun = false) => {
@@ -474,8 +484,6 @@ export default function AdminPage() {
                 authorized_user_id_masked: String(payload.authorized_user_id_masked || ""),
                 error: String(payload.error || ""),
             });
-            setConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
-            setSavedConfig((current) => ({ ...current, remote_snapshot_enabled: true }));
             setTelegramBotToken("");
             setTelegramChatId("");
             setTelegramAuthorizedUserId("");
@@ -1130,6 +1138,7 @@ export default function AdminPage() {
                                     isSendingSnapshotNow={isSendingSnapshotNow}
                                     sendSnapshotNow={sendRemoteSnapshotNow}
                                     toggleRemoteSnapshotEnabled={toggleRemoteSnapshotEnabled}
+                                    toggleTelegramRemoteControlEnabled={toggleTelegramRemoteControlEnabled}
                                     remoteSecrets={remoteSecrets}
                                     setShowRemoteSnapshotSetupModal={setShowRemoteSnapshotSetupModal}
                                 />

@@ -5,12 +5,10 @@ Remote snapshot rendering and delivery helpers.
 from __future__ import annotations
 
 import os
-import smtplib
 import threading
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from html import escape
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 import requests
@@ -602,150 +600,8 @@ def _deliver_via_telegram_photo(png_bytes: bytes, caption: str) -> Dict[str, Any
     raise RuntimeError(f"Telegram delivery failed: {last_error}")
 
 
-def _deliver_via_email_attachment(png_bytes: bytes, caption: str) -> Dict[str, Any]:
-    host = str(os.getenv("SMTP_HOST", "") or "").strip()
-    port = int(str(os.getenv("SMTP_PORT", "587") or "587").strip())
-    username = str(os.getenv("SMTP_USERNAME", "") or "").strip()
-    password = str(os.getenv("SMTP_PASSWORD", "") or "").strip()
-    to_email = str(os.getenv("REMOTE_SNAPSHOT_TO_EMAIL", "") or "").strip()
-    from_email = username or to_email
-    if not host or not to_email:
-        raise RuntimeError("SMTP_HOST and REMOTE_SNAPSHOT_TO_EMAIL must be set for email delivery")
-
-    msg = EmailMessage()
-    msg["Subject"] = f"[Run Snapshot] {caption.splitlines()[0][:120]}"
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg.set_content(caption)
-    msg.add_attachment(png_bytes, maintype="image", subtype="png", filename="remote-snapshot.png")
-
-    with smtplib.SMTP(host, port, timeout=20) as smtp:
-        smtp.ehlo()
-        try:
-            smtp.starttls()
-            smtp.ehlo()
-        except Exception:
-            pass
-        if username and password:
-            smtp.login(username, password)
-        smtp.send_message(msg)
-    return {"mode": "email", "delivered": True}
-
-
-def _deliver_via_email_text(subject: str, body: str) -> None:
-    host = str(os.getenv("SMTP_HOST", "") or "").strip()
-    port = int(str(os.getenv("SMTP_PORT", "587") or "587").strip())
-    username = str(os.getenv("SMTP_USERNAME", "") or "").strip()
-    password = str(os.getenv("SMTP_PASSWORD", "") or "").strip()
-    to_email = str(os.getenv("REMOTE_SNAPSHOT_TO_EMAIL", "") or "").strip()
-    from_email = username or to_email
-    if not host or not to_email:
-        raise RuntimeError("SMTP_HOST and REMOTE_SNAPSHOT_TO_EMAIL must be set for email delivery")
-
-    msg = EmailMessage()
-    msg["Subject"] = subject[:180]
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg.set_content(body)
-
-    with smtplib.SMTP(host, port, timeout=20) as smtp:
-        smtp.ehlo()
-        try:
-            smtp.starttls()
-            smtp.ehlo()
-        except Exception:
-            pass
-        if username and password:
-            smtp.login(username, password)
-        smtp.send_message(msg)
-
-
-def _build_signed_link_client():
-    try:
-        import boto3
-    except Exception as exc:
-        raise RuntimeError(f"boto3 is required for signed_link delivery: {exc}") from exc
-
-    access_key = str(os.getenv("REMOTE_SNAPSHOT_ACCESS_KEY", "") or "").strip()
-    secret_key = str(os.getenv("REMOTE_SNAPSHOT_SECRET_KEY", "") or "").strip()
-    region = str(os.getenv("REMOTE_SNAPSHOT_REGION", "") or "").strip() or None
-    endpoint = str(os.getenv("REMOTE_SNAPSHOT_PUBLIC_BASE_URL", "") or "").strip() or None
-    kwargs: Dict[str, Any] = {
-        "aws_access_key_id": access_key or None,
-        "aws_secret_access_key": secret_key or None,
-        "region_name": region,
-    }
-    if endpoint and endpoint.startswith(("http://", "https://")):
-        kwargs["endpoint_url"] = endpoint
-    return boto3.client("s3", **kwargs)
-
-
-def _deliver_signed_link(png_bytes: bytes, caption: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    bucket = str(os.getenv("REMOTE_SNAPSHOT_BUCKET", "") or "").strip()
-    if not bucket:
-        raise RuntimeError("REMOTE_SNAPSHOT_BUCKET must be set for signed_link delivery")
-
-    client = _build_signed_link_client()
-    timestamp = _ensure_utc(payload.get("timestamp")) or datetime.now(timezone.utc)
-    object_key = (
-        f"remote-snapshots/{timestamp.strftime('%Y/%m/%d')}/"
-        f"{payload.get('request_id', 'latest')}.png"
-    )
-    client.put_object(
-        Bucket=bucket,
-        Key=object_key,
-        Body=png_bytes,
-        ContentType="image/png",
-    )
-    expires_in = max(300, min(7 * 24 * 3600, int(os.getenv("REMOTE_SNAPSHOT_SIGNED_URL_TTL_SECONDS", "86400"))))
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": object_key},
-        ExpiresIn=expires_in,
-    )
-    message = f"{caption}\n{url}"
-    telegram_token = ""
-    telegram_chat_id = ""
-    try:
-        creds = get_telegram_credentials()
-        telegram_token = str(creds.get("bot_token") or "").strip()
-        telegram_chat_id = str(creds.get("chat_id") or "").strip()
-    except Exception:
-        telegram_token = ""
-        telegram_chat_id = ""
-    if not telegram_token:
-        telegram_token = str(os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
-    if not telegram_chat_id:
-        telegram_chat_id = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
-
-    if telegram_token and telegram_chat_id:
-        telegram_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-        response = requests.post(
-            telegram_url,
-            data={"chat_id": telegram_chat_id, "text": message[:4096]},
-            timeout=20,
-        )
-        if not response.ok:
-            raise RuntimeError(f"Signed-link telegram delivery failed: {response.status_code}: {response.text[:300]}")
-        return {"mode": "signed_link", "delivered": True, "delivery_channel": "telegram"}
-    if str(os.getenv("SMTP_HOST", "") or "").strip() and str(os.getenv("REMOTE_SNAPSHOT_TO_EMAIL", "") or "").strip():
-        _deliver_via_email_text(
-            subject=f"[Run Snapshot Link] {caption.splitlines()[0][:120]}",
-            body=message,
-        )
-        return {"mode": "signed_link", "delivered": True, "delivery_channel": "email"}
-    raise RuntimeError("Signed-link delivery needs Telegram or SMTP configured as the notification channel")
-
-
-def deliver_remote_snapshot(png_bytes: bytes, caption: str, mode: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    normalized_mode = str(mode or "").strip().lower()
-    if normalized_mode == "telegram":
-        return _deliver_via_telegram_photo(png_bytes, caption)
-    if normalized_mode == "email":
-        return _deliver_via_email_attachment(png_bytes, caption)
-    if normalized_mode == "signed_link":
-        return _deliver_signed_link(png_bytes, caption, payload or {})
-    raise RuntimeError(f"Unsupported remote snapshot mode: {mode}")
+def deliver_remote_snapshot(png_bytes: bytes, caption: str) -> Dict[str, Any]:
+    return _deliver_via_telegram_photo(png_bytes, caption)
 
 
 def should_send_remote_snapshot(config, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -816,12 +672,7 @@ def process_remote_snapshot_delivery(request_id: str, force: bool = False) -> No
 
         caption = build_remote_snapshot_caption(payload)
         png_bytes = render_remote_snapshot_png(payload)
-        delivery = deliver_remote_snapshot(
-            png_bytes,
-            caption,
-            str(getattr(config, "remote_snapshot_mode", "telegram") or "telegram"),
-            payload=payload,
-        )
+        delivery = deliver_remote_snapshot(png_bytes, caption)
 
         config.last_remote_snapshot_sent_at = datetime.utcnow()
         config.last_remote_snapshot_request_id = request_id
