@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time as _time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 from zoneinfo import ZoneInfo
@@ -445,6 +445,7 @@ def _record_alpaca_order(
     trading_mode: str,
     extended_hours: bool = False,
     limit_price: Optional[float] = None,
+    raw_context: Optional[Dict[str, Any]] = None,
 ) -> None:
     from database.models import AlpacaOrder
     from sqlalchemy.exc import IntegrityError
@@ -456,6 +457,10 @@ def _record_alpaca_order(
             return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         except Exception:
             return None
+
+    raw_response: Dict[str, Any] = dict(response or {})
+    if raw_context:
+        raw_response["_managed_context"] = raw_context
 
     order = AlpacaOrder(
         paper_trade_id   = paper_trade_id,
@@ -475,7 +480,7 @@ def _record_alpaca_order(
         submitted_at     = _parse_dt(response.get("submitted_at")),
         filled_at        = _parse_dt(response.get("filled_at")),
         trading_mode     = trading_mode,
-        raw_response     = response,
+        raw_response     = raw_response,
     )
     try:
         db.add(order)
@@ -590,6 +595,133 @@ def _get_live_symbol_position(broker: "AlpacaBroker", symbol: str) -> Optional[D
         "qty": abs(qty) if qty is not None else None,
         "side": side or None,
     }
+
+
+def _configured_live_execution_symbols(config) -> Set[str]:
+    """Return execution tickers this app is allowed to trade for the current config."""
+    from services.trading_instruments import INSTRUMENT_SPECS
+
+    allowed: Set[str] = set()
+
+    tracked_symbols = getattr(config, "tracked_symbols", None) or ["USO", "IBIT", "QQQ", "SPY"]
+    for raw_symbol in tracked_symbols:
+        symbol = str(raw_symbol or "").upper().strip()
+        if not symbol:
+            continue
+        spec = INSTRUMENT_SPECS.get(symbol)
+        if spec:
+            allowed.add(symbol)
+            for direction in ("bull", "bear"):
+                allowed.update(
+                    str(ticker).upper().strip()
+                    for ticker in spec.get(direction, {}).values()
+                    if str(ticker).strip()
+                )
+        else:
+            allowed.add(symbol)
+
+    custom_symbols = getattr(config, "custom_symbols", None) or []
+    for raw_symbol in custom_symbols:
+        symbol = str(raw_symbol or "").upper().strip()
+        if symbol:
+            allowed.add(symbol)
+
+    return allowed
+
+
+def _is_live_symbol_configured(config, paper_trade) -> bool:
+    """Return True when this trade resolves to a symbol the user has configured."""
+    symbol = str(getattr(paper_trade, "execution_ticker", "") or getattr(paper_trade, "underlying", "")).upper().strip()
+    underlying = str(getattr(paper_trade, "underlying", "") or "").upper().strip()
+    if not symbol and not underlying:
+        return False
+    allowed = _configured_live_execution_symbols(config)
+    return bool(symbol and symbol in allowed) or bool(underlying and underlying in allowed)
+
+
+def _alpaca_order_effective_qty(order) -> float:
+    """Best-effort executed or submitted quantity for one AlpacaOrder row."""
+    try:
+        filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
+    except Exception:
+        filled_qty = 0.0
+    if filled_qty > 0:
+        return filled_qty
+
+    status = str(getattr(order, "status", "") or "").strip().lower()
+    if status in {"error", "skipped", "cancelled", "expired", "rejected"}:
+        return 0.0
+
+    try:
+        qty = float(getattr(order, "qty", 0.0) or 0.0)
+    except Exception:
+        qty = 0.0
+    return qty if qty > 0 else 0.0
+
+
+def _get_managed_trade_qty(db, paper_trade_id: Optional[int], trading_mode: str) -> float:
+    """Return the app-managed net quantity still associated with one paper trade."""
+    if paper_trade_id is None:
+        return 0.0
+
+    from database.models import AlpacaOrder
+
+    rows = (
+        db.query(AlpacaOrder)
+        .filter(
+            AlpacaOrder.paper_trade_id == paper_trade_id,
+            AlpacaOrder.trading_mode == trading_mode,
+        )
+        .order_by(AlpacaOrder.created_at.asc(), AlpacaOrder.id.asc())
+        .all()
+    )
+
+    net_qty = 0.0
+    for row in rows:
+        effective_qty = _alpaca_order_effective_qty(row)
+        if effective_qty <= 0:
+            continue
+        side = str(getattr(row, "side", "") or "").strip().lower()
+        if side == "buy":
+            net_qty += effective_qty
+        elif side == "sell":
+            net_qty -= effective_qty
+
+    return abs(net_qty)
+
+
+def _get_managed_trade_baseline_qty(db, paper_trade_id: Optional[int], trading_mode: str) -> float:
+    """Return the pre-existing live quantity recorded when this trade was opened."""
+    if paper_trade_id is None:
+        return 0.0
+
+    from database.models import AlpacaOrder
+
+    rows = (
+        db.query(AlpacaOrder)
+        .filter(
+            AlpacaOrder.paper_trade_id == paper_trade_id,
+            AlpacaOrder.trading_mode == trading_mode,
+        )
+        .order_by(AlpacaOrder.created_at.asc(), AlpacaOrder.id.asc())
+        .all()
+    )
+
+    for row in rows:
+        raw_response = getattr(row, "raw_response", None)
+        if not isinstance(raw_response, dict):
+            continue
+        managed_context = raw_response.get("_managed_context")
+        if not isinstance(managed_context, dict):
+            continue
+        try:
+            baseline_qty = float(managed_context.get("pre_existing_qty") or 0.0)
+        except Exception:
+            baseline_qty = 0.0
+        if baseline_qty > 0:
+            return baseline_qty
+
+    return 0.0
 
 
 def _same_trading_day_as_now(ts: Optional[datetime]) -> bool:
@@ -768,6 +900,23 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     paper_id     = getattr(paper_trade, "id", None)
     direct_short = _is_direct_short(paper_trade)
     allow_short  = bool(getattr(config, "alpaca_allow_short_selling", False))
+    live_pos = _get_live_symbol_position(broker, symbol)
+    live_side = str((live_pos or {}).get("side") or "").lower()
+    live_value = (live_pos or {}).get("market_value")
+    live_qty = (live_pos or {}).get("qty")
+
+    if event == "open" and not _is_live_symbol_configured(config, paper_trade):
+        _record_alpaca_order_skip(
+            db,
+            paper_id,
+            "buy" if not direct_short else "sell",
+            symbol,
+            notional,
+            broker.mode,
+            f"symbol {symbol} is not enabled in tracked/custom symbols",
+        )
+        print(f"[alpaca] skipping open for {symbol}: symbol is not enabled in tracked/custom symbols")
+        return
 
     # ── Entry conviction gate ───────────────────────────────────────────
     conviction_block = _get_entry_conviction_block_reason(paper_trade, event)
@@ -853,9 +1002,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
 
         max_pos = getattr(config, "alpaca_max_position_usd", None)
         if max_pos and max_pos > 0:
-            live_pos = _get_live_symbol_position(broker, symbol)
-            live_side = str((live_pos or {}).get("side") or "").lower()
-            live_value = (live_pos or {}).get("market_value")
             same_direction_live = (
                 (side == "buy" and live_side == "long") or
                 (side == "sell" and live_side == "short")
@@ -905,11 +1051,33 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     use_notional: Optional[float] = None
     order_type = str(getattr(config, "alpaca_order_type", "market") or "market")
     time_in_force = "day"
+    open_raw_context: Optional[Dict[str, Any]] = None
+
+    if event == "open":
+        same_direction_live = (
+            (side == "buy" and live_side == "long") or
+            (side == "sell" and live_side == "short")
+        )
+        open_raw_context = {
+            "pre_existing_qty": float(live_qty or 0.0) if same_direction_live else 0.0,
+            "pre_existing_side": live_side if same_direction_live else None,
+        }
 
     if ext_hours:
         # Pre/post-market: Alpaca requires explicit extended_hours + limit + qty.
         if event == "open" and entry_price > 0 and notional > 0:
             qty = round(notional / entry_price, 6)
+        elif event == "close":
+            managed_qty = _get_managed_trade_qty(db, paper_id, broker.mode)
+            preserved_manual_qty = _get_managed_trade_baseline_qty(db, paper_id, broker.mode)
+            closeable_live_qty = max(0.0, float(live_qty or 0.0) - preserved_manual_qty)
+            qty = min(managed_qty, closeable_live_qty)
+            if qty <= 0:
+                print(
+                    f"[alpaca] skipping close for {symbol} (paper_id={paper_id}): "
+                    "no app-managed quantity remains after preserving manual holdings"
+                )
+                return
         elif shares > 0:
             qty = shares
         elif entry_price > 0:
@@ -928,22 +1096,16 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
         limit_price = max(0.01, limit_price)
         order_type = "limit"
     elif event == "close":
-        # Prefer the live Alpaca position qty so the close exactly matches what
-        # Alpaca holds (handles partial fills, manual adjustments, etc.).
-        live_qty: Optional[float] = None
-        try:
-            pos_data = broker.get_position(symbol)
-            raw_q = pos_data.get("qty") or pos_data.get("available_shares")
-            if raw_q is not None:
-                live_qty = abs(float(raw_q))
-        except Exception as _pos_exc:
-            print(f"[alpaca] get_position({symbol}) failed, falling back to paper shares: {_pos_exc}")
-        if live_qty and live_qty > 0:
-            qty = live_qty
-        elif shares > 0:
-            qty = shares
-        else:
-            use_notional = notional  # last-resort fallback
+        managed_qty = _get_managed_trade_qty(db, paper_id, broker.mode)
+        preserved_manual_qty = _get_managed_trade_baseline_qty(db, paper_id, broker.mode)
+        closeable_live_qty = max(0.0, float(live_qty or 0.0) - preserved_manual_qty)
+        qty = min(managed_qty, closeable_live_qty)
+        if qty <= 0:
+            print(
+                f"[alpaca] skipping close for {symbol} (paper_id={paper_id}): "
+                "no app-managed quantity remains after preserving manual holdings"
+            )
+            return
     else:
         use_notional = notional
 
@@ -963,7 +1125,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
         )
         _record_alpaca_order(
             db, paper_id, side, symbol, use_notional, qty,
-            response, broker.mode, ext_hours, limit_price,
+            response, broker.mode, ext_hours, limit_price, open_raw_context,
         )
     except Exception as exc:
         _record_alpaca_order_error(

@@ -461,7 +461,7 @@ class SignalService:
 
         prompt = format_red_team_review_prompt(context.get("raw_context", ""))
         engine = SentimentEngine(model_name=model_name)
-        raw = engine._call_ollama(prompt, model_override=model_name, force_json=True, max_tokens=700)
+        raw = engine._call_ollama_sync(prompt, model_override=model_name, force_json=True, max_tokens=700)
         raw_text = engine._strip_thinking(raw.get("response", ""))
         payload = engine._extract_json_value(raw_text)
         if not isinstance(payload, dict):

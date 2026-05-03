@@ -31,6 +31,8 @@ def db_session():
 def _seed_config(db_session, **overrides):
     payload = dict(
         id=1,
+        tracked_symbols=["USO", "IBIT", "QQQ", "SPY"],
+        custom_symbols=[],
         allow_extended_hours_trading=True,
         alpaca_execution_mode="live",
         alpaca_live_trading_enabled=True,
@@ -72,6 +74,129 @@ class DummyBroker:
 
     def get_account(self):
         return self.account
+
+
+def test_open_skips_when_symbol_is_not_user_configured(db_session, monkeypatch):
+    config = _seed_config(db_session, tracked_symbols=["SPY"], custom_symbols=[])
+    paper_trade = PaperTrade(
+        underlying="NVDA",
+        execution_ticker="NVDA",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=500.0,
+        shares=2.0,
+        entry_price=250.0,
+        entered_at=datetime.utcnow(),
+        analysis_request_id="req-symbol-scope",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "open", config)
+
+    assert broker.orders == []
+    skip = db_session.query(AlpacaOrder).filter(AlpacaOrder.status == "skipped").one()
+    assert "not enabled in tracked/custom symbols" in (skip.error_message or "")
+
+
+def test_close_sells_only_app_managed_qty_above_manual_baseline(db_session, monkeypatch):
+    config = _seed_config(db_session, tracked_symbols=["NVDA"], custom_symbols=["NVDA"])
+    paper_trade = PaperTrade(
+        underlying="NVDA",
+        execution_ticker="NVDA",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=1000.0,
+        shares=5.0,
+        entry_price=200.0,
+        entered_at=datetime.utcnow() - timedelta(days=1),
+        analysis_request_id="req-close-owned-only",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+    db_session.add(
+        AlpacaOrder(
+            paper_trade_id=paper_trade.id,
+            alpaca_order_id="existing-open",
+            client_order_id="existing-client-open",
+            symbol="NVDA",
+            side="buy",
+            notional=1000.0,
+            qty=5.0,
+            order_type="market",
+            time_in_force="day",
+            status="filled",
+            filled_qty=5.0,
+            trading_mode="live",
+            raw_response={"_managed_context": {"pre_existing_qty": 3.0, "pre_existing_side": "long"}},
+        )
+    )
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.position = {"qty": "8", "market_value": "1760.00", "side": "long"}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "close", config)
+
+    assert len(broker.orders) == 1
+    assert broker.orders[0]["side"] == "sell"
+    assert broker.orders[0]["qty"] == pytest.approx(5.0)
+
+
+def test_close_skips_when_only_manual_baseline_remains(db_session, monkeypatch):
+    config = _seed_config(db_session, tracked_symbols=["NVDA"], custom_symbols=["NVDA"])
+    paper_trade = PaperTrade(
+        underlying="NVDA",
+        execution_ticker="NVDA",
+        signal_type="LONG",
+        leverage="1x",
+        market_session="open",
+        amount=1000.0,
+        shares=5.0,
+        entry_price=200.0,
+        entered_at=datetime.utcnow() - timedelta(days=1),
+        analysis_request_id="req-close-baseline-only",
+    )
+    db_session.add(paper_trade)
+    db_session.commit()
+    db_session.add(
+        AlpacaOrder(
+            paper_trade_id=paper_trade.id,
+            alpaca_order_id="existing-open-2",
+            client_order_id="existing-client-open-2",
+            symbol="NVDA",
+            side="buy",
+            notional=1000.0,
+            qty=5.0,
+            order_type="market",
+            time_in_force="day",
+            status="filled",
+            filled_qty=5.0,
+            trading_mode="live",
+            raw_response={"_managed_context": {"pre_existing_qty": 3.0, "pre_existing_side": "long"}},
+        )
+    )
+    db_session.commit()
+
+    broker = DummyBroker(mode="live")
+    broker.position = {"qty": "3", "market_value": "660.00", "side": "long"}
+    monkeypatch.setattr("services.alpaca_broker.get_broker_from_keychain", lambda mode=None: broker)
+    monkeypatch.setattr("services.alpaca_broker._is_extended_hours_now", lambda cfg=None: False)
+    monkeypatch.setattr("services.alpaca_broker._check_circuit_breakers", lambda db, cfg, pending_notional=0.0: None)
+
+    maybe_execute_alpaca_order(db_session, paper_trade, "close", config)
+
+    assert broker.orders == []
 
 
 @pytest.mark.parametrize("event,side", [("open", "buy"), ("close", "sell")])
