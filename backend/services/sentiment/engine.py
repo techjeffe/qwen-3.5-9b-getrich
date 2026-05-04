@@ -171,11 +171,13 @@ class SentimentEngine:
     - Fallback handling
     """
     
-    # Configuration — override with OLLAMA_MODEL and OLLAMA_URL env vars
+    # Configuration — override with OLLAMA_MODEL / OLLAMA_URL / VLLM_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.10
     MAX_TOKENS = 2048  # 1536 still truncated; maxItems:6 on phrase arrays caps output length
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+    INFERENCE_BACKEND = os.getenv("INFERENCE_BACKEND", "ollama").strip().lower()
+    VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000").rstrip("/")
 
     # Limit concurrent Ollama requests — local GPU processes one at a time, so parallel
     # requests queue up inside Ollama and each one's HTTP timeout starts ticking from
@@ -208,6 +210,14 @@ class SentimentEngine:
         self.model_name = (model_name or self.MODEL_NAME or "").strip()
         self.session = requests.Session()
         self._cache = {}
+        self.inference_backend = self.INFERENCE_BACKEND
+        self.vllm_url = self.VLLM_URL
+
+    @classmethod
+    def set_backend(cls, backend: str) -> None:
+        """Switch the active inference backend for all future engine instances."""
+        normalized = str(backend or "ollama").strip().lower()
+        cls.INFERENCE_BACKEND = normalized if normalized in {"ollama", "vllm"} else "ollama"
     
     def clear_cache(self):
         """Clear all cached analysis and LLM-generated keyword results."""
@@ -1044,6 +1054,8 @@ class SentimentEngine:
         max_tokens: Optional[int] = None,
         response_schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if self.inference_backend == "vllm":
+            return self._call_vllm_sync(prompt, model_override, force_json, max_tokens, response_schema)
         model = (model_override or self.model_name or "").strip()
         effective_max_tokens = max_tokens if max_tokens is not None else self.MAX_TOKENS
         # Estimate prompt tokens (4 chars ≈ 1 token for English) and size the KV cache
@@ -1117,7 +1129,63 @@ class SentimentEngine:
             raise Exception(f"Invalid JSON response from Ollama: {e}")
         except Exception as e:
             raise Exception(f"Ollama API error: {e}")
-    
+
+    def _call_vllm_sync(
+        self,
+        prompt: str,
+        model_override: Optional[str] = None,
+        force_json: bool = False,
+        max_tokens: Optional[int] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        model = (model_override or self.model_name or "").strip()
+        effective_max_tokens = max_tokens if max_tokens is not None else self.MAX_TOKENS
+        url = f"{self.vllm_url}/v1/completions"
+        payload: Dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": effective_max_tokens,
+            "temperature": self.TEMPERATURE,
+        }
+        if response_schema is not None:
+            payload["guided_json"] = response_schema
+        elif force_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        start_time = time.time()
+        response = None
+        try:
+            response = self.session.post(url, json=payload, timeout=180)
+            response.raise_for_status()
+            data = response.json()
+            text = data["choices"][0]["text"]
+            latency = (time.time() - start_time) * 1000
+            print(f"vLLM [{model}] completed in {latency:.1f}ms")
+            # Wrap in the same envelope _call_ollama_sync callers expect so that
+            # downstream _parse_json_with_repair / _extract_json_value work unchanged.
+            return {"response": text}
+        except requests.exceptions.Timeout:
+            raise Exception("vLLM API timeout")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Cannot connect to vLLM. Is it running?")
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            body_text = ""
+            if response is not None:
+                try:
+                    body_payload = response.json()
+                    body_text = str(body_payload.get("message") or body_payload)
+                except Exception:
+                    body_text = str(getattr(response, "text", "") or "")
+            detail = body_text.strip() or str(e)
+            raise Exception(f"vLLM API HTTP {status_code}: {detail}")
+        except (KeyError, IndexError) as e:
+            raise Exception(f"Unexpected vLLM response shape: {e}")
+        except json.JSONDecodeError as e:
+            raise Exception(f"Invalid JSON response from vLLM: {e}")
+        except Exception as e:
+            raise Exception(f"vLLM API error: {e}")
+
     def _parse_response(
         self,
         ollama_response: Dict[str, Any],

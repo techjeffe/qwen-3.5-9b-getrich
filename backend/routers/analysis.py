@@ -44,7 +44,7 @@ from services.data_ingestion.parser import RSSFeedParser
 from services.data_ingestion.worker import build_analysis_posts
 from services.data_ingestion.yfinance_client import PriceClient
 from services.data_ingestion.market_validation import MarketValidationClient
-from services.ollama import get_ollama_status
+from services.ollama import get_llm_backend_status
 from services.sentiment.engine import SentimentEngine
 from services.sentiment.prompts import (
     get_symbol_specialist_focus,
@@ -382,17 +382,17 @@ async def get_market_prices(
 
 
 @router.get("/ollama/status", tags=["System"])
-async def get_ollama_runtime_status():
-    """Return reachability and active model details from Ollama."""
+async def get_ollama_runtime_status(db: Session = Depends(get_db)):
+    """Return reachability and active model details from the configured inference backend."""
+    config = get_or_create_app_config(db)
+    backend = str(getattr(config, "inference_backend", "ollama") or "ollama")
     try:
-        return get_ollama_status()
+        return get_llm_backend_status(backend=backend)
     except Exception as exc:
-        import os as _os
-
         return {
             "reachable": False,
-            "ollama_root": _os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", ""),
-            "configured_model": _os.getenv("OLLAMA_MODEL", "").strip(),
+            "ollama_root": os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate").replace("/api/generate", ""),
+            "configured_model": os.getenv("OLLAMA_MODEL", "").strip(),
             "active_model": "",
             "available_models": [],
             "resolution": "unreachable",
@@ -1243,6 +1243,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
         prompt_overrides = config.symbol_prompt_overrides or {}
         timeout_seconds = _analysis_timeout_seconds(config)
         SentimentEngine.configure_parallelism(int(getattr(config, "ollama_parallel_slots", 1) or 1))
+        SentimentEngine.set_backend(str(getattr(config, "inference_backend", "ollama") or "ollama"))
         run_marker = str(uuid.uuid4())
         run_marked = False
 
@@ -1403,6 +1404,7 @@ async def analyze_market(
     effective_request = _apply_request_defaults(request, config)
     timeout_seconds = _analysis_timeout_seconds(config)
     SentimentEngine.configure_parallelism(int(getattr(config, "ollama_parallel_slots", 1) or 1))
+    SentimentEngine.set_backend(str(getattr(config, "inference_backend", "ollama") or "ollama"))
     run_marker = str(uuid.uuid4())
     run_marked = False
 

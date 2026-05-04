@@ -348,13 +348,16 @@ class PersistenceService:
                         "atr_pct": _atr_pct,
                     })
                 if recs_for_paper:
-                    paper_process_signals(
+                    _paper_actions = paper_process_signals(
                         db=db,
                         recommendations=recs_for_paper,
                         quotes_by_symbol=quotes_by_symbol,
                         request_id=request_id,
                         trade_amount=float(getattr(config, "paper_trade_amount", None) or 0) or None,
                     )
+                    _skipped = [a for a in (_paper_actions or []) if a.get("action") == "skipped"]
+                    if _skipped:
+                        print(f"[paper] {len(_skipped)} signal(s) skipped this run: {[a.get('reason') for a in _skipped]}")
             except Exception as _pe:
                 print(f"Paper trading hook error: {_pe}")
             retention_limit = int(getattr(config, "snapshot_retention_limit", DEFAULT_SNAPSHOT_RETENTION_LIMIT))

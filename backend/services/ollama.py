@@ -24,6 +24,14 @@ def _extract_model_names(payload: Dict[str, Any]) -> List[str]:
     ]
 
 
+def get_llm_backend_status(backend: str = "ollama", timeout: int = 3) -> Dict[str, Any]:
+    """Return status for whichever inference backend is currently selected."""
+    if backend == "vllm":
+        from services.vllm import get_vllm_status
+        return get_vllm_status(timeout=timeout)
+    return get_ollama_status(timeout=timeout)
+
+
 def get_ollama_status(timeout: int = 3) -> Dict[str, Any]:
     """Return reachability and active-model details from Ollama."""
     ollama_root = get_ollama_root_url()

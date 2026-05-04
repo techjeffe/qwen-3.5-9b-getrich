@@ -440,6 +440,7 @@ def process_signals(
 
     session = market_status(_allow_extended_hours_trading(db))
     if not session["tradeable"]:
+        print(f"[paper] signals skipped — market not tradeable ({session['label']})")
         return [_expired_action(ea) for ea in expired_actions] or [
             {"skipped": True, "reason": "market_closed", "session": session["label"]}
         ]
@@ -621,6 +622,7 @@ def process_signals(
             if _same_day_exit_edge_blocks_close(open_pos, existing_pos_price, now, _min_same_day_edge_pct):
                 action_summary["action"] = "held"
                 action_summary["reason"] = "min_same_day_exit_edge"
+                print(f"[paper] {underlying}: held — min same-day exit edge not reached (need {_min_same_day_edge_pct:.1%})")
                 action_summary["exit_edge_pct"] = round(
                     _directional_return_pct(open_pos.signal_type, open_pos.entry_price, existing_pos_price),
                     4,
@@ -641,6 +643,7 @@ def process_signals(
             action_summary["action"] = "held"
             action_summary["reason"] = "conviction_window_blocks_flip"
             action_summary["holding_window_until"] = _utc_iso(open_pos.holding_window_until)
+            print(f"[paper] {underlying} {signal_type}: held — conviction window blocks direction flip until {_utc_iso(open_pos.holding_window_until)}")
             actions.append(action_summary)
             continue
 
@@ -664,6 +667,7 @@ def process_signals(
                 if _now_utc < _exited + timedelta(minutes=_reentry_cooldown):
                     action_summary["action"] = "skipped"
                     action_summary["reason"] = "reentry_cooldown"
+                    print(f"[paper] {underlying} {signal_type}: skipped — reentry cooldown active ({_reentry_cooldown}min since last exit)")
                     actions.append(action_summary)
                     continue
 
@@ -704,6 +708,7 @@ def process_signals(
             action_summary["action"] = "skipped"
             action_summary["reason"] = "low_conviction_blocked"
             action_summary["entry_threshold"] = _threshold
+            print(f"[paper] {underlying} {signal_type}: skipped — LOW conviction blocked")
             actions.append(action_summary)
             continue
 
@@ -722,6 +727,7 @@ def process_signals(
                 action_summary["reason"] = "portfolio_cap_reached"
                 action_summary["portfolio_cap_usd"] = _portfolio_cap
                 action_summary["open_exposure_usd"] = round(_open_exposure, 2)
+                print(f"[paper] {underlying} {signal_type}: skipped — portfolio cap reached (${_open_exposure:.2f} / ${_portfolio_cap:.2f})")
                 actions.append(action_summary)
                 continue
             _amount = min(_amount, _remaining)
@@ -753,9 +759,11 @@ def process_signals(
             action_summary["entry_price"] = entry_price
             action_summary["amount"] = round(_amount, 2)
             action_summary["holding_window_until"] = _utc_iso(window_until)
+            print(f"[paper] {underlying} {signal_type}: opened {execution_ticker} @ ${entry_price:.2f} (${_amount:.2f}, {conviction_level})")
         else:
             action_summary["action"] = "skipped"
             action_summary["reason"] = "no_price_available"
+            print(f"[paper] {underlying} {signal_type}: skipped — no price available for {execution_ticker}")
 
         actions.append(action_summary)
 

@@ -540,6 +540,7 @@ export default function TradingPage() {
         return acc;
     }, {} as Record<BrokerMode, number>);
     const latestLiveOrderError = alpacaOrders.find((order) => order.trading_mode === "live" && !!order.error_message) ?? null;
+    const latestPaperOrderError = alpacaOrders.find((order) => order.trading_mode === "paper" && !!order.error_message) ?? null;
 
     // ── Live summary stats computed from Alpaca account + order fills ─────────
     const liveAccount = alpacaAccounts.live;
@@ -1214,6 +1215,13 @@ export default function TradingPage() {
                                 <span className="text-amber-300">{latestLiveOrderError.error_message}</span>
                             </div>
                         )}
+                        {latestPaperOrderError && (
+                            <div className="mx-5 mt-4 rounded-lg border border-amber-600/40 bg-amber-900/20 px-4 py-3 text-xs text-amber-200">
+                                Latest paper order blocked: {latestPaperOrderError.symbol} {latestPaperOrderError.side.toUpperCase()}
+                                {" — "}
+                                <span className="text-amber-300">{latestPaperOrderError.error_message}</span>
+                            </div>
+                        )}
                         <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                                 <thead>
@@ -1231,12 +1239,15 @@ export default function TradingPage() {
                                 <tbody>
                                     {alpacaOrders.map((order) => {
                                         const isFilled = order.status === "filled";
-                                        const isError = !!order.error_message;
+                                        const isSkipped = order.status === "skipped";
+                                        const isError = order.status === "error" || (!isFilled && !isSkipped && !!order.error_message);
                                         const statusColor = isFilled
                                             ? "text-emerald-300"
                                             : isError
                                                 ? "text-red-400"
-                                                : "text-slate-400";
+                                                : isSkipped
+                                                    ? "text-amber-400"
+                                                    : "text-slate-400";
                                         return (
                                             <tr key={order.id} className="border-b border-white/4 hover:bg-white/4 transition-colors">
                                                 <td className="px-4 py-3 font-semibold text-white">{order.symbol}</td>
@@ -1253,9 +1264,9 @@ export default function TradingPage() {
                                                 </td>
                                                 <td className="px-4 py-3 text-slate-400 capitalize">{order.order_type}</td>
                                                 <td className={`px-4 py-3 ${statusColor}`}>
-                                                    {isError ? (
-                                                        <span title={order.error_message ?? ""} className="cursor-help">
-                                                            {`error${order.error_message ? `: ${order.error_message}` : ""}`}
+                                                    {(isError || isSkipped) && order.error_message ? (
+                                                        <span title={order.error_message} className="cursor-help underline decoration-dotted">
+                                                            {isSkipped ? `skipped: ${order.error_message}` : `error: ${order.error_message}`}
                                                         </span>
                                                     ) : (
                                                         order.status ?? "—"

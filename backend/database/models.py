@@ -343,6 +343,9 @@ class AppConfig(Base):
     # Toggle the red-team adversarial review pass. Off saves ~one Ollama call
     # per analysis at the cost of losing the bias/risk countercheck.
     red_team_enabled = Column(Boolean, nullable=False, default=True)
+    # LLM inference backend. "ollama" uses /api/generate; "vllm" uses the
+    # OpenAI-compatible /v1/completions API (set VLLM_URL to point at it).
+    inference_backend = Column(String(16), nullable=False, default="ollama")
     risk_profile = Column(String(20), nullable=False, default="standard")
     risk_policy = Column(JSON, nullable=False, default={})
     web_research_enabled = Column(Boolean, nullable=False, default=False)

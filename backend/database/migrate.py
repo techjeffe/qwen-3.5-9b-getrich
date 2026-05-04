@@ -1,8 +1,16 @@
 """
 Database migration script. SQLite only — run to update the schema.
+Can be run from any directory: python backend/database/migrate.py
 """
 
 import os
+import sys
+from pathlib import Path
+
+# Ensure the backend/ directory is on sys.path so imports work regardless of cwd.
+_backend_dir = str(Path(__file__).resolve().parent.parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -37,6 +45,7 @@ def migrate():
             ("reasoning_model", "VARCHAR(128)", "''"),
             ("ollama_parallel_slots", "INTEGER", "1"),
             ("red_team_enabled", "BOOLEAN", "1"),
+            ("inference_backend", "VARCHAR(16)", "'ollama'"),
             ("risk_profile", "VARCHAR(20)", "'standard'"),
             ("risk_policy", "JSON", "'{}'"),
             ("web_research_enabled", "BOOLEAN", "0"),

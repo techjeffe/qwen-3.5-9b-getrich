@@ -30,6 +30,7 @@ export type AppConfig = {
     extraction_model: string;
     reasoning_model: string;
     ollama_parallel_slots: number;
+    inference_backend: string;
     red_team_enabled: boolean;
     risk_profile: string;
     risk_policy?: {
@@ -143,6 +144,7 @@ export const EMPTY_CONFIG: AppConfig = {
     extraction_model: "",
     reasoning_model: "",
     ollama_parallel_slots: 1,
+    inference_backend: "ollama",
     red_team_enabled: true,
     risk_profile: "standard",
     risk_policy: {

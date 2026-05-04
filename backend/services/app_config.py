@@ -46,6 +46,8 @@ DEFAULT_REMOTE_SNAPSHOT_MODE = "telegram"
 VALID_REMOTE_SNAPSHOT_MODES = {"telegram"}
 DEFAULT_ALPACA_EXECUTION_MODE = "off"
 VALID_ALPACA_EXECUTION_MODES = {"off", "paper", "live"}
+DEFAULT_INFERENCE_BACKEND = "ollama"
+VALID_INFERENCE_BACKENDS = {"ollama", "vllm"}
 MAX_CUSTOM_SYMBOLS = 50
 MAX_CUSTOM_RSS_FEEDS = 3
 MAX_TRACKED_SYMBOLS = len(DEFAULT_TRACKED_SYMBOLS) + MAX_CUSTOM_SYMBOLS
@@ -105,6 +107,11 @@ def _normalize_display_timezone(value: Any) -> str:
 def _normalize_alpaca_execution_mode(value: Any) -> str:
     normalized = str(value or DEFAULT_ALPACA_EXECUTION_MODE).strip().lower()
     return normalized if normalized in VALID_ALPACA_EXECUTION_MODES else DEFAULT_ALPACA_EXECUTION_MODE
+
+
+def _normalize_inference_backend(value: Any) -> str:
+    normalized = str(value or DEFAULT_INFERENCE_BACKEND).strip().lower()
+    return normalized if normalized in VALID_INFERENCE_BACKENDS else DEFAULT_INFERENCE_BACKEND
 
 
 def _normalize_symbols(symbols: Any, *, fallback: List[str] | None = None, max_items: int = MAX_TRACKED_SYMBOLS) -> List[str]:
@@ -863,6 +870,8 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.ollama_parallel_slots = max(1, min(8, slots))
     if "red_team_enabled" in payload:
         config.red_team_enabled = bool(payload.get("red_team_enabled"))
+    if "inference_backend" in payload:
+        config.inference_backend = _normalize_inference_backend(payload.get("inference_backend"))
     if "risk_profile" in payload:
         config.risk_profile = _normalize_risk_profile(payload.get("risk_profile"))
     if "risk_policy" in payload:
@@ -1147,6 +1156,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "reasoning_model": str(getattr(config, "reasoning_model", "") or ""),
         "ollama_parallel_slots": int(getattr(config, "ollama_parallel_slots", 1) or 1),
         "red_team_enabled": bool(getattr(config, "red_team_enabled", True)),
+        "inference_backend": _normalize_inference_backend(getattr(config, "inference_backend", DEFAULT_INFERENCE_BACKEND)),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
         "risk_policy": _normalize_risk_policy(getattr(config, "risk_policy", {})),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),

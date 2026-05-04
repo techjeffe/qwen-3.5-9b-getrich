@@ -252,6 +252,7 @@ export default function AdminPage() {
             config.data_ingestion_interval_seconds !== d.data_ingestion_interval_seconds ||
             config.snapshot_retention_limit !== d.snapshot_retention_limit ||
             config.ollama_parallel_slots !== d.ollama_parallel_slots ||
+            config.inference_backend !== d.inference_backend ||
             config.red_team_enabled !== d.red_team_enabled ||
             config.allow_extended_hours_trading !== d.allow_extended_hours_trading ||
             config.hold_overnight !== d.hold_overnight ||

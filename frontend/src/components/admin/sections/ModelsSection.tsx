@@ -16,6 +16,7 @@ type ModelsSectionProps = {
 
 export function ModelsSection({ config, setConfig, hasAdvancedCustomizations, depthOptions }: ModelsSectionProps) {
     const hasModels = config.available_models.length > 0;
+    const isVllm = config.inference_backend === "vllm";
 
     return (
         <section id="models" className="scroll-mt-24 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 space-y-5">
@@ -24,6 +25,32 @@ export function ModelsSection({ config, setConfig, hasAdvancedCustomizations, de
                 <p className="text-xs text-slate-500 mt-1">
                     Model selection follows the depth setting chosen above.
                 </p>
+            </div>
+
+            {/* Inference backend selector */}
+            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+                <div>
+                    <p className="text-xs font-semibold text-slate-300">Inference Backend</p>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                        Ollama serves models locally via its own API. vLLM uses an OpenAI-compatible endpoint — set{" "}
+                        <code className="text-slate-400">VLLM_URL</code> (default: http://localhost:8000).
+                    </p>
+                </div>
+                <div className="flex gap-2">
+                    {(["ollama", "vllm"] as const).map((backend) => (
+                        <button
+                            key={backend}
+                            onClick={() => setConfig((c) => ({ ...c, inference_backend: backend }))}
+                            className={`px-4 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+                                config.inference_backend === backend
+                                    ? "bg-blue-600 border-blue-500 text-white"
+                                    : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600"
+                            }`}
+                        >
+                            {backend === "ollama" ? "Ollama" : "vLLM"}
+                        </button>
+                    ))}
+                </div>
             </div>
 
             <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
@@ -179,7 +206,11 @@ export function ModelsSection({ config, setConfig, hasAdvancedCustomizations, de
                     </div>
                 )
             ) : (
-                <p className="text-xs text-amber-400 italic">No Ollama models detected — make sure Ollama is running.</p>
+                <p className="text-xs text-amber-400 italic">
+                    {isVllm
+                        ? "No vLLM models detected — make sure vLLM is running and VLLM_URL is set correctly."
+                        : "No Ollama models detected — make sure Ollama is running."}
+                </p>
             )}
         </section>
     );
