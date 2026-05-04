@@ -125,6 +125,30 @@ type AlpacaAccount = {
     trading_blocked?: boolean | string;
 };
 
+type AlpacaPosition = {
+    symbol: string;
+    qty: string | number;
+    avg_entry_price: string | number;
+    current_price: string | number;
+    last_price: string | number;
+    market_value: string | number;
+    unrealized_pnl: string | number;
+    unrealized_plpc: string | number;
+    side: "long" | "short";
+    session?: string;
+    buy_current_price?: string | number;
+    sell_current_price?: string | number;
+    today_cost_basis?: string | number;
+    today_pl?: string | number;
+    today_plpc?: string | number;
+    asset_meta?: {
+        alias_symbol?: string;
+        custom_name?: string;
+        custom_slug?: string;
+        order_pricing_helper_type?: string;
+    };
+};
+
 type AlpacaStatus = {
     execution_mode?: "off" | "paper" | "live";
     live_trading_enabled: boolean;
@@ -226,10 +250,10 @@ function DirectionBadge({ signal }: { signal: string }) {
 function ConvictionBadge({ conviction, tradingType }: { conviction: string | null; tradingType: string | null }) {
     const label = tradingType ?? conviction ?? "—";
     const colors: Record<string, string> = {
-        POSITION:      "bg-purple-500/10 text-purple-300 border-purple-500/20",
-        SWING:         "bg-blue-500/10 text-blue-300 border-blue-500/20",
-        VOLATILE_EVENT:"bg-amber-500/10 text-amber-300 border-amber-500/20",
-        SCALP:         "bg-slate-500/10 text-slate-300 border-slate-500/20",
+        POSITION: "bg-purple-500/10 text-purple-300 border-purple-500/20",
+        SWING: "bg-blue-500/10 text-blue-300 border-blue-500/20",
+        VOLATILE_EVENT: "bg-amber-500/10 text-amber-300 border-amber-500/20",
+        SCALP: "bg-slate-500/10 text-slate-300 border-slate-500/20",
     };
     const cls = colors[tradingType ?? ""] ?? "bg-slate-500/10 text-slate-400 border-slate-500/20";
     return (
@@ -411,6 +435,7 @@ export default function TradingPage() {
     const [alpacaOrders, setAlpacaOrders] = useState<AlpacaOrder[]>([]);
     const [alpacaAccounts, setAlpacaAccounts] = useState<Partial<Record<BrokerMode, AlpacaAccount>>>({});
     const [alpacaHistories, setAlpacaHistories] = useState<Partial<Record<BrokerMode, AlpacaPortfolioHistory>>>({});
+    const [alpacaLivePositions, setAlpacaLivePositions] = useState<AlpacaPosition[]>([]);
     const [preferredTrack, setPreferredTrack] = useState<TradingTrack>("strategy_paper");
 
     const load = useCallback(async () => {
@@ -429,13 +454,14 @@ export default function TradingPage() {
 
     const loadAlpaca = useCallback(async () => {
         try {
-            const [statusRes, ordersRes, paperAccountRes, liveAccountRes, paperHistoryRes, liveHistoryRes] = await Promise.all([
+            const [statusRes, ordersRes, paperAccountRes, liveAccountRes, paperHistoryRes, liveHistoryRes, livePositionsRes] = await Promise.all([
                 fetch("/api/alpaca/status", { cache: "no-store" }),
                 fetch("/api/alpaca/orders?limit=50", { cache: "no-store" }),
                 fetch("/api/alpaca/account?mode=paper", { cache: "no-store" }),
                 fetch("/api/alpaca/account?mode=live", { cache: "no-store" }),
                 fetch("/api/alpaca/portfolio-history?mode=paper&period=1M&timeframe=1D", { cache: "no-store" }),
                 fetch("/api/alpaca/portfolio-history?mode=live&period=1M&timeframe=1D", { cache: "no-store" }),
+                fetch("/api/alpaca/positions?mode=live", { cache: "no-store" }),
             ]);
             if (statusRes.ok) {
                 const s = await statusRes.json();
@@ -460,6 +486,10 @@ export default function TradingPage() {
                 if (history?.timestamp?.length) nextHistories.live = history;
             }
             setAlpacaHistories(nextHistories);
+
+            if (livePositionsRes.ok) {
+                setAlpacaLivePositions(await livePositionsRes.json());
+            }
         } catch { /* silent — Alpaca may not be configured */ }
     }, []);
 
@@ -525,31 +555,31 @@ export default function TradingPage() {
     const livePdtRiskLevel = liveTradingBlocked || livePatternDayTrader || (liveUnderPdtEquity && (liveDaytradeCount ?? 0) >= 3)
         ? "blocked"
         : liveUnderPdtEquity && (liveDaytradeCount ?? 0) >= 2
-        ? "warning"
-        : liveUnderPdtEquity
-        ? "watch"
-        : "clear";
+            ? "warning"
+            : liveUnderPdtEquity
+                ? "watch"
+                : "clear";
     const livePdtTone = livePdtRiskLevel === "blocked"
         ? "border-red-500/35 bg-red-500/10 text-red-200"
         : livePdtRiskLevel === "warning"
-        ? "border-amber-500/35 bg-amber-500/10 text-amber-100"
-        : livePdtRiskLevel === "watch"
-        ? "border-sky-500/30 bg-sky-500/10 text-sky-100"
-        : "border-emerald-500/25 bg-emerald-500/10 text-emerald-100";
+            ? "border-amber-500/35 bg-amber-500/10 text-amber-100"
+            : livePdtRiskLevel === "watch"
+                ? "border-sky-500/30 bg-sky-500/10 text-sky-100"
+                : "border-emerald-500/25 bg-emerald-500/10 text-emerald-100";
     const livePdtHeadline = livePdtRiskLevel === "blocked"
         ? "PDT protection active"
         : livePdtRiskLevel === "warning"
-        ? "PDT threshold close"
-        : livePdtRiskLevel === "watch"
-        ? "Sub-$25k account"
-        : "PDT status clear";
+            ? "PDT threshold close"
+            : livePdtRiskLevel === "watch"
+                ? "Sub-$25k account"
+                : "PDT status clear";
     const livePdtBody = livePdtRiskLevel === "blocked"
         ? "New opens and same-day closes can be blocked to avoid pattern day trading violations."
         : livePdtRiskLevel === "warning"
-        ? "This account is below $25k and is near the 3 day-trade threshold in the rolling 5-day window."
-        : livePdtRiskLevel === "watch"
-        ? "This account is below $25k, so same-day round trips need to stay limited."
-        : "Equity is above the standard PDT threshold or the account is not currently at risk.";
+            ? "This account is below $25k and is near the 3 day-trade threshold in the rolling 5-day window."
+            : livePdtRiskLevel === "watch"
+                ? "This account is below $25k, so same-day round trips need to stay limited."
+                : "Equity is above the standard PDT threshold or the account is not currently at risk.";
 
     const liveFilled = alpacaOrders.filter(
         (o) => o.trading_mode === "live" && o.status === "filled" && o.paper_trade_id != null,
@@ -561,16 +591,16 @@ export default function TradingPage() {
         liveByTrade.get(key)!.push(o);
     }
 
-    type LiveOpenRow  = { symbol: string; side: string; fillPrice: number; qty: number; openedAt: string | null };
+    type LiveOpenRow = { symbol: string; side: string; fillPrice: number; qty: number; openedAt: string | null };
     type LiveClosedRow = { symbol: string; buyPrice: number; sellPrice: number; qty: number; pnl: number; closedAt: string | null };
     const liveOpenRows: LiveOpenRow[] = [];
     const liveClosedRows: LiveClosedRow[] = [];
     let liveWins = 0, liveLosses = 0, liveRealized = 0;
 
     for (const orders of Array.from(liveByTrade.values())) {
-        const buys  = orders.filter((o) => o.side === "buy");
+        const buys = orders.filter((o) => o.side === "buy");
         const sells = orders.filter((o) => o.side === "sell");
-        const sym   = orders[0]?.symbol ?? "?";
+        const sym = orders[0]?.symbol ?? "?";
 
         if (!buys.length || !sells.length) {
             // Only one side filled — position is still open
@@ -589,7 +619,7 @@ export default function TradingPage() {
             continue;
         }
 
-        const buy  = buys.reduce((a, b)  => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
+        const buy = buys.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
         const sell = sells.reduce((a, b) => (a.filled_at ?? "") > (b.filled_at ?? "") ? a : b);
         if (!buy.filled_avg_price || !sell.filled_avg_price) continue;
         const qty = Math.min(buy.filled_qty ?? 0, sell.filled_qty ?? 0);
@@ -702,15 +732,14 @@ export default function TradingPage() {
                                             key={track}
                                             type="button"
                                             onClick={() => setPreferredTrack(track)}
-                                            className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
-                                                preferredTrack === track
-                                                    ? track === "strategy_paper"
-                                                        ? "border-sky-400/50 bg-sky-500/15 text-sky-200"
-                                                        : track === "alpaca_paper"
+                                            className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${preferredTrack === track
+                                                ? track === "strategy_paper"
+                                                    ? "border-sky-400/50 bg-sky-500/15 text-sky-200"
+                                                    : track === "alpaca_paper"
                                                         ? "border-cyan-400/50 bg-cyan-500/15 text-cyan-200"
                                                         : "border-rose-400/50 bg-rose-500/15 text-rose-200"
-                                                    : "border-slate-700 text-slate-400 hover:text-white"
-                                            }`}
+                                                : "border-slate-700 text-slate-400 hover:text-white"
+                                                }`}
                                         >
                                             {trackLabel(track)}
                                         </button>
@@ -747,7 +776,7 @@ export default function TradingPage() {
                                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-xl border border-rose-500/30 bg-rose-950/10 p-3">
                                     <StatCard label="Cash" value={liveAccount?.cash != null ? fmtMoney(liveAccount.cash) : "—"} />
                                     <StatCard label="Buying Power" value={liveAccount?.buying_power != null ? fmtMoney(liveAccount.buying_power) : "—"} />
-                                    <StatCard label="Open Positions" value={String(liveOpenRows.length)} />
+                                    <StatCard label="Open Positions" value={String(alpacaLivePositions.length)} />
                                     <StatCard label="Total Trades" value={String(liveTotalTrades)} />
                                 </div>
                                 <div className={`rounded-xl border p-4 ${livePdtTone}`}>
@@ -780,14 +809,14 @@ export default function TradingPage() {
                                     </div>
                                 </div>
 
-                                {/* Live open positions */}
+                                {/* Live open positions — from Alpaca live positions endpoint */}
                                 <div className="rounded-xl border border-rose-500/20 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
                                     <div className="px-5 py-4 border-b border-white/8 flex items-center gap-2">
                                         <Activity size={14} className="text-rose-400" />
                                         <p className="text-sm font-semibold text-white">Live Open Positions</p>
-                                        <span className="ml-auto text-[10px] text-slate-500">{liveOpenRows.length} position{liveOpenRows.length !== 1 ? "s" : ""}</span>
+                                        <span className="ml-auto text-[10px] text-slate-500">{alpacaLivePositions.length} position{alpacaLivePositions.length !== 1 ? "s" : ""}</span>
                                     </div>
-                                    {liveOpenRows.length > 0 ? (
+                                    {alpacaLivePositions.length > 0 ? (
                                         <div className="overflow-x-auto">
                                             <table className="w-full text-xs">
                                                 <thead>
@@ -795,22 +824,35 @@ export default function TradingPage() {
                                                         <th className="px-4 py-2.5 text-left">Symbol</th>
                                                         <th className="px-4 py-2.5 text-left">Side</th>
                                                         <th className="px-4 py-2.5 text-right">Qty</th>
-                                                        <th className="px-4 py-2.5 text-right">Fill Price</th>
-                                                        <th className="px-4 py-2.5 text-left">Opened</th>
+                                                        <th className="px-4 py-2.5 text-right">Avg Entry</th>
+                                                        <th className="px-4 py-2.5 text-right">Current</th>
+                                                        <th className="px-4 py-2.5 text-right">Unrealized P&L</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
-                                                    {liveOpenRows.map((row, i) => (
-                                                        <tr key={i} className="border-b border-white/4 hover:bg-white/4 transition-colors">
-                                                            <td className="px-4 py-3 font-semibold text-white">{row.symbol}</td>
-                                                            <td className="px-4 py-3">
-                                                                <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${row.side === "buy" ? "bg-emerald-500/15 text-emerald-300" : "bg-red-500/15 text-red-300"}`}>{row.side}</span>
-                                                            </td>
-                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">{row.qty.toFixed(4)}</td>
-                                                            <td className="px-4 py-3 text-right font-mono text-slate-300">${row.fillPrice.toFixed(2)}</td>
-                                                            <td className="px-4 py-3 text-slate-400">{fmtDate(row.openedAt)}</td>
-                                                        </tr>
-                                                    ))}
+                                                    {alpacaLivePositions.map((pos, i) => {
+                                                        const qtyNum = toNumber(pos.qty);
+                                                        const entryNum = toNumber(pos.avg_entry_price);
+                                                        const currentNum = toNumber(pos.current_price);
+                                                        const pnlNum = toNumber(pos.unrealized_pnl);
+                                                        const sideLower = String(pos.side || "").toLowerCase();
+                                                        return (
+                                                            <tr key={i} className="border-b border-white/4 hover:bg-white/4 transition-colors">
+                                                                <td className="px-4 py-3 font-semibold text-white">{pos.symbol}</td>
+                                                                <td className="px-4 py-3">
+                                                                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${sideLower === "long" ? "bg-emerald-500/15 text-emerald-300" : "bg-red-500/15 text-red-300"}`}>{sideLower}</span>
+                                                                </td>
+                                                                <td className="px-4 py-3 text-right font-mono text-slate-300">{qtyNum != null ? qtyNum.toFixed(4) : "—"}</td>
+                                                                <td className="px-4 py-3 text-right font-mono text-slate-300">{entryNum != null ? `$${entryNum.toFixed(2)}` : "—"}</td>
+                                                                <td className="px-4 py-3 text-right font-mono text-slate-300">{currentNum != null ? `$${currentNum.toFixed(2)}` : "—"}</td>
+                                                                <td className="px-4 py-3 text-right">
+                                                                    <span className={`inline-block rounded px-1.5 py-0.5 border text-[10px] font-semibold ${pnlBg(pnlNum ?? 0)}`}>
+                                                                        {fmtDollar(pnlNum ?? 0)}
+                                                                    </span>
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
                                                 </tbody>
                                             </table>
                                         </div>
@@ -909,7 +951,7 @@ export default function TradingPage() {
                         {/* Broker accounts */}
                         {(configuredBrokerModes.length > 0 || alpacaOrders.length > 0) && (
                             <div className="rounded-xl border border-white/8 p-5 space-y-4" style={{ background: "rgba(30,41,59,0.7)" }}>
-                            <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2">
                                     <Activity size={14} className="text-slate-400" />
                                     <p className="text-sm font-semibold text-white">Broker Accounts</p>
                                     <p className="text-[10px] text-slate-500 ml-auto">Tracked separately from the internal strategy paper ledger</p>
@@ -919,13 +961,12 @@ export default function TradingPage() {
                                         const account = alpacaAccounts[mode];
                                         const configured = !!alpacaStatus?.secrets?.[mode]?.configured;
                                         return (
-                                            <div key={mode} className={`rounded-xl border p-4 space-y-3 ${
-                                                preferredTrack === (mode === "paper" ? "alpaca_paper" : "alpaca_live")
-                                                    ? mode === "paper"
-                                                        ? "border-cyan-500/30 bg-cyan-950/10"
-                                                        : "border-rose-500/30 bg-rose-950/10"
-                                                    : "border-white/8"
-                                            }`}>
+                                            <div key={mode} className={`rounded-xl border p-4 space-y-3 ${preferredTrack === (mode === "paper" ? "alpaca_paper" : "alpaca_live")
+                                                ? mode === "paper"
+                                                    ? "border-cyan-500/30 bg-cyan-950/10"
+                                                    : "border-rose-500/30 bg-rose-950/10"
+                                                : "border-white/8"
+                                                }`}>
                                                 <div className="flex items-center gap-2">
                                                     <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wider ${modeBadgeClass(mode)}`}>
                                                         Alpaca {modeLabel(mode)}
@@ -1021,11 +1062,10 @@ export default function TradingPage() {
                                 {brokerModes
                                     .filter((mode) => !!alpacaHistories[mode])
                                     .map((mode) => (
-                                        <div key={mode} className={`rounded-xl p-5 ${
-                                            mode === "live"
-                                                ? "border border-rose-600/30"
-                                                : preferredTrack === "alpaca_paper" ? "border border-cyan-500/40" : "border border-sky-500/20"
-                                        }`} style={{ background: "rgba(30,41,59,0.7)" }}>
+                                        <div key={mode} className={`rounded-xl p-5 ${mode === "live"
+                                            ? "border border-rose-600/30"
+                                            : preferredTrack === "alpaca_paper" ? "border border-cyan-500/40" : "border border-sky-500/20"
+                                            }`} style={{ background: "rgba(30,41,59,0.7)" }}>
                                             <div className="flex items-center gap-2 mb-4">
                                                 <span className={`w-2 h-2 rounded-full shrink-0 ${mode === "live" ? "bg-rose-400" : "bg-sky-400"}`} />
                                                 <p className="text-sm font-semibold text-white">Alpaca {modeLabel(mode)} Equity</p>
@@ -1195,17 +1235,16 @@ export default function TradingPage() {
                                         const statusColor = isFilled
                                             ? "text-emerald-300"
                                             : isError
-                                            ? "text-red-400"
-                                            : "text-slate-400";
+                                                ? "text-red-400"
+                                                : "text-slate-400";
                                         return (
                                             <tr key={order.id} className="border-b border-white/4 hover:bg-white/4 transition-colors">
                                                 <td className="px-4 py-3 font-semibold text-white">{order.symbol}</td>
                                                 <td className="px-4 py-3">
-                                                    <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${
-                                                        order.side === "buy"
-                                                            ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
-                                                            : "bg-red-500/10 text-red-300 border-red-500/20"
-                                                    }`}>
+                                                    <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${order.side === "buy"
+                                                        ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                                                        : "bg-red-500/10 text-red-300 border-red-500/20"
+                                                        }`}>
                                                         {order.side.toUpperCase()}
                                                     </span>
                                                 </td>
@@ -1226,11 +1265,10 @@ export default function TradingPage() {
                                                     {order.filled_avg_price != null ? `$${order.filled_avg_price.toFixed(2)}` : "—"}
                                                 </td>
                                                 <td className="px-4 py-3">
-                                                    <span className={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wider ${
-                                                        order.trading_mode === "live"
-                                                            ? "bg-rose-600/20 text-rose-300"
-                                                            : "bg-slate-700 text-slate-400"
-                                                    }`}>
+                                                    <span className={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wider ${order.trading_mode === "live"
+                                                        ? "bg-rose-600/20 text-rose-300"
+                                                        : "bg-slate-700 text-slate-400"
+                                                        }`}>
                                                         {order.trading_mode}
                                                     </span>
                                                 </td>
