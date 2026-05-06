@@ -114,6 +114,7 @@ def migrate():
             ("alpaca_fixed_order_size",       "BOOLEAN", "0"),
             ("alpaca_order_type",             "VARCHAR(20)", "'market'"),
             ("alpaca_limit_slippage_pct",     "REAL", "0.002"),
+            ("alpaca_high_conviction_override_enabled", "BOOLEAN", "0"),
         ]:
             if column_name not in existing_cols:
                 print(f"Adding {column_name} to app_config...")

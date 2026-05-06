@@ -834,10 +834,14 @@ def _check_live_position_take_profit(
     return None
 
 
-def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str) -> Optional[str]:
+def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str, conviction_level: Optional[str] = None, high_conviction_override: bool = False) -> Optional[str]:
     """
     Return a human-readable reason when the order should be blocked to avoid
     pattern day trading issues on sub-$25k live accounts.
+
+    If conviction_level is 'HIGH' and high_conviction_override is True,
+    entry ("open") orders bypass the PDT gate — HIGH conviction trades are
+    allowed through even on PDT-flagged accounts.
     """
     try:
         account = broker.get_account()
@@ -861,6 +865,8 @@ def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str) -> Op
 
     if event == "open":
         if is_pdt_flagged or daytrade_count >= 3:
+            if high_conviction_override and conviction_level == "HIGH":
+                return "PDT_OVERRIDE"  # sentinel for caller to handle
             return (
                 f"PDT protection: live account equity ${equity:.2f} with "
                 f"daytrade_count={daytrade_count} blocks opening new positions"
@@ -950,22 +956,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             )
             return
 
-    if execution_mode == "live":
-        pdt_block_reason = _get_pdt_block_reason(broker, paper_trade, event)
-        if pdt_block_reason:
-            side_hint = "sell" if (event == "close" and _is_direct_short(paper_trade)) else ("buy" if event == "open" else "sell")
-            _record_alpaca_order_skip(
-                db,
-                paper_id,
-                side_hint,
-                symbol,
-                notional if event == "open" else None,
-                broker.mode,
-                pdt_block_reason,
-            )
-            print(f"[alpaca] skipping {event} for {symbol}: {pdt_block_reason}")
-            return
-
     # ── Determine Alpaca side ────────────────────────────────────────────────
     if event == "open":
         configured_notional = None
@@ -1027,6 +1017,47 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             else:
                 notional = min(notional, max_pos)
 
+    # ── Build open_raw_context early so PDT check can flag it ────────────
+    open_raw_context: Optional[Dict[str, Any]] = None
+    _pdt_override_flag = False
+    if event == "open":
+        same_direction_live = (
+            (side == "buy" and live_side == "long") or
+            (side == "sell" and live_side == "short")
+        )
+        open_raw_context = {
+            "pre_existing_qty": float(live_qty or 0.0) if same_direction_live else 0.0,
+            "pre_existing_side": live_side if same_direction_live else None,
+        }
+
+    if execution_mode == "live":
+        _conviction = str(getattr(paper_trade, "conviction_level", "MEDIUM") or "MEDIUM").upper()
+        _high_conv = bool(getattr(config, "alpaca_high_conviction_override_enabled", False))
+        _pdt_override = False
+        if _high_conv and _conviction == "HIGH":
+            _pdt_override = True
+        pdt_block_reason = _get_pdt_block_reason(broker, paper_trade, event, conviction_level=_conviction, high_conviction_override=_pdt_override)
+        if pdt_block_reason:
+            if pdt_block_reason == "PDT_OVERRIDE":
+                # HIGH conviction — allow entry but flag the override
+                _pdt_override_flag = True
+                if open_raw_context is not None:
+                    open_raw_context["high_conviction_pdt_override"] = True
+                print(f"[alpaca] HIGH conviction override — bypassing PDT gate for {symbol} ({event})")
+            else:
+                side_hint = "sell" if (event == "close" and _is_direct_short(paper_trade)) else ("buy" if event == "open" else "sell")
+                _record_alpaca_order_skip(
+                    db,
+                    paper_id,
+                    side_hint,
+                    symbol,
+                    notional if event == "open" else None,
+                    broker.mode,
+                    pdt_block_reason,
+                )
+                print(f"[alpaca] skipping {event} for {symbol}: {pdt_block_reason}")
+                return
+
     elif event == "close":
         # Guard: only close if a live open order was actually placed for this trade.
         # A skipped or failed open (direct short disabled, circuit breaker, etc.)
@@ -1051,17 +1082,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     use_notional: Optional[float] = None
     order_type = str(getattr(config, "alpaca_order_type", "market") or "market")
     time_in_force = "day"
-    open_raw_context: Optional[Dict[str, Any]] = None
-
-    if event == "open":
-        same_direction_live = (
-            (side == "buy" and live_side == "long") or
-            (side == "sell" and live_side == "short")
-        )
-        open_raw_context = {
-            "pre_existing_qty": float(live_qty or 0.0) if same_direction_live else 0.0,
-            "pre_existing_side": live_side if same_direction_live else None,
-        }
 
     if ext_hours:
         # Pre/post-market: Alpaca requires explicit extended_hours + limit + qty.

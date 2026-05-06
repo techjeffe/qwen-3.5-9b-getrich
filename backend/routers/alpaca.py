@@ -29,17 +29,18 @@ class AlpacaSecretsPayload(BaseModel):
 
 
 class AlpacaSettingsPayload(BaseModel):
-    alpaca_execution_mode:         Optional[str]   = None
-    alpaca_live_trading_enabled:   Optional[bool]  = None
-    alpaca_allow_short_selling:    Optional[bool]  = None
-    alpaca_paper_trade_amount_usd: Optional[float] = None
-    alpaca_live_trade_amount_usd:  Optional[float] = None
-    alpaca_max_position_usd:       Optional[float] = None
-    alpaca_max_total_exposure_usd: Optional[float] = None
-    alpaca_order_type:             Optional[str]   = None
-    alpaca_limit_slippage_pct:     Optional[float] = None
-    alpaca_daily_loss_limit_usd:   Optional[float] = None
-    alpaca_max_consecutive_losses: Optional[int]   = None
+    alpaca_execution_mode:                 Optional[str]   = None
+    alpaca_live_trading_enabled:           Optional[bool]  = None
+    alpaca_allow_short_selling:            Optional[bool]  = None
+    alpaca_paper_trade_amount_usd:         Optional[float] = None
+    alpaca_live_trade_amount_usd:          Optional[float] = None
+    alpaca_max_position_usd:               Optional[float] = None
+    alpaca_max_total_exposure_usd:         Optional[float] = None
+    alpaca_order_type:                     Optional[str]   = None
+    alpaca_limit_slippage_pct:             Optional[float] = None
+    alpaca_daily_loss_limit_usd:           Optional[float] = None
+    alpaca_max_consecutive_losses:         Optional[int]   = None
+    alpaca_high_conviction_override_enabled: Optional[bool] = None
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
@@ -70,19 +71,20 @@ async def get_alpaca_status(
             account_info = {"error": str(exc)}
 
     return {
-        "secrets":                   secret_status,
-        "execution_mode":            str(getattr(config, "alpaca_execution_mode", "off") or "off"),
-        "live_trading_enabled":      bool(getattr(config, "alpaca_live_trading_enabled",   False)),
-        "allow_short_selling":       bool(getattr(config, "alpaca_allow_short_selling",    False)),
-        "paper_trade_amount_usd":    getattr(config, "alpaca_paper_trade_amount_usd",      None),
-        "live_trade_amount_usd":     getattr(config, "alpaca_live_trade_amount_usd",       None),
-        "max_position_usd":          getattr(config, "alpaca_max_position_usd",            None),
-        "max_total_exposure_usd":    getattr(config, "alpaca_max_total_exposure_usd",      None),
-        "order_type":                str(getattr(config,  "alpaca_order_type",             "market") or "market"),
-        "limit_slippage_pct":        float(getattr(config, "alpaca_limit_slippage_pct",    0.002) or 0.002),
-        "daily_loss_limit_usd":      getattr(config, "alpaca_daily_loss_limit_usd",        None),
-        "max_consecutive_losses":    getattr(config, "alpaca_max_consecutive_losses",      3),
-        "account":                   account_info,
+        "secrets":                            secret_status,
+        "execution_mode":                     str(getattr(config, "alpaca_execution_mode", "off") or "off"),
+        "live_trading_enabled":               bool(getattr(config, "alpaca_live_trading_enabled",   False)),
+        "allow_short_selling":                bool(getattr(config, "alpaca_allow_short_selling",    False)),
+        "paper_trade_amount_usd":             getattr(config, "alpaca_paper_trade_amount_usd",      None),
+        "live_trade_amount_usd":              getattr(config, "alpaca_live_trade_amount_usd",       None),
+        "max_position_usd":                   getattr(config, "alpaca_max_position_usd",            None),
+        "max_total_exposure_usd":             getattr(config, "alpaca_max_total_exposure_usd",      None),
+        "order_type":                         str(getattr(config,  "alpaca_order_type",             "market") or "market"),
+        "limit_slippage_pct":                 float(getattr(config, "alpaca_limit_slippage_pct",    0.002) or 0.002),
+        "daily_loss_limit_usd":               getattr(config, "alpaca_daily_loss_limit_usd",        None),
+        "max_consecutive_losses":             getattr(config, "alpaca_max_consecutive_losses",      3),
+        "high_conviction_override_enabled":   bool(getattr(config, "alpaca_high_conviction_override_enabled", False)),
+        "account":                            account_info,
     }
 
 
@@ -165,6 +167,26 @@ async def get_alpaca_positions(
             if isinstance(position, dict):
                 position["trading_mode"] = broker.mode
         return positions
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/positions/{symbol}/close")
+async def close_alpaca_position(
+    symbol: str,
+    mode: Optional[str] = Query(default=None, pattern="^(paper|live)$"),
+    _admin: None = Depends(require_admin_token),
+) -> Dict[str, Any]:
+    """Close an open Alpaca position for the given symbol."""
+    broker = get_broker_from_keychain(mode=mode)
+    if broker is None:
+        slot = f" for {mode}" if mode else ""
+        raise HTTPException(status_code=400, detail=f"Alpaca API keys not configured{slot}")
+    try:
+        result = broker.close_position(symbol)
+        if isinstance(result, dict):
+            result["trading_mode"] = broker.mode
+        return {"ok": True, "result": result}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -289,6 +311,7 @@ async def update_alpaca_settings(
         "limit_slippage_pct":        float(getattr(config, "alpaca_limit_slippage_pct",    0.002) or 0.002),
         "daily_loss_limit_usd":      getattr(config, "alpaca_daily_loss_limit_usd",        None),
         "max_consecutive_losses":    getattr(config, "alpaca_max_consecutive_losses",      3),
+        "high_conviction_override_enabled": bool(getattr(config, "alpaca_high_conviction_override_enabled", False)),
     }
 
 

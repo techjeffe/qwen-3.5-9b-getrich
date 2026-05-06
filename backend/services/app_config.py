@@ -968,6 +968,8 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.alpaca_daily_loss_limit_usd = _normalize_trading_logic_float(payload.get("alpaca_daily_loss_limit_usd"), 1.0, 1_000_000.0)
     if "alpaca_max_consecutive_losses" in payload:
         config.alpaca_max_consecutive_losses = _normalize_trading_logic_int(payload.get("alpaca_max_consecutive_losses"), 1, 50)
+    if "alpaca_high_conviction_override_enabled" in payload:
+        config.alpaca_high_conviction_override_enabled = _coerce_bool(payload.get("alpaca_high_conviction_override_enabled"), False)
 
     db.add(config)
     db.commit()
@@ -1198,6 +1200,7 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "alpaca_limit_slippage_pct":     float(getattr(config, "alpaca_limit_slippage_pct",    0.002) or 0.002),
         "alpaca_daily_loss_limit_usd":   getattr(config, "alpaca_daily_loss_limit_usd",        None),
         "alpaca_max_consecutive_losses": getattr(config, "alpaca_max_consecutive_losses",      3),
+        "alpaca_high_conviction_override_enabled": bool(getattr(config, "alpaca_high_conviction_override_enabled", False)),
         # JSON defaults (read-only, for display)
         "logic_defaults": {
             "paper_trade_amount": _L["paper_trade_amount"],

@@ -152,6 +152,7 @@ type AlpacaPosition = {
 type AlpacaStatus = {
     execution_mode?: "off" | "paper" | "live";
     live_trading_enabled: boolean;
+    high_conviction_override_enabled: boolean;
     secrets?: {
         paper?: { configured?: boolean };
         live?: { configured?: boolean };
@@ -248,7 +249,9 @@ function DirectionBadge({ signal }: { signal: string }) {
 }
 
 function ConvictionBadge({ conviction, tradingType }: { conviction: string | null; tradingType: string | null }) {
+    const isHigh = conviction === "HIGH";
     const label = tradingType ?? conviction ?? "—";
+    const highBg = "bg-yellow-500/15 text-yellow-300 border-yellow-500/30";
     const colors: Record<string, string> = {
         POSITION: "bg-purple-500/10 text-purple-300 border-purple-500/20",
         SWING: "bg-blue-500/10 text-blue-300 border-blue-500/20",
@@ -257,7 +260,8 @@ function ConvictionBadge({ conviction, tradingType }: { conviction: string | nul
     };
     const cls = colors[tradingType ?? ""] ?? "bg-slate-500/10 text-slate-400 border-slate-500/20";
     return (
-        <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${cls}`}>
+        <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${isHigh ? highBg : cls}`}>
+            {isHigh && "⚡ "}
             {label}
         </span>
     );
@@ -437,6 +441,7 @@ export default function TradingPage() {
     const [alpacaHistories, setAlpacaHistories] = useState<Partial<Record<BrokerMode, AlpacaPortfolioHistory>>>({});
     const [alpacaLivePositions, setAlpacaLivePositions] = useState<AlpacaPosition[]>([]);
     const [preferredTrack, setPreferredTrack] = useState<TradingTrack>("strategy_paper");
+    const [livePrices, setLivePrices] = useState<Record<string, any>>({});
 
     const load = useCallback(async () => {
         try {
@@ -494,6 +499,109 @@ export default function TradingPage() {
     }, []);
 
     useEffect(() => { load(); loadAlpaca(); }, [load, loadAlpaca]);
+
+    useEffect(() => {
+        if (!data || data.open_positions.length === 0) return;
+        const symbols = Array.from(new Set(data.open_positions.map(p => p.execution_ticker))).join(",");
+        const fetchPrices = async () => {
+            try {
+                const res = await fetch(`/api/prices?symbols=${symbols}`);
+                if (res.ok) setLivePrices(await res.json());
+            } catch { }
+        };
+        fetchPrices();
+        const interval = setInterval(fetchPrices, 10000);
+        return () => clearInterval(interval);
+    }, [data]);
+
+    useEffect(() => {
+        if (alpacaLivePositions.length === 0) return;
+        const symbols = Array.from(new Set(alpacaLivePositions.map(p => p.symbol))).join(",");
+        const fetchPrices = async () => {
+            try {
+                const res = await fetch(`/api/prices?symbols=${symbols}`);
+                if (res.ok) {
+                    const priceData = await res.json();
+                    setLivePrices(prev => ({ ...prev, ...priceData }));
+                }
+            }
+            catch { }
+        };
+        fetchPrices();
+        const interval = setInterval(fetchPrices, 10000);
+        return () => clearInterval(interval);
+    }, [alpacaLivePositions]);
+
+    const handleClosePosition = async (tradeId: number) => {
+        if (!confirm("Are you sure you want to manually close this position?")) return;
+        try {
+            const res = await fetch(`/api/paper-trading/close`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ trade_id: tradeId })
+            });
+            if (!res.ok) throw new Error("Failed to close position");
+            await load(); // Reload data immediately to reflect the change
+        } catch (err: any) {
+            alert(err.message);
+        }
+    };
+
+    const handleCloseAlpacaPosition = async (symbol: string) => {
+        if (!confirm(`Are you sure you want to close the live position for ${symbol}?`)) return;
+        try {
+            const res = await fetch(`/api/alpaca/positions/${symbol}/close`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ mode: "live" })
+            });
+            if (!res.ok) {
+                const errorData = await res.json().catch(() => ({ error: res.statusText }));
+                throw new Error(errorData.error || "Failed to close position");
+            }
+            await load();
+            await loadAlpaca(); // Reload Alpaca data immediately to reflect the change
+        } catch (err: any) {
+            alert(err.message);
+        }
+    };
+
+    const calculateUnrealizedPnl = (trade: any, currentPrice?: number) => {
+        if (!currentPrice) return { pnl: trade.unrealized_pnl, pct: trade.unrealized_pnl_pct };
+
+        let priceDiff = currentPrice - trade.entry_price;
+
+        // If direct shorting is used (execution ticker is the underlying, but signal is SHORT)
+        if (trade.signal_type === "SHORT" && trade.execution_ticker === trade.underlying) {
+            priceDiff = -priceDiff;
+        }
+        // Otherwise (Longs and Inverse ETFs like SPXS or SCO), 
+        // the execution ticker naturally tracks the P&L direction correctly.
+
+        const rawReturn = priceDiff / trade.entry_price;
+        const pnlPct = rawReturn * 100;
+        // Use shares for exact precision, fallback to amount * return if shares is missing
+        const pnlAmount = trade.shares ? (trade.shares * priceDiff) : (trade.amount * rawReturn);
+        return { pnl: pnlAmount, pct: pnlPct };
+    };
+
+    const calculateUnrealizedPnlForLive = (pos: AlpacaPosition, currentPrice?: number) => {
+        const qtyNum = toNumber(pos.qty);
+        const entryNum = toNumber(pos.avg_entry_price);
+        if (!currentPrice || !qtyNum || !entryNum) return { pnl: toNumber(pos.unrealized_pnl) ?? 0, pct: toNumber(pos.unrealized_plpc) ?? 0 };
+
+        const sideLower = String(pos.side || "").toLowerCase();
+        let priceDiff = currentPrice - entryNum;
+
+        // For shorts, P&L is inverted
+        if (sideLower === "short") {
+            priceDiff = -priceDiff;
+        }
+
+        const pnlPct = (priceDiff / entryNum) * 100;
+        const pnlAmount = qtyNum * priceDiff;
+        return { pnl: pnlAmount, pct: pnlPct };
+    };
 
     useEffect(() => {
         try {
@@ -780,35 +888,45 @@ export default function TradingPage() {
                                     <StatCard label="Open Positions" value={String(alpacaLivePositions.length)} />
                                     <StatCard label="Total Trades" value={String(liveTotalTrades)} />
                                 </div>
-                                <div className={`rounded-xl border p-4 ${livePdtTone}`}>
-                                    <div className="flex items-center justify-between gap-3 flex-wrap">
-                                        <div>
-                                            <p className="text-sm font-semibold">{livePdtHeadline}</p>
-                                            <p className="mt-1 text-xs text-current/80">{livePdtBody}</p>
+                                {(() => {
+                                    const highConvOverride = alpacaStatus?.high_conviction_override_enabled ?? false;
+                                    return (
+                                        <div className={`rounded-xl border p-4 ${livePdtTone}`}>
+                                            <div className="flex items-center justify-between gap-3 flex-wrap">
+                                                <div>
+                                                    <p className="text-sm font-semibold">{livePdtHeadline}</p>
+                                                    <p className="mt-1 text-xs text-current/80">{livePdtBody}</p>
+                                                    {highConvOverride && (
+                                                        <p className="mt-2 text-xs text-current/90 font-medium">
+                                                            ⚡ <strong>High conviction override active:</strong> HIGH conviction trades can enter positions even when PDT limits are approaching.
+                                                        </p>
+                                                    )}
+                                                </div>
+                                                <span className="rounded-full border border-current/20 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide">
+                                                    {livePdtRiskLevel}
+                                                </span>
+                                            </div>
+                                            <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                                                <div>
+                                                    <p className="text-current/65">Equity</p>
+                                                    <p className="mt-1 font-semibold">{liveEquity != null ? fmtMoney(liveEquity) : "—"}</p>
+                                                </div>
+                                                <div>
+                                                    <p className="text-current/65">Day Trades</p>
+                                                    <p className="mt-1 font-semibold">{liveDaytradeCount != null ? String(liveDaytradeCount) : "—"}</p>
+                                                </div>
+                                                <div>
+                                                    <p className="text-current/65">PDT Flag</p>
+                                                    <p className="mt-1 font-semibold">{livePatternDayTrader ? "Yes" : "No"}</p>
+                                                </div>
+                                                <div>
+                                                    <p className="text-current/65">Daytrade BP</p>
+                                                    <p className="mt-1 font-semibold">{liveDaytradingBuyingPower != null ? fmtMoney(liveDaytradingBuyingPower) : "—"}</p>
+                                                </div>
+                                            </div>
                                         </div>
-                                        <span className="rounded-full border border-current/20 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide">
-                                            {livePdtRiskLevel}
-                                        </span>
-                                    </div>
-                                    <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                                        <div>
-                                            <p className="text-current/65">Equity</p>
-                                            <p className="mt-1 font-semibold">{liveEquity != null ? fmtMoney(liveEquity) : "—"}</p>
-                                        </div>
-                                        <div>
-                                            <p className="text-current/65">Day Trades</p>
-                                            <p className="mt-1 font-semibold">{liveDaytradeCount != null ? String(liveDaytradeCount) : "—"}</p>
-                                        </div>
-                                        <div>
-                                            <p className="text-current/65">PDT Flag</p>
-                                            <p className="mt-1 font-semibold">{livePatternDayTrader ? "Yes" : "No"}</p>
-                                        </div>
-                                        <div>
-                                            <p className="text-current/65">Daytrade BP</p>
-                                            <p className="mt-1 font-semibold">{liveDaytradingBuyingPower != null ? fmtMoney(liveDaytradingBuyingPower) : "—"}</p>
-                                        </div>
-                                    </div>
-                                </div>
+                                    );
+                                })()}
 
                                 {/* Live open positions — from Alpaca live positions endpoint */}
                                 <div className="rounded-xl border border-rose-500/20 overflow-hidden" style={{ background: "rgba(30,41,59,0.7)" }}>
@@ -828,6 +946,7 @@ export default function TradingPage() {
                                                         <th className="px-4 py-2.5 text-right">Avg Entry</th>
                                                         <th className="px-4 py-2.5 text-right">Current</th>
                                                         <th className="px-4 py-2.5 text-right">Unrealized P&L</th>
+                                                        <th className="px-4 py-2.5 text-right">Actions</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
@@ -835,7 +954,9 @@ export default function TradingPage() {
                                                         const qtyNum = toNumber(pos.qty);
                                                         const entryNum = toNumber(pos.avg_entry_price);
                                                         const currentNum = toNumber(pos.current_price);
-                                                        const pnlNum = toNumber(pos.unrealized_pnl);
+                                                        const livePrice = livePrices[pos.symbol]?.price;
+                                                        const { pnl: pnlNum, pct: pnlPct } = calculateUnrealizedPnlForLive(pos, livePrice);
+                                                        const displayPrice = livePrice ?? toNumber(pos.current_price);
                                                         const sideLower = String(pos.side || "").toLowerCase();
                                                         return (
                                                             <tr key={i} className="border-b border-white/4 hover:bg-white/4 transition-colors">
@@ -848,8 +969,16 @@ export default function TradingPage() {
                                                                 <td className="px-4 py-3 text-right font-mono text-slate-300">{currentNum != null ? `$${currentNum.toFixed(2)}` : "—"}</td>
                                                                 <td className="px-4 py-3 text-right">
                                                                     <span className={`inline-block rounded px-1.5 py-0.5 border text-[10px] font-semibold ${pnlBg(pnlNum ?? 0)}`}>
-                                                                        {fmtDollar(pnlNum ?? 0)}
+                                                                        {fmtDollar(pnlNum ?? 0)} ({fmt(pnlPct ?? 0)}%)
                                                                     </span>
+                                                                </td>
+                                                                <td className="px-4 py-3 text-right">
+                                                                    <button
+                                                                        onClick={() => handleCloseAlpacaPosition(pos.symbol)}
+                                                                        className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] font-semibold text-rose-400 hover:bg-rose-500/20 transition-colors"
+                                                                    >
+                                                                        Close
+                                                                    </button>
                                                                 </td>
                                                             </tr>
                                                         );
@@ -1103,30 +1232,44 @@ export default function TradingPage() {
                                                 <th className="px-4 py-2.5 text-right">P&L</th>
                                                 <th className="px-4 py-2.5 text-left">Entered</th>
                                                 <th className="px-4 py-2.5 text-left">Session</th>
+                                                <th className="px-4 py-2.5 text-right">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {data.open_positions.map((pos) => (
-                                                <tr key={pos.id} className="border-b border-white/4 hover:bg-white/4 transition-colors">
-                                                    <td className="px-4 py-3 font-semibold text-white">
-                                                        {pos.execution_ticker}
-                                                        <span className="text-slate-500 font-normal ml-1 text-[10px]">({pos.underlying})</span>
-                                                    </td>
-                                                    <td className="px-4 py-3"><DirectionBadge signal={pos.signal_type} /></td>
-                                                    <td className="px-4 py-3 text-slate-300">{pos.leverage}</td>
-                                                    <td className="px-4 py-3"><ConvictionBadge conviction={pos.conviction_level} tradingType={pos.trading_type} /></td>
-                                                    <td className="px-4 py-3"><WindowBadge active={pos.window_active} remaining={pos.window_remaining_minutes} /></td>
-                                                    <td className="px-4 py-3 text-right font-mono text-slate-300">${pos.entry_price.toFixed(2)}</td>
-                                                    <td className="px-4 py-3 text-right font-mono text-slate-200">${pos.current_price.toFixed(2)}</td>
-                                                    <td className="px-4 py-3 text-right">
-                                                        <span className={`inline-block rounded px-1.5 py-0.5 border text-[10px] font-semibold ${pnlBg(pos.unrealized_pnl)}`}>
-                                                            {fmtDollar(pos.unrealized_pnl)} ({fmt(pos.unrealized_pnl_pct)}%)
-                                                        </span>
-                                                    </td>
-                                                    <td className="px-4 py-3 text-slate-400">{fmtDate(pos.entered_at)}</td>
-                                                    <td className="px-4 py-3"><SessionBadge session={pos.market_session} /></td>
-                                                </tr>
-                                            ))}
+                                            {data.open_positions.map((pos) => {
+                                                const livePrice = livePrices[pos.execution_ticker]?.price;
+                                                const { pnl, pct } = calculateUnrealizedPnl(pos, livePrice);
+                                                const displayPrice = livePrice ?? pos.current_price;
+                                                return (
+                                                    <tr key={pos.id} className="border-b border-white/4 hover:bg-white/4 transition-colors">
+                                                        <td className="px-4 py-3 font-semibold text-white">
+                                                            {pos.execution_ticker}
+                                                            <span className="text-slate-500 font-normal ml-1 text-[10px]">({pos.underlying})</span>
+                                                        </td>
+                                                        <td className="px-4 py-3"><DirectionBadge signal={pos.signal_type} /></td>
+                                                        <td className="px-4 py-3 text-slate-300">{pos.leverage}</td>
+                                                        <td className="px-4 py-3"><ConvictionBadge conviction={pos.conviction_level} tradingType={pos.trading_type} /></td>
+                                                        <td className="px-4 py-3"><WindowBadge active={pos.window_active} remaining={pos.window_remaining_minutes} /></td>
+                                                        <td className="px-4 py-3 text-right font-mono text-slate-300">${pos.entry_price.toFixed(2)}</td>
+                                                        <td className="px-4 py-3 text-right font-mono text-slate-200">${displayPrice.toFixed(2)}</td>
+                                                        <td className="px-4 py-3 text-right">
+                                                            <span className={`inline-block rounded px-1.5 py-0.5 border text-[10px] font-semibold ${pnlBg(pnl)}`}>
+                                                                {fmtDollar(pnl)} ({fmt(pct)}%)
+                                                            </span>
+                                                        </td>
+                                                        <td className="px-4 py-3 text-slate-400">{fmtDate(pos.entered_at)}</td>
+                                                        <td className="px-4 py-3"><SessionBadge session={pos.market_session} /></td>
+                                                        <td className="px-4 py-3 text-right">
+                                                            <button
+                                                                onClick={() => handleClosePosition(pos.id)}
+                                                                className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] font-semibold text-rose-400 hover:bg-rose-500/20 transition-colors"
+                                                            >
+                                                                Close
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
                                         </tbody>
                                     </table>
                                 </div>

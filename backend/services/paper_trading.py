@@ -490,11 +490,22 @@ def process_signals(
         price_data = quotes_by_symbol.get(execution_ticker) or quotes_by_symbol.get(underlying) or {}
         entry_price = float(price_data.get("current_price") or price_data.get("price") or 0.0)
 
-        open_pos = (
+        open_positions = (
             db.query(PaperTrade)
             .filter(PaperTrade.underlying == underlying, PaperTrade.exited_at.is_(None))
-            .first()
+            .order_by(PaperTrade.entered_at.desc())
+            .all()
         )
+        
+        open_pos = open_positions[0] if open_positions else None
+        
+        # Clean up any rogue simultaneous positions for the same underlying
+        if len(open_positions) > 1:
+            for p in open_positions[1:]:
+                p_price = _resolve_position_market_price(p, quotes_by_symbol)
+                if p_price > 0:
+                    _close_position(p, p_price, now, db, reason="Simultaneous position cleanup")
+                    _alpaca_pending.append((p, "close"))
 
         action_summary: Dict[str, Any] = {
             "underlying": underlying,

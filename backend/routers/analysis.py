@@ -1478,6 +1478,46 @@ async def reset_paper_trading(
     return {"deleted": deleted, "message": "Paper trading history cleared"}
 
 
+@router.post("/paper-trading/{trade_id}/close", tags=["Paper Trading"])
+async def manual_close_trade(
+    trade_id: int, 
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db)
+):
+    from database.models import PaperTrade
+    from services.data_ingestion.yfinance_client import PriceClient
+    from datetime import datetime, timezone
+    
+    trade = db.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+    if not trade or trade.exited_at is not None:
+        raise HTTPException(status_code=400, detail="Trade not found or already closed")
+        
+    # Get current market price
+    price_client = PriceClient()
+    try:
+        quote = price_client.get_realtime_quote(trade.execution_ticker)
+        current_price = float((quote or {}).get("current_price") or trade.entry_price or 0.0)
+    except Exception:
+        current_price = float(trade.entry_price or 0.0)
+        
+    now = datetime.utcnow()
+    
+    from services.paper_trading import _close_position, _dispatch_alpaca_orders
+    _close_position(trade, current_price, now, db, reason="Manual Close")
+    
+    _alpaca_pending = [(trade, "close")]
+    db.commit()
+    
+    try:
+        from services.app_config import get_or_create_app_config
+        config = get_or_create_app_config(db)
+        _dispatch_alpaca_orders(db, _alpaca_pending, config)
+    except Exception:
+        pass
+        
+    return {"status": "success", "closed_price": current_price}
+
+
 @router.get("/analysis-debug/latest", tags=["System"])
 async def get_latest_analysis_debug(
     _admin: None = Depends(require_admin_token),

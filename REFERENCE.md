@@ -161,6 +161,7 @@ The backend runs `migrate.py` automatically on every startup. This table is for 
 | `alpaca_limit_slippage_pct` | `app_config` | `0.002` | Slippage added to limit price |
 | `alpaca_daily_loss_limit_usd` | `app_config` | `NULL` | Daily realized loss circuit breaker |
 | `alpaca_max_consecutive_losses` | `app_config` | `3` | Consecutive losses before auto-disable |
+| `alpaca_high_conviction_override_enabled` | `app_config` | `false` | High conviction override for PDT |
 | `alpaca_orders` | table | — | Full audit log of every Alpaca order attempt |
 
 To run the migration manually:
