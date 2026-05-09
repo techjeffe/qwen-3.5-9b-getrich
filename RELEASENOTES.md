@@ -1,3 +1,112 @@
+# Release Notes — May 9, 2026
+
+## Persistent Auto-Run Timer and Cross-Page Analysis
+
+The auto-run analysis timer now runs regardless of which page the user is on. Previously, navigating to the Trading, Admin, or Health pages would stop the countdown because the timer lived inside the main dashboard component, which unmounts on navigation.
+
+**AnalysisProvider context (`frontend/src/lib/context/AnalysisContext.tsx`):**
+
+- New React Context + Provider wraps the root layout so the countdown timer and analysis trigger persist across all pages
+- Fetches config on mount and every 60 seconds to stay in sync with admin changes
+- Runs the countdown timer via `useEffect` with `setInterval` at the layout level — never unmounts
+- When countdown hits 0, fires a POST to `/api/analyze/stream` and consumes the full SSE stream, capturing the `result` event
+- Stores the latest completed analysis result in `latestResult` via context
+- Exposes `countdown`, `isAnalyzing`, `config`, `configLoaded`, `triggerAnalysis()`, `resetCountdown()`, and `latestResult`
+
+**Auto-run results become the hero signal:**
+
+- The main dashboard watches `latestResult` from context via a `useEffect`
+- When a new auto-run completes (even if the user was on the Trading page), the result is promoted to the hero signal on the next visit
+- The request_id is saved to localStorage so the History tab marks it as CURRENT
+
+**Persistent countdown indicator (`frontend/src/components/AutoRunCountdown.tsx`):**
+
+- A small fixed-position badge in the bottom-right corner shows the countdown on every page
+- Displays "Auto-run in MM:SS" or "Analyzing..." depending on state
+- Hidden when auto-run is disabled in admin settings
+
+**Files changed:** `frontend/src/lib/context/AnalysisContext.tsx` (new), `frontend/src/components/AutoRunCountdown.tsx` (new), `frontend/src/app/layout.tsx`, `frontend/src/app/page.tsx`
+
+---
+
+## Run-to-Run Diff in History Tab
+
+The History tab now shows signal flips and data gaps inline on each snapshot row instead of a separate diff section.
+
+**`frontend/src/components/Dashboard/PullHistoryCard.tsx`:**
+
+- Each snapshot row compares its signal_type to the next older run
+- A **SIGNAL FLIP** badge appears when the signal changed (e.g., "SIGNAL FLIP: LONG → HOLD")
+- A **DATA GAP** badge appears when article count dropped significantly (≥5 drop to ≤3 articles)
+- The list stays in its original newest-first chronological order
+
+---
+
+## Data Gap Protection (HOLD-with-Momentum)
+
+When the article count drops by ≥60% from the previous run (and the previous run had ≥10 articles), the system now preserves open positions instead of closing them on a transient HOLD signal.
+
+**`backend/schemas/analysis.py` — `TradingSignal.data_gap_hold`:**
+
+- New boolean field on the TradingSignal schema, default `false`
+- Set to `true` when the signal is HOLD and article count dropped significantly
+
+**`backend/services/analysis/signal_service.py` — `generate_trading_signal()`:**
+
+- Accepts `previous_posts_count` and `current_posts_count` parameters
+- After computing the signal, checks if article count dropped by ≥60% from a previous baseline of ≥10
+- If so, sets `data_gap_hold: true` on the returned TradingSignal
+
+**`backend/services/analysis/pipeline_service.py` — `run_stream()`:**
+
+- Extracts `previous_posts_count` from the previous analysis state (via `HysteresisService`)
+- Passes both `previous_posts_count` and `current_posts_count` to the signal generator
+
+**`backend/services/paper_trading.py` — `process_signals()`:**
+
+- When processing a HOLD recommendation, checks for `data_gap_hold: true`
+- If data_gap_hold is active and a position exists, skips closing it and logs "HOLD (data gap — preserving position)"
+- The position stays open until the next run with adequate data either confirms the HOLD (without the flag) or produces a new directional signal
+
+**`frontend/src/components/Dashboard/SignalHero.tsx`:**
+
+- Shows "HOLD (insufficient data)" instead of just "HOLD" when `data_gap_hold` is true
+- Displays an orange warning: "Article count dropped significantly from the previous run. Positions are preserved until adequate data returns."
+
+---
+
+## Rolling Sentiment Averaging
+
+Blends the current run's per-symbol sentiment scores with recent historical runs using exponential decay. This prevents a single run of noisy or sparse articles from flipping the trading signal.
+
+**`backend/services/analysis/rolling_sentiment.py` (new):**
+
+- `load_recent_scores(db, symbols, max_age_hours=2.0)` — loads all analysis runs within the last 2 hours from the existing `analysis_results` table (no new DB tables needed)
+- `blend_with_history(current_scores, historical_runs, half_life_hours=0.33)` — blends scores using exponential decay with a 20-minute half-life
+- Non-numeric fields (reasoning, signal_type, urgency) are preserved from the current run, not blended
+- Works with any run frequency (10 min, 30 min, etc.) — the decay formula handles it automatically
+
+**`backend/services/analysis/pipeline_service.py` — `run_stream()`:**
+
+- Calls `load_recent_scores` and `blend_with_history` after sentiment analysis
+- Passes the blended scores to the signal generator instead of raw single-run scores
+
+**Stabilization effect (20-min half-life, 10-min schedule):**
+
+- Current run: 100% weight
+- 10 min ago: 70% weight
+- 20 min ago: 50% weight
+- 30 min ago: 35% weight
+- 40 min ago: 25% weight
+- 50 min ago: 18% weight
+- 60 min ago: 12% weight
+
+A 1-article data gap run with near-zero scores would only move the blended average by ~10-15%, so the signal stays stable.
+
+**Files changed:** `backend/services/analysis/rolling_sentiment.py` (new), `backend/services/analysis/pipeline_service.py`, `backend/services/analysis/signal_service.py`, `backend/schemas/analysis.py`, `backend/services/paper_trading.py`, `frontend/src/components/Dashboard/SignalHero.tsx`, `frontend/src/components/Dashboard/PullHistoryCard.tsx`
+
+---
+
 # Release Notes — May 7, 2026
 
 ## Cloud LLM Support — OpenAI-Compatible Inference Backend

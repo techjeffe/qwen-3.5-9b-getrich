@@ -282,9 +282,27 @@ class PipelineService:
             if isinstance(value, dict)
         })
 
+        # ── Rolling sentiment blend ────────────────────────────────────────
+        # Blend current sentiment scores with recent historical runs using
+        # exponential decay to prevent single-run noise from flipping signals.
+        from services.analysis.rolling_sentiment import load_recent_scores, blend_with_history
+
+        historical_runs = load_recent_scores(
+            db, self.symbols, max_age_hours=2.0,
+        )
+        blended_sentiment = blend_with_history(
+            sentiment_results, historical_runs, half_life_hours=0.33,
+        )
+
         # ── Trading signal ────────────────────────────────────────────────
+        previous_posts_count = None
+        if previous_state:
+            prev_response = previous_state.get("response")
+            if prev_response:
+                previous_posts_count = prev_response.get("posts_scraped")
+
         candidate_signal = self._signal.generate_trading_signal(
-            sentiment_results=sentiment_results,
+            sentiment_results=blended_sentiment,
             quotes_by_symbol=quotes_by_symbol,
             risk_profile=getattr(config, 'risk_profile', 'moderate'),
             previous_signal=previous_signal,
@@ -298,6 +316,8 @@ class PipelineService:
                 risk_policy=dict(getattr(config, "risk_policy", {}) or {}),
                 price_context=price_context,
             ),
+            previous_posts_count=previous_posts_count,
+            current_posts_count=len(posts),
         )
 
         # ── Materiality gate ──────────────────────────────────────────────

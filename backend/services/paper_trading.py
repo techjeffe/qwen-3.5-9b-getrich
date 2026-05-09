@@ -546,7 +546,14 @@ def process_signals(
 
         # ── HOLD signal ───────────────────────────────────────────────────────
         if signal_type == "HOLD":
-            if (
+            # Data gap protection: when article count dropped significantly,
+            # don't close positions — preserve them until adequate data returns.
+            data_gap_hold = str(rec.get("data_gap_hold") or "").lower() == "true"
+            if data_gap_hold and open_pos:
+                action_summary["action"] = "held"
+                action_summary["reason"] = "data_gap_hold"
+                print(f"[paper] {underlying}: HOLD (data gap — preserving position)")
+            elif (
                 open_pos
                 and _cv.get("hold_signal_respects_window", True)
                 and _window_active(open_pos, now)

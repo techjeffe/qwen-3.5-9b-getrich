@@ -34,25 +34,33 @@ export default function PullHistoryCard({ snapshots, currentRequestId }: PullHis
                 <p className="text-sm text-slate-500 italic">No saved analyses yet.</p>
             ) : (
                 <div className="space-y-2">
-                    {sortedSnapshots.map((snapshot) => {
+                    {sortedSnapshots.map((snapshot, idx) => {
                         const current = isCurrent(snapshot.request_id);
                         const lastViewed = isLastViewed(snapshot.request_id);
                         const expanded = viewingId === snapshot.request_id;
 
+                        // Compare with the next older snapshot for signal flip detection
+                        const olderSnapshot = idx < sortedSnapshots.length - 1 ? sortedSnapshots[idx + 1] : null;
+                        const signalFlipped = olderSnapshot
+                            && (snapshot.signal_type ?? "HOLD") !== (olderSnapshot.signal_type ?? "HOLD");
+                        const articleDrop = olderSnapshot
+                            ? olderSnapshot.posts_scraped - snapshot.posts_scraped
+                            : 0;
+                        const significantArticleDrop = articleDrop >= 5 && snapshot.posts_scraped <= 3;
+
                         return (
                             <div
                                 key={snapshot.request_id}
-                                className={`rounded-xl border p-3 transition-colors cursor-pointer ${
-                                    current
-                                        ? "border-blue-500/40 bg-blue-500/10"
-                                        : lastViewed
+                                className={`rounded-xl border p-3 transition-colors cursor-pointer ${current
+                                    ? "border-blue-500/40 bg-blue-500/10"
+                                    : lastViewed
                                         ? "border-yellow-500/30 bg-yellow-500/5"
                                         : "border-slate-700/50 bg-slate-800/30 hover:bg-slate-800/50"
-                                }`}
+                                    }`}
                                 onClick={() => setViewingId(expanded ? null : snapshot.request_id)}
                             >
                                 <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
                                         {current && (
                                             <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
                                                 CURRENT
@@ -61,6 +69,16 @@ export default function PullHistoryCard({ snapshots, currentRequestId }: PullHis
                                         {lastViewed && !current && (
                                             <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-300">
                                                 LAST VIEWED
+                                            </span>
+                                        )}
+                                        {signalFlipped && (
+                                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">
+                                                SIGNAL FLIP: {olderSnapshot!.signal_type || "HOLD"} → {snapshot.signal_type || "HOLD"}
+                                            </span>
+                                        )}
+                                        {significantArticleDrop && (
+                                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-orange-500/20 text-orange-300">
+                                                DATA GAP ({snapshot.posts_scraped} articles, was {olderSnapshot!.posts_scraped})
                                             </span>
                                         )}
                                         <span className="text-xs font-mono text-slate-300">
@@ -87,11 +105,10 @@ export default function PullHistoryCard({ snapshots, currentRequestId }: PullHis
                                     </div>
                                     <div>
                                         <span className="text-slate-500">Signal: </span>
-                                        <span className={`font-mono font-bold ${
-                                            snapshot.signal_type === "LONG" ? "text-emerald-400" :
+                                        <span className={`font-mono font-bold ${snapshot.signal_type === "LONG" ? "text-emerald-400" :
                                             snapshot.signal_type === "SHORT" ? "text-red-400" :
-                                            "text-slate-400"
-                                        }`}>
+                                                "text-slate-400"
+                                            }`}>
                                             {snapshot.signal_type || "HOLD"}
                                         </span>
                                     </div>
@@ -103,9 +120,8 @@ export default function PullHistoryCard({ snapshots, currentRequestId }: PullHis
                                         <div className="space-y-1">
                                             {snapshot.recommendations.map((rec, idx) => (
                                                 <div key={idx} className="flex items-center gap-2 text-xs">
-                                                    <span className={`font-bold ${
-                                                        rec.action === "BUY" ? "text-emerald-400" : "text-red-400"
-                                                    }`}>{rec.action}</span>
+                                                    <span className={`font-bold ${rec.action === "BUY" ? "text-emerald-400" : "text-red-400"
+                                                        }`}>{rec.action}</span>
                                                     <span className="font-mono text-slate-300">{rec.symbol}</span>
                                                     <span className="text-slate-500">{rec.leverage}</span>
                                                 </div>

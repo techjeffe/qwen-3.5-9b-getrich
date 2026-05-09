@@ -49,6 +49,7 @@ import DebugPanel from "@/components/Dashboard/DebugPanel";
 import TradeExecutionModal from "@/components/Dashboard/TradeExecutionModal";
 import ActualTradeComparisonCard from "@/components/Dashboard/ActualTradeComparisonCard";
 import { useTimezone } from "@/lib/timezone";
+import { useAnalysis } from "@/lib/context/AnalysisContext";
 
 const RECENT_ANALYSIS_TIMES_KEY = "recentAnalysisTimes";
 const MAX_RECENT_ANALYSIS_TIMES = 12;
@@ -94,7 +95,6 @@ export default function Home() {
     const [feed, setFeed] = useState<FeedItem[]>([]);
     const [expandedIdxs, setExpandedIdxs] = useState<Set<number>>(new Set());
     const [prices, setPrices] = useState<Prices | null>(null);
-    const [countdown, setCountdown] = useState(DEFAULT_APP_CONFIG.auto_run_interval_minutes * 60);
     const [analysisStartedAt, setAnalysisStartedAt] = useState<number | null>(null);
     const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
     const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -139,7 +139,6 @@ export default function Home() {
     useEffect(() => { isAnalyzingRef.current = isAnalyzing; }, [isAnalyzing]);
 
     const handleAnalyzeRef = useRef<() => void>(() => { });
-    const countdownRef = useRef(countdown);
 
     const fetchConfig = useCallback(async () => {
         try {
@@ -162,12 +161,6 @@ export default function Home() {
 
             setConfig(nextConfig);
             setTimeZone(nextConfig.display_timezone || "");
-            const configuredIntervalSeconds = Math.max(1, nextConfig.auto_run_interval_minutes * 60);
-            const nextCountdown = lastRunFailedRef.current
-                ? configuredIntervalSeconds
-                : nextConfig.seconds_until_next_auto_run;
-            countdownRef.current = nextCountdown;
-            setCountdown(nextCountdown);
             setConfigLoaded(true);
         } catch { }
     }, [setTimeZone]);
@@ -185,9 +178,6 @@ export default function Home() {
         setFeed([]);
         setExpandedIdxs(new Set());
         setResult(null);
-        const restartSeconds = Math.max(1, config.auto_run_interval_minutes * 60);
-        countdownRef.current = restartSeconds;
-        setCountdown(restartSeconds);
         setAnalysisStartedAt(runStartedAt);
         setStreamStartedAt(null);
         setElapsedSeconds(0);
@@ -286,11 +276,6 @@ export default function Home() {
             lastRunFailedRef.current = true;
             setError(err.message || "Failed to connect to backend");
         } finally {
-            if (lastRunFailedRef.current) {
-                const retryDelaySeconds = config.auto_run_interval_minutes * 60;
-                countdownRef.current = retryDelaySeconds;
-                setCountdown(retryDelaySeconds);
-            }
             setIsAnalyzing(false);
             setAnalysisStartedAt(null);
             setStreamStartedAt(null);
@@ -479,28 +464,6 @@ export default function Home() {
     }, [isAnalyzing, analysisStartedAt, streamStartedAt]);
 
     useEffect(() => { handleAnalyzeRef.current = handleAnalyze; }, [handleAnalyze]);
-    useEffect(() => { countdownRef.current = countdown; }, [countdown]);
-
-    // Auto-run countdown.
-    useEffect(() => {
-        if (!configLoaded || !config.auto_run_enabled) return;
-        const intervalSecs = config.auto_run_interval_minutes * 60;
-        const tick = setInterval(() => {
-            if (isAnalyzingRef.current) return;
-            const c = countdownRef.current;
-            if (c <= 1) {
-                countdownRef.current = intervalSecs;
-                setCountdown(intervalSecs);
-                autoRunStartedRef.current = true;
-                handleAnalyzeRef.current();
-            } else {
-                countdownRef.current = c - 1;
-                setCountdown(c - 1);
-            }
-        }, 1000);
-        return () => clearInterval(tick);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [config.auto_run_enabled, config.auto_run_interval_minutes, configLoaded]);
 
     useEffect(() => {
         void fetchConfig();
@@ -547,6 +510,19 @@ export default function Home() {
         void restoreLastViewedResult();
     }, [restoreLastViewedResult]);
 
+    // When the auto-run in the provider completes, promote its result to the hero.
+    const { countdown: ctxCountdown, latestResult: ctxLatestResult } = useAnalysis();
+    useEffect(() => {
+        if (ctxLatestResult && !isAnalyzing) {
+            setResult(ctxLatestResult);
+            setFeed([]);
+            setExpandedIdxs(new Set());
+            if (ctxLatestResult.request_id && typeof window !== "undefined") {
+                localStorage.setItem(LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY, ctxLatestResult.request_id);
+            }
+        }
+    }, [ctxLatestResult, isAnalyzing]);
+
     useEffect(() => {
         if (!result?.request_id || typeof window === "undefined") return;
         localStorage.setItem(LAST_VIEWED_ANALYSIS_REQUEST_ID_KEY, result.request_id);
@@ -578,6 +554,8 @@ export default function Home() {
             return next;
         });
     };
+
+    // ─── Derived rendering state ──────────────────────────────────────────────
 
     const errorText = String(error || "");
     const errorLower = errorText.toLowerCase();
@@ -618,8 +596,8 @@ export default function Home() {
         : null;
     const articleItems = feed.filter((f): f is FeedItem & { kind: "article" } => f.kind === "article");
     const logItems = feed.filter((f): f is FeedItem & { kind: "log" } => f.kind === "log");
-    const mm = Math.floor(countdown / 60);
-    const ss = countdown % 60;
+    const mm = Math.floor(ctxCountdown / 60);
+    const ss = ctxCountdown % 60;
     const stageIndex = (() => {
         const message = latestLogMessage.toLowerCase();
         let best = 0;

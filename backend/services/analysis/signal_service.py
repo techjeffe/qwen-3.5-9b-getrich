@@ -74,6 +74,8 @@ class SignalService:
         price_context: Optional[Dict[str, Any]] = None,
         signal_age_hours: float = 0.0,
         crazy_ramp_context: Optional[Dict[str, Any]] = None,
+        previous_posts_count: Optional[int] = None,
+        current_posts_count: Optional[int] = None,
     ) -> TradingSignal:
         """Generate a blue-team TradingSignal from sentiment results."""
         if not sentiment_results:
@@ -353,6 +355,19 @@ class SignalService:
 
         action_if_already_in_position = "HOLD"
 
+        # ── Data gap protection ──
+        # If the signal is HOLD and the article count dropped significantly (>60% and previous had >=10),
+        # mark it as data_gap_hold so paper_trading doesn't close positions.
+        data_gap_hold = False
+        if (
+            signal_type == "HOLD"
+            and previous_posts_count is not None
+            and current_posts_count is not None
+            and previous_posts_count >= 10
+            and current_posts_count < previous_posts_count * 0.4
+        ):
+            data_gap_hold = True
+
         return TradingSignal(
             signal_type=signal_type,
             confidence_score=min(confidence_score, 1.0),
@@ -366,6 +381,7 @@ class SignalService:
             trading_type=trading_type,
             action_if_already_in_position=action_if_already_in_position,
             recommendations=recommendations,
+            data_gap_hold=data_gap_hold,
         )
 
     def build_consensus_trading_signal(

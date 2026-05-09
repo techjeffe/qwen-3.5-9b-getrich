@@ -35,6 +35,9 @@ export default function SignalHero({
     const recommendations: Recommendation[] = signal.recommendations ?? [];
     const overallSignal = signal.signal_type || "HOLD";
     const confidenceScore = signal.confidence_score ?? 0;
+    const isDataGapHold = signal.data_gap_hold === true;
+    const displaySignal = isDataGapHold ? "HOLD" : overallSignal;
+    const displayLabel = isDataGapHold ? "HOLD (insufficient data)" : overallSignal;
 
     return (
         <GlassCard>
@@ -42,12 +45,17 @@ export default function SignalHero({
             <div className="text-center mb-6">
                 <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500 mb-2">Overall Trading Signal</p>
                 <div className="flex items-center justify-center gap-3 mb-2">
-                    <span className={`text-5xl font-black ${signalColor(overallSignal)}`}>{overallSignal}</span>
-                    <span className={`text-sm font-bold px-3 py-1 rounded-lg border ${signalBadge(overallSignal)}`}>
+                    <span className={`text-5xl font-black ${signalColor(displaySignal)}`}>{displayLabel}</span>
+                    <span className={`text-sm font-bold px-3 py-1 rounded-lg border ${signalBadge(displaySignal)}`}>
                         {Math.round(confidenceScore * 100)}% confidence
                     </span>
                 </div>
-                {signal.summary && (
+                {isDataGapHold && (
+                    <p className="text-xs text-orange-400 max-w-2xl mx-auto mt-2">
+                        ⚠ Article count dropped significantly from the previous run. Positions are preserved until adequate data returns.
+                    </p>
+                )}
+                {signal.summary && !isDataGapHold && (
                     <p className="text-sm text-slate-400 max-w-2xl mx-auto mt-2">{signal.summary}</p>
                 )}
             </div>
@@ -68,11 +76,10 @@ export default function SignalHero({
                                     key={idx}
                                     type="button"
                                     onClick={() => onRecommendationClick(rec)}
-                                    className={`text-left rounded-xl border p-4 transition-colors hover:bg-slate-800/40 ${
-                                        isShort
+                                    className={`text-left rounded-xl border p-4 transition-colors hover:bg-slate-800/40 ${isShort
                                             ? "border-red-500/20 bg-red-500/5"
                                             : "border-emerald-500/20 bg-emerald-500/5"
-                                    }`}
+                                        }`}
                                 >
                                     <div className="flex items-center justify-between mb-2">
                                         <div>
@@ -178,10 +185,9 @@ export default function SignalHero({
                                         </div>
                                         <div>
                                             <span className="text-slate-500">Urgency: </span>
-                                            <span className={`font-mono font-bold ${
-                                                review.adjusted_urgency === "HIGH" ? "text-red-400" :
-                                                review.adjusted_urgency === "MEDIUM" ? "text-yellow-400" : "text-slate-400"
-                                            }`}>{review.adjusted_urgency}</span>
+                                            <span className={`font-mono font-bold ${review.adjusted_urgency === "HIGH" ? "text-red-400" :
+                                                    review.adjusted_urgency === "MEDIUM" ? "text-yellow-400" : "text-slate-400"
+                                                }`}>{review.adjusted_urgency}</span>
                                         </div>
                                     </div>
                                 </div>

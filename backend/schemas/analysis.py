@@ -98,30 +98,36 @@ class TradingSignal(BaseModel):
     # Conviction and holding strategy
     conviction_level: Literal["LOW", "MEDIUM", "HIGH"] = Field(
         default="MEDIUM",
-        description="Conviction strength independent of analysis confidence (LOW=reactive/bluster, MEDIUM=data-driven swing, HIGH=structural multi-day thesis)"
     )
     
-    holding_period_hours: int = Field(
-        default=4,
-        ge=1,
-        le=720,
-        description="Expected holding period in hours, assuming no major news or stop/profit triggers"
+    # Data gap protection
+    data_gap_hold: bool = Field(
+        default=False,
+        description="True when the signal is HOLD because article count dropped significantly from the previous run. Positions should not be closed."
     )
     
-    trading_type: Literal["SCALP", "SWING", "POSITION", "VOLATILE_EVENT"] = Field(
-        default="SWING",
-        description="Trade classification to guide re-analysis strategy (SCALP: 1-2h, SWING: 4-24h, POSITION: 24-168h, VOLATILE_EVENT: 1-4h)"
+    # Holding strategy
+    trading_type: Literal["POSITION", "SWING", "VOLATILE_EVENT", "SCALP"] = Field(
+        default="VOLATILE_EVENT",
+        description="Trading strategy type"
     )
-    
-    action_if_already_in_position: Literal["HOLD", "EXIT", "ADD", "TAKE_PROFIT"] = Field(
+    holding_period_hours: float = Field(
+        default=2.0,
+        ge=0.5,
+        le=168.0,
+        description="Recommended holding period in hours"
+    )
+    action_if_already_in_position: Literal["HOLD", "INCREASE", "DECREASE", "CLOSE"] = Field(
         default="HOLD",
-        description="Recommended action if already holding the same symbol with conflicting signal"
+        description="What to do if already in a position"
     )
-
-    # Specific actionable recommendations
-    recommendations: List[Dict[str, str]] = Field(
-        default_factory=list,
-        description='List of broker-ready recommendations like {"action":"BUY","symbol":"TQQQ","leverage":"3x","underlying_symbol":"QQQ"}'
+    recommendations: List[Dict[str, Any]] = Field(
+        default=[],
+        description="Per-symbol recommendations"
+    )
+    summary: str = Field(
+        default="",
+        description="Human-readable summary of the signal"
     )
 
     model_config = {
