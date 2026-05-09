@@ -126,31 +126,8 @@ def call_openai_chat_sync(
 
     # Convert the raw prompt string into a chat messages array.
     # The existing system sends a single prompt string that contains both
-    # system-level instructions and the user input. We split on a heuristic:
-    # if the prompt starts with a known system-style instruction pattern, we
-    # put the first paragraph as system and the rest as user.
-    # Otherwise, we wrap the whole thing as a user message.
+    # system-level instructions and the user input.
     messages = _build_chat_messages(prompt)
-
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
-    # Map response schema / force_json to OpenAI's response_format
-    if response_schema is not None:
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "structured_response",
-                "strict": True,
-                "schema": response_schema,
-            },
-        }
-    elif force_json:
-        payload["response_format"] = {"type": "json_object"}
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -158,17 +135,78 @@ def call_openai_chat_sync(
     }
 
     session = requests.Session()
-    start_time = time.time()
+
+    # ── Try 1: send response_schema as json_schema (structured output) ────
+    # Many providers (OpenRouter, Together, etc.) now support json_schema.
+    # Constraining the output forces the model to engage with every field
+    # rather than defaulting to the safest answer (noise/UNRELATED).
+    if response_schema is not None:
+        schema_payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_response",
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            },
+        }
+        print(f"OpenAI [{model}] → {api_url} (json_schema, max_tokens={max_tokens})")
+        start_time = time.time()
+        try:
+            response = session.post(api_url, json=schema_payload, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            latency = (time.time() - start_time) * 1000
+            choices = data.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                print(f"OpenAI [{model}] completed in {latency:.1f}ms (json_schema) (input={data.get('usage', {}).get('prompt_tokens', '?')}t output={data.get('usage', {}).get('completion_tokens', '?')}t)")
+                return {"response": content}
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            # 400 / 422 = provider doesn't support json_schema; fall back to force_json
+            if status_code in (400, 422):
+                print(f"OpenAI [{model}] → json_schema not supported (HTTP {status_code}), falling back to force_json")
+            else:
+                # Re-raise non-schema errors (auth, not found, etc.)
+                body_text = _extract_error_body(e)
+                if status_code == 401:
+                    raise Exception(
+                        f"OpenAI API authentication failed. "
+                        f"URL: {api_url}, Model: {model}. "
+                        f"Check your API key and base URL in the admin LLM Configuration section."
+                    )
+                if status_code == 404:
+                    raise Exception(f"OpenAI model not found: `{model}`. Verify the model name and base URL.")
+                raise Exception(f"OpenAI API HTTP {status_code}: {body_text}")
+        except Exception as e:
+            print(f"OpenAI [{model}] → json_schema attempt failed ({e}), falling back to force_json")
+
+    # ── Try 2 (fallback): force_json only ─────────────────────────────────
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"} if force_json else None,
+    }
+    # Remove None keys
+    payload = {k: v for k, v in payload.items() if v is not None}
 
     print(f"OpenAI [{model}] → {api_url} (force_json={force_json}, max_tokens={max_tokens})")
 
+    start_time = time.time()
     try:
         response = session.post(api_url, json=payload, headers=headers, timeout=timeout)
         response.raise_for_status()
         data = response.json()
         latency = (time.time() - start_time) * 1000
 
-        # Extract the text from the OpenAI response format
         choices = data.get("choices", [])
         if not choices:
             raise ValueError("OpenAI API returned empty choices array")
@@ -178,7 +216,6 @@ def call_openai_chat_sync(
 
         print(f"OpenAI [{model}] completed in {latency:.1f}ms (input={data.get('usage', {}).get('prompt_tokens', '?')}t output={data.get('usage', {}).get('completion_tokens', '?')}t)")
 
-        # Return in the same envelope as Ollama's /api/generate
         return {"response": content}
 
     except requests.exceptions.Timeout:
@@ -187,14 +224,7 @@ def call_openai_chat_sync(
         raise Exception("Cannot connect to OpenAI API. Is the base URL correct?")
     except requests.exceptions.HTTPError as e:
         status_code = getattr(getattr(e, "response", None), "status_code", None)
-        body_text = ""
-        if e.response is not None:
-            try:
-                body_payload = e.response.json()
-                body_text = str(body_payload.get("error", {}).get("message", "") or body_payload)
-            except Exception:
-                body_text = str(getattr(e.response, "text", "") or "")
-        detail = body_text.strip() or str(e)
+        body_text = _extract_error_body(e)
         if status_code == 401:
             raise Exception(
                 f"OpenAI API authentication failed. "
@@ -203,44 +233,34 @@ def call_openai_chat_sync(
             )
         if status_code == 404:
             raise Exception(f"OpenAI model not found: `{model}`. Verify the model name and base URL.")
-        raise Exception(f"OpenAI API HTTP {status_code}: {detail}")
+        raise Exception(f"OpenAI API HTTP {status_code}: {body_text}")
     except json.JSONDecodeError as e:
         raise Exception(f"Invalid JSON response from OpenAI: {e}")
     except Exception as e:
         raise Exception(f"OpenAI API error: {e}")
 
 
-def _build_chat_messages(prompt: str) -> List[Dict[str, str]]:
-    """Split a raw prompt string into system + user chat messages.
+def _extract_error_body(e: requests.exceptions.HTTPError) -> str:
+    """Extract error message text from an HTTPError response."""
+    if e.response is not None:
+        try:
+            body_payload = e.response.json()
+            return str(body_payload.get("error", {}).get("message", "") or body_payload)
+        except Exception:
+            return str(getattr(e.response, "text", "") or "")
+    return str(e)
 
-    Heuristic: if the prompt starts with a capitalized instruction sentence
-    (e.g. "You are a financial analyst..." or "Analyze the following text...")
-    we treat the first paragraph as the system instruction and the rest as user input.
-    Otherwise, the entire prompt is sent as a user message.
+
+def _build_chat_messages(prompt: str) -> List[Dict[str, str]]:
+    """Send the entire prompt as a single user message.
+
+    TEMPORARY: Bypassing the system/user split to test if sending the full
+    prompt as a user message (matching how Ollama receives it) fixes the
+    cloud model's tendency to classify everything as noise/UNRELATED.
     """
     text = str(prompt or "").strip()
     if not text:
         return [{"role": "user", "content": "Hello."}]
-
-    # Split on double newline to separate system context from user input
-    paragraphs = re.split(r"\n\n+", text, maxsplit=1)
-
-    if len(paragraphs) >= 2:
-        first = paragraphs[0].strip()
-        rest = paragraphs[1].strip()
-        # If the first paragraph looks like an instruction (starts with "You are",
-        # "Analyze", "Given", "As an", etc.), treat it as system message
-        if re.match(
-            r"^(You are|Analyze|Given|As an|Your task|Your role|You handle|For each|The following)",
-            first,
-            re.IGNORECASE,
-        ):
-            return [
-                {"role": "system", "content": first},
-                {"role": "user", "content": rest},
-            ]
-
-    # Single paragraph or no clear split: use entire prompt as user message
     return [{"role": "user", "content": text}]
 
 

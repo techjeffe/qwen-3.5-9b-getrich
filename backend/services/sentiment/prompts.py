@@ -548,22 +548,25 @@ STRICT DIFFERENTIATION PROTOCOL:
 """
 
 
-SYMBOL_SPECIALIST_LEAN_HEADER = """You are a skeptical financial news analyst performing fact extraction for {symbol} on {date}.
+SYMBOL_SPECIALIST_LEAN_HEADER = """You are a thorough financial news analyst performing fact extraction for {symbol} on {date}.
 
 Your only job: read the news below, then fill in the JSON schema.
 Python computes all scores from your extracted facts. Do NOT invent numbers.
+
+IMPORTANT CONTEXT: This article reached you because Stage 1 keyword filtering confirmed it contains terms relevant to {symbol}. It is NOT random noise — your job is to classify HOW it connects, not WHETHER it connects.
 
 {symbol} price: ${active_symbol_price}{source_count_block}{validation_block}{web_block}
 
 Specialist focus — what drives {symbol}:
 {specialist_focus}
 
-Red-team stance:
-- Challenge the obvious trade before accepting it.
-- Do not assume a dramatic headline matters to {symbol}.
-- Prefer direct price mechanisms, official actions, and validation context over narrative.
-- If timing is unclear, the move may already be priced in, or the channel is second-order, stay conservative.
-- Challenge bearish cases as hard as bullish ones.
+Analysis stance:
+- This is a quantitative analysis tool, not financial advice. Make your best objective assessment.
+- The article passed topic filtering — at minimum classify it as BROAD exposure with an event_type matching the actual topic discussed.
+- Only use "noise" for event_type if the article is truly about sports, entertainment, or celebrity news.
+- Only use "UNRELATED" for exposure_type if the article has zero connection to any sector or market.
+- Prefer direct price mechanisms and official actions over narrative, but do not default to "no connection" when a clear topic match exists.
+- If timing is unclear or the channel is second-order, use BROAD exposure and neutral direction rather than UNRELATED.
 
 {proxy_block}"""
 

@@ -433,12 +433,31 @@ class SentimentEngine:
         extraction: Dict[str, Any],
         symbol: str,
         technical_indicators: Optional[Dict[str, Any]] = None,
+        *,
+        cloud_backend: bool = False,
     ) -> Dict[str, Any]:
         """
         Derive calibrated scores from LLM-extracted facts.
         All numerical outputs come from this function — the LLM never outputs raw floats.
+
+        Args:
+            extraction: LLM-extracted facts dict.
+            symbol: The symbol being scored.
+            technical_indicators: Optional TA data for confidence modulation.
+            cloud_backend: When True, apply conservative-model overrides. Cloud-hosted
+                models (deepseek, gemma, etc.) are fine-tuned for safety and default
+                to noise/UNRELATED/false even for articles that passed Stage 1 filtering.
+                These overrides treat BROAD+ as relevant and downgrade UNRELATED to BROAD.
         """
         event_type = SentimentEngine._normalize_event_type(str(extraction.get("event_type") or ""))
+        # Cloud-model override: they often default to event_type="noise" with zero
+        # substance/bluster counts even for articles that passed Stage 1 keyword
+        # filtering. Since Stage 1 confirmed topic relevance, override to macro_data.
+        if cloud_backend:
+            n_blu_raw = extraction.get("bluster_count")
+            n_sub_raw = extraction.get("substance_count")
+            if event_type == "noise" and (n_blu_raw is None or n_sub_raw is None or (int(n_blu_raw or 0) == 0 and int(n_sub_raw or 0) == 0)):
+                event_type = "macro_data"
         confirmed = bool(extraction.get("confirmed", False))
         # Prefer integer counts (new trimmed schema); fall back to array length
         # for snapshots saved under the old schema.
@@ -458,6 +477,14 @@ class SentimentEngine:
         exposure_type = str(extraction.get("exposure_type") or "").upper()
         if exposure_type not in {"DIRECT", "INDIRECT", "BROAD", "UNRELATED"}:
             exposure_type = "DIRECT" if relevant else "UNRELATED"
+        # Cloud-model override: these models often return UNRELATED/relevant:false
+        # for articles that passed Stage 1 keyword filtering. Since Stage 1 confirmed
+        # topic relevance, downgrade UNRELATED to BROAD and mark it relevant.
+        if cloud_backend:
+            if exposure_type == "UNRELATED":
+                exposure_type = "BROAD"
+            if exposure_type == "BROAD" and not relevant:
+                relevant = True
         # Broad-market ETFs are relevant to any non-UNRELATED macro news by definition.
         # Qwen often returns relevant:false for SPY/QQQ even when exposure_type is DIRECT/BROAD,
         # which crushes policy_score and confidence via the irrelevance multiplier.
@@ -1411,20 +1438,28 @@ class SentimentEngine:
                 "(Settings → Cloud LLM) or via the OPENAI_MODEL environment variable."
             )
 
-        # Always use force_json=True; never pass response_schema (json_schema is
-        # incompatible with most non-OpenAI providers). The downstream JSON repair
-        # pipeline handles model output that deviates from the schema.
-        return call_openai_chat_sync(
+        # Pass response_schema if provided — it constrains the model to output
+        # the exact fields we need, just like Ollama's `format` field does.
+        # call_openai_chat_sync will attempt json_schema format first, and fall
+        # back to force_json if the provider doesn't support it.
+        # DEBUG: log start and end of prompt to verify articles are included
+        print(f"DEBUG _call_openai_sync prompt ({len(prompt)} chars) start: {prompt[:200]}")
+        print(f"DEBUG _call_openai_sync prompt ({len(prompt)} chars) end: {prompt[-400:]}")
+        result = call_openai_chat_sync(
             prompt=prompt,
             model=effective_model,
             api_key=api_key,
             base_url=effective_base_url,
-            force_json=True,
-            response_schema=None,
+            force_json=force_json,
+            response_schema=response_schema,
             max_tokens=effective_max_tokens,
             temperature=self.TEMPERATURE,
             timeout=180,
         )
+        # DEBUG: log raw response to diagnose cloud model output
+        raw = result.get("response", "")
+        print(f"DEBUG _call_openai_sync raw response ({len(raw)} chars): {raw[:600]}")
+        return result
 
     def _parse_response(
         self,
@@ -1457,13 +1492,19 @@ class SentimentEngine:
             "event_type" in data and "confirmed" in data
         )
 
+        print(f"DEBUG _parse_response: is_extraction_format={is_extraction_format}, data_keys={list(data.keys())}, data_preview={str(data)[:500]}")
+
+        # Determine if we're using a cloud backend for cloud-model-specific overrides
+        _is_cloud = getattr(self, "inference_backend", "ollama") in ("openai", "vllm")
+
         if is_extraction_format:
             # New path: LLM extracted facts, Python computes scores
             # We need the symbol to score — pull it from symbol_relevance keys or fall back
             sym_keys = list((data.get("symbol_relevance") or {}).keys())
             symbol_for_scoring = sym_keys[0] if sym_keys else ""
             tech_indicators = getattr(self, "_last_technical_indicators", None) or {}
-            computed = self.compute_symbol_scores(data, symbol_for_scoring, technical_indicators=tech_indicators)
+            computed = self.compute_symbol_scores(data, symbol_for_scoring, technical_indicators=tech_indicators, cloud_backend=_is_cloud)
+            print(f"DEBUG _parse_response computed scores for {symbol_for_scoring}: {computed}")
 
             bluster = {
                 "is_bluster": computed["is_bluster"],

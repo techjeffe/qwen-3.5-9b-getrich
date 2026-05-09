@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppConfig } from "@/lib/utils/config-normalizer";
 
 type CloudLLMSecretsStatus = {
@@ -92,6 +92,69 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
             },
         ];
     const activeBackend = config.inference_backend || "ollama";
+
+    // ── Track last-used local models so we can restore them when switching back from cloud ──
+    const lastLocalModelsRef = useRef<{ extraction: string; reasoning: string }>({
+        extraction: config.extraction_model,
+        reasoning: config.reasoning_model,
+    });
+
+    // ── When backend changes, auto-select models available on that backend ──
+    const prevBackendRef = useRef(activeBackend);
+    useEffect(() => {
+        const prev = prevBackendRef.current;
+        if (prev === activeBackend) return;
+        prevBackendRef.current = activeBackend;
+
+        // Save last-used local models before switching away from local
+        if (prev !== "openai") {
+            lastLocalModelsRef.current = {
+                extraction: config.extraction_model,
+                reasoning: config.reasoning_model,
+            };
+        }
+
+        // Determine which model pool is relevant for the new backend
+        const availableModels = activeBackend === "openai"
+            ? cloudModels
+            : config.local_models;
+
+        if (availableModels.length === 0) return;
+
+        const availableSet = new Set(availableModels);
+
+        setConfig((c) => {
+            const next = { ...c };
+            let changed = false;
+
+            // Helper: if the current model isn't available on the new backend, pick a suitable one
+            const pick = (current: string): string => {
+                if (current && availableSet.has(current)) return current; // keep it
+                // For local backends, try to restore the last-used local model
+                if (activeBackend !== "openai") {
+                    const lastLocal = lastLocalModelsRef.current;
+                    if (lastLocal.extraction && availableSet.has(lastLocal.extraction)) return lastLocal.extraction;
+                    if (lastLocal.reasoning && availableSet.has(lastLocal.reasoning)) return lastLocal.reasoning;
+                }
+                // Fall back to first available model
+                return availableModels[0];
+            };
+
+            const newExtraction = pick(c.extraction_model);
+            if (newExtraction !== c.extraction_model) {
+                next.extraction_model = newExtraction;
+                changed = true;
+            }
+
+            const newReasoning = pick(c.reasoning_model);
+            if (newReasoning !== c.reasoning_model) {
+                next.reasoning_model = newReasoning;
+                changed = true;
+            }
+
+            return changed ? next : c;
+        });
+    }, [activeBackend, cloudModels, config.local_models, setConfig]);
 
     // ── Fetch secret status on mount ──────────────────────────────────
     const fetchSecrets = useCallback(async () => {
