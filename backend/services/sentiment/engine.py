@@ -175,7 +175,7 @@ class SentimentEngine:
     # Configuration — override with OLLAMA_MODEL / OLLAMA_URL / VLLM_URL env vars
     MODEL_NAME = os.getenv("OLLAMA_MODEL", "").strip()
     TEMPERATURE = 0.10
-    MAX_TOKENS = 2048  # 1536 still truncated; maxItems:6 on phrase arrays caps output length
+    MAX_TOKENS = 8192  # Generous limit for all backends — truncated analyses produce wrong signals
     API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
     INFERENCE_BACKEND = os.getenv("INFERENCE_BACKEND", "ollama").strip().lower()
     VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000").rstrip("/")
