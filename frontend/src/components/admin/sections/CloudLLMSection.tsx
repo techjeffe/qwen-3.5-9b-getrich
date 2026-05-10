@@ -278,12 +278,29 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
     // ── Re-fetch secrets when provider changes in cloud mode ──────────
     useEffect(() => { void fetchSecrets(); }, [fetchSecrets]);
 
-    // Auto-fetch cloud models when cloud mode is active, secrets are configured, and models not yet loaded
+    // Reset cloud state when entering/exiting cloud mode so stale data
+    // doesn't linger across mode switches.
+    const prevApiMode = useRef(config.api_mode);
     useEffect(() => {
-        if (config.api_mode === "cloud" && secrets.configured && cloudModels.length === 0 && !isLoadingCloudModels) {
+        const prev = prevApiMode.current;
+        prevApiMode.current = config.api_mode;
+        if (prev !== config.api_mode && config.api_mode === "cloud") {
+            // Switching TO cloud — clear stale local-state so models re-fetch
+            setCloudModels([]);
+            setCloudModelsError("");
+            setTestResult(null);
+        }
+    }, [config.api_mode]);
+
+    // Fetch cloud models when entering cloud mode with no cached models.
+    // Does NOT gate on secrets.configured — the backend handles auth and
+    // the key may be stored in the OS keychain already from a previous
+    // session even if the in-memory secrets flag hasn't loaded yet.
+    useEffect(() => {
+        if (config.api_mode === "cloud" && cloudModels.length === 0 && !isLoadingCloudModels) {
             void fetchCloudModels();
         }
-    }, [config.api_mode, secrets.configured, cloudModels.length, isLoadingCloudModels, fetchCloudModels]);
+    }, [config.api_mode, cloudModels.length, isLoadingCloudModels, fetchCloudModels]);
 
     // ── Save API key ──────────────────────────────────────────────────
     const saveApiKey = async () => {
