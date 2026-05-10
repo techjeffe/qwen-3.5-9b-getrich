@@ -356,6 +356,10 @@ class AppConfig(Base):
     # API key is stored in the OS keychain via secret_store.py, not in the DB.
     openai_base_url = Column(String(256), nullable=False, default="https://api.openai.com/v1")
     openai_model = Column(String(128), nullable=False, default="gpt-4o-mini")
+    # Cloud/Local toggle state (new UI fields, persisted for round-trip fidelity)
+    api_mode = Column(String(16), nullable=False, default="local")
+    cloud_provider = Column(String(32), nullable=False, default="openai")
+    local_provider = Column(String(32), nullable=False, default="ollama")
     risk_profile = Column(String(20), nullable=False, default="standard")
     risk_policy = Column(JSON, nullable=False, default={})
     web_research_enabled = Column(Boolean, nullable=False, default=False)

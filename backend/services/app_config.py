@@ -936,6 +936,12 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         except ValueError:
             normalized = getattr(config, "openai_base_url", DEFAULT_OPENAI_BASE_URL)
         config.openai_base_url = normalized
+    if "api_mode" in payload:
+        config.api_mode = str(payload.get("api_mode") or "local").strip().lower()
+    if "cloud_provider" in payload:
+        config.cloud_provider = str(payload.get("cloud_provider") or "openai").strip().lower()
+    if "local_provider" in payload:
+        config.local_provider = str(payload.get("local_provider") or "ollama").strip().lower()
     if "openai_model" in payload:
         config.openai_model = str(payload.get("openai_model") or "").strip() or DEFAULT_OPENAI_MODEL
     if "risk_profile" in payload:
@@ -1245,6 +1251,9 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "vllm_url": str(getattr(config, "vllm_url", "http://localhost:8000") or "http://localhost:8000"),
         "openai_base_url": str(getattr(config, "openai_base_url", DEFAULT_OPENAI_BASE_URL) or DEFAULT_OPENAI_BASE_URL),
         "openai_model": str(getattr(config, "openai_model", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL),
+        "api_mode": str(getattr(config, "api_mode", "local") or "local"),
+        "cloud_provider": str(getattr(config, "cloud_provider", "openai") or "openai"),
+        "local_provider": str(getattr(config, "local_provider", "ollama") or "ollama"),
         "risk_profile": _normalize_risk_profile(getattr(config, "risk_profile", DEFAULT_RISK_PROFILE)),
         "risk_policy": _normalize_risk_policy(getattr(config, "risk_policy", {})),
         "web_research_enabled": bool(getattr(config, "web_research_enabled", False)),
