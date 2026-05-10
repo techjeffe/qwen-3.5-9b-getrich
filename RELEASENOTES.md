@@ -1,6 +1,148 @@
 # Release Notes — May 9, 2026
 
-## Persistent Auto-Run Timer and Cross-Page Analysis
+## Cloud/Local Toggle — Reworked Provider Selection
+
+The old 3-card backend selector (Ollama / vLLM / Cloud LLM) has been replaced with a two-button Cloud/Local toggle. This simplifies the mental model: choose *where* inference runs, then pick the *specific provider* within that mode.
+
+**UI changes:**
+
+- Two large toggle buttons at the top of the LLM Configuration section: **☁️ Cloud** and **🖥️ Local**
+- Cloud mode providers: OpenRouter, Anthropic, OpenAI, Google, Custom
+- Local mode providers: Ollama, vLLM, llama.cpp, Custom
+- Each mode has its own URL smart-fill map — switching providers auto-populates the URL
+- **Protocol validation** enforces `https://` for cloud and `http://` for local, with red borders and inline warnings
+- Custom URL editing is tracked via a `user_edited_url` flag; provider changes always smart-fill regardless of edit history, and an amber warning explains the behavior
+- A "custom" badge appears next to the URL when the user has manually edited it
+
+**Conditional UI sections:**
+
+- **Cloud mode**: model dropdown (auto-populated from provider), API key management, connection test, env fallback note
+- **Local mode**: per-provider docs panel (Ollama's `/api/generate`, vLLM's `/v1/completions`, etc.), connection test, env fallback note
+
+**Backward compatible state mapping:**
+
+- Cloud → `inference_backend = "openai"`, model via `openai_model`
+- Local (Ollama) → `inference_backend = "ollama"`
+- Local (vLLM/llama.cpp/custom) → `inference_backend = "vllm"`
+- Existing `lastLocalModelsRef` logic for model switching preserved
+
+**Files changed:** `frontend/src/components/admin/sections/CloudLLMSection.tsx`, `frontend/src/app/admin/page.tsx`, `frontend/src/lib/utils/config-normalizer.ts`
+
+---
+
+## Per-Provider API Keys
+
+Each cloud provider now stores its own API key in the OS keychain under a separate slot. Switching providers shows the correct key's status immediately.
+
+| Provider | Keychain Slot |
+|---|---|
+| OpenAI | `openai_api_key` (legacy, backward compatible) |
+| Anthropic | `anthropic_api_key` |
+| OpenRouter | `openrouter_api_key` |
+| Google | `google_api_key` |
+| Custom | `custom_api_key` |
+
+**What changed:**
+
+- `secret_store.py` — Added `get_cloud_api_key(provider)`, `save_cloud_api_key(provider, key)`, `clear_cloud_api_key(provider)`. Legacy functions preserved as wrappers.
+- Backend `/admin/openai-secrets` endpoints — Accept `?provider=` query parameter. Defaults to "openai" when omitted.
+- Frontend passes `?provider=` when fetching/saving/clearing keys. Re-fetches secret status when provider changes.
+- Sentiment engine uses `get_cloud_api_key(cloud_provider)` to read the right provider's key. Only reads the key when `inference_backend == "openai"` (cloud mode) — local mode never loads any cloud API key.
+- Pipeline → sentiment service → engine: `cloud_provider` forwarded through the chain from `config.cloud_provider`.
+
+**Files changed:** `backend/services/secret_store.py`, `backend/routers/config.py`, `backend/services/sentiment/engine.py`, `backend/services/analysis/sentiment_service.py`, `backend/services/analysis/pipeline_service.py`, `frontend/src/components/admin/sections/CloudLLMSection.tsx`, `frontend/src/app/api/admin/openai-secrets/route.ts`
+
+---
+
+## DB Persistence for New UI Fields
+
+The new Cloud/Local toggle state (`api_mode`, `cloud_provider`, `local_provider`) is now persisted in the database, so the mode survives restarts without needing to toggle back.
+
+- Three new columns on `app_config`: `api_mode` (VARCHAR 16), `cloud_provider` (VARCHAR 32), `local_provider` (VARCHAR 32)
+- Migration added to `migrate.py` — runs automatically on next backend restart
+- `update_app_config` and `config_to_dict_with_stats` handle the new fields
+
+**Files changed:** `backend/database/models.py`, `backend/database/migrate.py`, `backend/services/app_config.py`
+
+---
+
+## Smart Default Models per Provider
+
+The model dropdown now auto-selects the best inexpensive model for each provider when cloud models first load or when the provider changes.
+
+| Provider | Preferred Defaults |
+|---|---|
+| OpenRouter | `deepseek/deepseek-r1` → `deepseek/deepseek-chat` → `mistralai/mistral-7b-instruct` |
+| OpenAI | `gpt-4o-mini` → `gpt-4o` → `gpt-4.1-nano` |
+| Anthropic | `claude-3-5-haiku-20241022` → `claude-3-haiku-20240307` |
+| Google | `gemini-2.0-flash-lite` → `gemini-2.5-flash-preview-04-17` → `gemini-1.5-flash` |
+
+Auto-selection only triggers when the current model is still the generic `gpt-4o-mini` — a model already chosen by the user is never overwritten.
+
+**Files changed:** `frontend/src/components/admin/sections/CloudLLMSection.tsx`
+
+---
+
+## Security Hardening
+
+- **Refuse 0.0.0.0 without ADMIN_API_TOKEN** — The backend now raises a hard `RuntimeError` at startup if `HOST=0.0.0.0` is set without also setting `ADMIN_API_TOKEN`. Previously this was only a warning.
+- **Provider domain validation** — When editing a cloud provider's URL, an amber warning appears if the hostname doesn't match the expected domain (e.g. `api.openai.com` vs `openrouter.ai`).
+- **Protected analysis mutation endpoints** — `POST /analyze`, `POST /analyze/stream`, `POST /analysis-snapshots/{id}/rerun`, and `POST /paper-trading/expire-check` now require the admin token. Frontend proxy routes forward `X-Admin-Token` conditionally.
+- **`POST /analyze` fix** — The stale `inference_backend` was causing cloud API keys to be sent to local endpoints when switching modes without a config save. The engine now only reads API keys when the backend is "openai".
+
+**Files changed:** `backend/main.py`, `backend/routers/analysis.py`, `frontend/src/app/api/analyze/route.ts`, `frontend/src/app/api/analyze/stream/route.ts`, `frontend/src/app/api/analyze/rerun/route.ts`
+
+---
+
+## Connection Test Buttons
+
+Both cloud and local modes now have a "🔌 Test Connection" button that verifies the endpoint is reachable before running an analysis.
+
+- **Cloud mode**: Calls `POST /admin/openai-test-connection` → pings the provider's `/v1/models` endpoint and tests inference with a minimal prompt. Shows model count and inference verification status.
+- **Local mode**: Calls `GET /api/ollama/status` → pings Ollama's `/api/tags` endpoint. Shows available models and the active model name.
+- The test connection button in cloud mode accepts optional `base_url` and `provider` parameters so it works even before the config is saved.
+
+**Files changed:** `backend/routers/config.py`, `frontend/src/app/api/admin/openai-test-connection/route.ts` (new), `frontend/src/components/admin/sections/CloudLLMSection.tsx`
+
+---
+
+## `.env.example`
+
+A new `.env.example` at the repo root documents all 20 supported environment variables with descriptions and defaults. Copy it to `.env` and edit as needed instead of hunting through source code.
+
+**Files changed:** `.env.example` (new)
+
+---
+
+## Telegram Bot Hot-Reload
+
+The Telegram bot loop now re-reads credentials from the OS keychain on every poll cycle — updating credentials in the admin UI takes effect without a backend restart. When credentials are missing, the loop backs off and retries instead of exiting.
+
+The boot logic always starts the bot loop when `remote_control_enabled` is true, even if credentials are absent at startup. The loop automatically starts polling once credentials appear.
+
+**Files changed:** `backend/main.py`, `backend/routers/config.py`
+
+---
+
+## Cloud Model Fetch Fix
+
+When fetching available models for the cloud provider dropdown, the frontend now passes both `?base_url=` and `?provider=` as query parameters. This lets the backend use the correct API URL and per-provider API key from the keychain even before the user has saved the config. Previously the model fetch used the DB-stored `openai_base_url` (still the default `https://api.openai.com/v1`) and the legacy `openai_api_key` slot, which would fail for any provider other than OpenAI.
+
+**Files changed:** `backend/routers/config.py`, `frontend/src/app/api/admin/models/route.ts`, `frontend/src/components/admin/sections/CloudLLMSection.tsx`
+
+---
+
+## Stale State Fix on Mode Toggle
+
+Fixed a race condition where switching from local to cloud mode would fail to fetch cloud models because the `secrets.configured` flag was still the stale local-mode value. The fix removes the `secrets.configured` gate from the model fetch trigger — the backend handles auth internally — and resets stale cloud models + errors when entering cloud mode.
+
+**Files changed:** `frontend/src/components/admin/sections/CloudLLMSection.tsx`
+
+
+
+---
+
+# Release Notes — May 7, 2026
 
 The auto-run analysis timer now runs regardless of which page the user is on. Previously, navigating to the Trading, Admin, or Health pages would stop the countdown because the timer lived inside the main dashboard component, which unmounts on navigation.
 

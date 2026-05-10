@@ -72,7 +72,7 @@ Bitcoin and oil are capped at 2x leverage.
 
 - **Frontend**: Next.js / React dashboard with a live article feed, signal cards, price panel, health page, trading simulation page, and a snapshot comparison lab.
 - **Backend**: FastAPI serving the analysis pipeline, config, paper trading, and optional Alpaca brokerage routes. All state lives in a local SQLite database.
-- **LLM**: Ollama (local), vLLM (local OpenAI-compatible), or any OpenAI-compatible cloud provider. Configure the inference backend from the Admin UI. Tested local models: `qwen3.5:9b`, `qwen3:8b`, `0xroyce/plutus:latest`.
+- **LLM**: Ollama (local), vLLM (local OpenAI-compatible), or any OpenAI-compatible cloud provider. A Cloud/Local toggle in the Admin UI lets you switch between local and cloud inference with per-provider configuration, smart-fill URLs, and protocol validation. Tested local models: `qwen3.5:9b`, `qwen3:8b`, `0xroyce/plutus:latest`. Cloud providers: OpenRouter, Anthropic, OpenAI, Google.
 - **Validation data**: EIA petroleum data for USO; FRED M2, TIPS yield, and credit spread data for IBIT, QQQ, and SPY.
 - **Technical indicators**: When price history has been pulled, RSI(14), SMA50/200, MACD, Volume Profile, Bollinger Bands %B, ATR(14), and OBV trend are computed locally and injected into each specialist prompt.
 
@@ -113,18 +113,19 @@ If `OLLAMA_MODEL` is unset, the backend uses whichever model Ollama is currently
 
 Instead of running Ollama locally, you can use any OpenAI-compatible cloud provider. Configure everything from the Admin UI — no environment variables required.
 
-**Supported providers:** OpenAI, Together AI, Groq, Fireworks, DeepSeek, OpenRouter, and any provider with an OpenAI-compatible chat completions API.
+**Supported providers:** OpenRouter, Anthropic, OpenAI, Google, and any provider with an OpenAI-compatible chat completions API.
 
 **To configure via the Admin UI:**
 
 1. Start the backend and frontend normally (Ollama is not needed for cloud inference)
 2. Open the Admin page and navigate to **LLM Configuration**
-3. Select **Cloud LLM** as the inference backend
-4. Enter your provider's base URL (e.g. `https://api.openai.com/v1`, `https://openrouter.ai/api/v1`)
-5. Enter your default model (e.g. `gpt-4o-mini`, `gpt-4o`)
-6. Save your API key — it is stored in the OS keychain via `keyring`, never in the repo
-7. Click **Load models** to verify connectivity and see available models
-8. Optionally set separate models for Stage 1 (extraction) and Stage 2 (reasoning) in the **Model Orchestration** section
+3. Toggle to **☁️ Cloud** mode
+4. Select your provider from the dropdown (OpenRouter, Anthropic, OpenAI, Google, or Custom)
+5. The API URL is auto-populated — override it if needed
+6. Save your API key — it is stored in the OS keychain under a per-provider slot, never in the repo
+7. Click **🔌 Test Connection** to verify connectivity
+8. Cloud models are fetched automatically — the best default model for your provider is pre-selected
+9. Optionally set separate models for Stage 1 (extraction) and Stage 2 (reasoning) in the **Model Orchestration** section
 
 **Environment variable fallback** (if not set in Admin):
 
@@ -223,7 +224,7 @@ Open [http://localhost:3000](http://localhost:3000).
 
 The Admin page is where you configure everything. Changes persist in the database and survive restarts.
 
-- **LLM Configuration** — Choose your inference backend (Ollama, vLLM, or Cloud LLM), configure endpoint URLs, and manage cloud API keys. Cloud LLM settings are stored in the OS keychain via `keyring`.
+- **LLM Configuration** — Choose Cloud or Local mode, then pick your provider (OpenRouter, Anthropic, OpenAI, Google, Ollama, vLLM, llama.cpp, or Custom). The API URL is auto-populated. Cloud API keys are stored per-provider in the OS keychain via `keyring`. Test connectivity with the built-in button.
 - **Analysis Depth** — Light / Normal / Detailed controls article count per feed and pipeline behavior
 - **Model Orchestration** — Stage 1 (extraction) and Stage 2 (reasoning) model selectors; optional Light Web Research toggle. When using the Cloud LLM backend, model dropdowns include both local and cloud models.
 - **Trading Logic** — session hours, base trade amount, entry threshold, stop loss, take profit, re-entry cooldown, trailing stop behavior, portfolio cap, and strategy feature toggles (continuous entry sizing, regime adaptation, separate hold decay)
