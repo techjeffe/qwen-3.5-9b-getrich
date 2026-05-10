@@ -574,6 +574,7 @@ async def get_analysis_snapshot_detail(request_id: str, db: Session = Depends(ge
 async def rerun_analysis_snapshot(
     request_id: str,
     payload: Dict[str, Any],
+    _admin: None = Depends(require_admin_token),
     db: Session = Depends(get_db),
 ):
     """Re-run a frozen analysis dataset snapshot with alternate model settings."""
@@ -1236,7 +1237,11 @@ async def _pre_ingest_stream(
     summary="Run full analysis pipeline with real-time progress",
     tags=["Analysis"]
 )
-async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_market_stream(
+    request: AnalysisRequest,
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db)
+):
     """SSE endpoint streaming heartbeat comments and the final result."""
 
     async def generate() -> AsyncGenerator[str, None]:
@@ -1402,6 +1407,7 @@ async def analyze_market_stream(request: AnalysisRequest, db: Session = Depends(
 )
 async def analyze_market(
     request: AnalysisRequest,
+    _admin: None = Depends(require_admin_token),
     db: Session = Depends(get_db)
 ):
     services = _analysis_services(db)
@@ -1466,7 +1472,10 @@ async def get_paper_trading_summary(db: Session = Depends(get_db)):
 
 
 @router.post("/paper-trading/expire-check", tags=["Paper Trading"])
-async def paper_trading_expire_check(db: Session = Depends(get_db)):
+async def paper_trading_expire_check(
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db)
+):
     """Close any open positions whose conviction window has expired. Safe to call at any time."""
     from services.paper_trading import close_expired_positions
     closed = close_expired_positions(db)

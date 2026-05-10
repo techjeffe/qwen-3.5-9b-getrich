@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from services.audit_log import record_audit_event
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from database.engine import get_db
@@ -35,14 +35,21 @@ from services.secret_store import (
     clear_openai_api_key,
     get_openai_api_key,
 )
+from services.openai_client import get_openai_status
 from services.telegram_bot import verify_remote_control
 
 
 router = APIRouter()
 
 
-def _fetch_models_from_backends(config) -> Dict[str, Any]:
-    """Return {'local_models': [...], 'cloud_models': [...]} from all configured backends."""
+def _fetch_models_from_backends(config, override_base_url: Optional[str] = None) -> Dict[str, Any]:
+    """Return {'local_models': [...], 'cloud_models': [...]} from all configured backends.
+
+    Args:
+        config: AppConfig instance from the database.
+        override_base_url: If provided, overrides the DB-stored openai_base_url.
+            Used when the frontend user has edited the URL but not yet saved.
+    """
     result: Dict[str, List[str]] = {"local_models": [], "cloud_models": []}
 
     # 1. Local models from Ollama (use DB-stored URL if set, fall back to env var)
@@ -55,11 +62,16 @@ def _fetch_models_from_backends(config) -> Dict[str, Any]:
         result["local_models"] = []
 
     # 2. Cloud models from OpenAI-compatible endpoint (only if API key is configured)
+    def _resolve_base_url() -> str:
+        if override_base_url:
+            return override_base_url
+        return str(getattr(config, "openai_base_url", "https://api.openai.com/v1") or "https://api.openai.com/v1")
+
     api_key = get_openai_api_key()
     if api_key:
         try:
             from services.openai_client import get_openai_status
-            base_url = str(getattr(config, "openai_base_url", "https://api.openai.com/v1") or "https://api.openai.com/v1")
+            base_url = _resolve_base_url()
             status = get_openai_status(api_key=api_key, base_url=base_url, timeout=5)
             result["cloud_models"] = status.get("available_models") or []
         except Exception:
@@ -71,7 +83,7 @@ def _fetch_models_from_backends(config) -> Dict[str, Any]:
         if env_key:
             try:
                 from services.openai_client import get_openai_status
-                base_url = str(getattr(config, "openai_base_url", "https://api.openai.com/v1") or "https://api.openai.com/v1")
+                base_url = _resolve_base_url()
                 status = get_openai_status(api_key=env_key, base_url=base_url, timeout=5)
                 result["cloud_models"] = status.get("available_models") or []
             except Exception:
@@ -115,12 +127,19 @@ async def get_config(
 
 @router.get("/admin/models", tags=["Admin"])
 async def get_admin_models(
+    request: Request,
     _admin: None = Depends(require_admin_token),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Refresh and return models from all configured backends on demand."""
+    """Refresh and return models from all configured backends on demand.
+
+    Query parameters:
+      - base_url: override the DB-stored openai_base_url (for when the
+        user has edited the URL in the UI but not yet saved config).
+    """
     config = get_or_create_app_config(db)
-    model_info = _fetch_models_from_backends(config)
+    base_url_override = request.query_params.get("base_url")
+    model_info = _fetch_models_from_backends(config, override_base_url=base_url_override)
     return {
         "local_models": model_info["local_models"],
         "cloud_models": model_info["cloud_models"],
@@ -332,9 +351,8 @@ async def put_remote_snapshot_secrets(
         saved["remote_snapshot_enabled"] = bool(getattr(config, "remote_snapshot_enabled", False))
         saved["telegram_remote_control_enabled"] = bool(getattr(config, "telegram_remote_control_enabled", False))
         
-        # Notify user that backend restart is required if credentials changed and remote control is enabled
-        if changed and saved.get("telegram_remote_control_enabled"):
-            saved["restart_note"] = "Telegram credentials updated. Restart the backend to activate the bot with new credentials."
+        # Note: No restart is needed — the bot polls credentials from the OS keychain
+        # on every cycle and picks up changes automatically.
         
         return saved
     except ValueError as exc:
@@ -427,6 +445,47 @@ async def delete_openai_secrets(
         return clear_openai_api_key()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+
+# ── Cloud LLM Connection Test ────────────────────────────────────────────
+
+
+@router.post("/admin/openai-test-connection", tags=["Admin"])
+async def test_openai_connection(
+    payload: Dict[str, Any],
+    _admin: None = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Test connectivity to the configured OpenAI-compatible endpoint.
+
+    Accepts optional api_key and base_url overrides; when omitted, falls back
+    to the saved OS keychain key and the DB-stored base URL.
+    """
+    config = get_or_create_app_config(db)
+    api_key = str(payload.get("api_key") or "").strip() or get_openai_api_key()
+    base_url = str(payload.get("base_url") or "").strip() or str(getattr(config, "openai_base_url", "https://api.openai.com/v1") or "https://api.openai.com/v1")
+    timeout = min(int(payload.get("timeout", 8)), 15)
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No API key configured. Save an API key in the admin UI or set OPENAI_API_KEY.")
+
+    try:
+        result = get_openai_status(api_key=api_key, base_url=base_url, timeout=timeout)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "openai_root": base_url,
+            "configured_model": "",
+            "active_model": "",
+            "available_models": [],
+            "running_models": [],
+            "resolution": "unreachable",
+            "api_key_configured": bool(api_key),
+            "error": str(exc),
+        }
 
 
 # ── Remote Snapshot / Data Management ─────────────────────────────────────

@@ -48,6 +48,27 @@ const CLOUD_URLS: ProviderUrls = {
     google: "https://generativelanguage.googleapis.com",
 };
 
+/** Expected hostnames for cloud providers — used for domain validation warnings. */
+const CLOUD_DOMAINS: Record<string, string[]> = {
+    openai: ["api.openai.com"],
+    anthropic: ["api.anthropic.com"],
+    openrouter: ["openrouter.ai", "api.openrouter.ai"],
+    google: ["generativelanguage.googleapis.com"],
+};
+
+/**
+ * Preferred default model per cloud provider.
+ * Each entry is a prioritized list — the first one found in the available
+ * cloud models list is selected automatically.
+ */
+const PROVIDER_DEFAULT_MODELS: Record<string, string[]> = {
+    openrouter: ["deepseek/deepseek-r1", "deepseek/deepseek-chat", "mistralai/mistral-7b-instruct", "gpt-4o-mini"],
+    openai: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-nano"],
+    anthropic: ["claude-3-5-haiku-20241022", "claude-3-haiku-20240307", "claude-opus-4-20250514", "gpt-4o-mini"],
+    google: ["gemini-2.0-flash-lite", "gemini-2.5-flash-preview-04-17", "gemini-1.5-flash", "gpt-4o-mini"],
+    custom: ["gpt-4o-mini"],
+};
+
 const LOCAL_URLS: ProviderUrls = {
     ollama: "http://localhost:11434",
     vllm: "http://localhost:8000",
@@ -76,6 +97,8 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
     const [apiKeyInput, setApiKeyInput] = useState("");
     const [isSaving, setIsSaving] = useState(false);
     const [status, setStatus] = useState("");
+    const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+    const [isTesting, setIsTesting] = useState(false);
 
     // ── Cloud models fetched on demand ─────────────────────────────────
     const [cloudModels, setCloudModels] = useState<string[]>([]);
@@ -90,6 +113,24 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
     const currentProvider = config.api_mode === "cloud" ? config.cloud_provider : config.local_provider;
     // For protocol validation, "custom" means the user is typing their own URL
     const userIsTypingUrl = currentProvider === "custom" || config.user_edited_url;
+
+    // ── Provider domain validation (cloud only) ────────────────────────
+    const domainMismatch = useMemo<string | null>(() => {
+        if (config.api_mode !== "cloud" || currentProvider === "custom") return null;
+        const url = config.api_url?.trim() ?? "";
+        if (!url) return null;
+        try {
+            const hostname = new URL(url).hostname.toLowerCase();
+            const expected = CLOUD_DOMAINS[currentProvider];
+            if (!expected) return null;
+            if (!expected.some((d) => hostname === d || hostname.endsWith("." + d))) {
+                return `URL domain "${hostname}" doesn't match the expected domain for ${currentProvider} (${expected.join(", ")}). Verify this is intentional.`;
+            }
+        } catch {
+            // Malformed URL — protocolError will catch it
+        }
+        return null;
+    }, [config.api_url, config.api_mode, currentProvider]);
 
     // ── Protocol validation ─────────────────────────────────────────────
     const protocolError = useMemo<string | null>(() => {
@@ -108,7 +149,10 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
         if (showLoading) setIsLoadingCloudModels(true);
         setCloudModelsError("");
         try {
-            const res = await fetch("/api/admin/models", { cache: "no-store" });
+            // Pass the current API URL so the backend can use it instead of
+            // the stale DB-stored openai_base_url (which may not be saved yet).
+            const baseUrlParam = config.api_url ? `?base_url=${encodeURIComponent(config.api_url)}` : "";
+            const res = await fetch(`/api/admin/models${baseUrlParam}`, { cache: "no-store" });
             if (!res.ok) {
                 const payload = await res.json().catch(() => ({}));
                 setCloudModelsError(payload?.error || "Failed to load cloud models");
@@ -127,7 +171,25 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
         }
     }, []);
 
-    // ── Track last-used local models so we can restore them when switching back from cloud ──
+    // ── Auto-select best default model when cloud models load or provider changes ──
+    const previousCloudModelsLength = useRef(0);
+    useEffect(() => {
+        // Only auto-select when models first load (empty → populated) or provider changes
+        const modelsJustLoaded = previousCloudModelsLength.current === 0 && cloudModels.length > 0;
+        previousCloudModelsLength.current = cloudModels.length;
+
+        if (!modelsJustLoaded && !currentProvider) return;
+
+        const preferences = PROVIDER_DEFAULT_MODELS[currentProvider] || PROVIDER_DEFAULT_MODELS.custom;
+        const modelSet = new Set(cloudModels);
+        const best = preferences.find((m) => modelSet.has(m));
+        if (!best) return;
+
+        setConfig((c) => {
+            if (c.openai_model && c.openai_model !== "gpt-4o-mini") return c; // user already picked something
+            return { ...c, openai_model: best };
+        });
+    }, [cloudModels, currentProvider, setConfig]);
     const lastLocalModelsRef = useRef<{ extraction: string; reasoning: string }>({
         extraction: config.extraction_model,
         reasoning: config.reasoning_model,
@@ -353,6 +415,14 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
         return options;
     }, [config.local_models, cloudModels]);
 
+    // ── Pick the best default model for the current cloud provider ────
+    const providerDefaultModel = useMemo<string>(() => {
+        if (config.api_mode !== "cloud") return "gpt-4o-mini";
+        const preferences = PROVIDER_DEFAULT_MODELS[currentProvider] || PROVIDER_DEFAULT_MODELS.custom;
+        const modelSet = new Set(cloudModels);
+        return preferences.find((m) => modelSet.has(m)) || "gpt-4o-mini";
+    }, [config.api_mode, currentProvider, cloudModels]);
+
     const showCloudModelDropdown = cloudModels.length > 0 || isLoadingCloudModels || cloudModelsError;
 
     // ── Mapping for old inference_backend
@@ -466,7 +536,13 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
                             <span>{protocolError}</span>
                         </p>
                     )}
-                    {!protocolError && config.user_edited_url && (
+                    {domainMismatch && (
+                        <p className="mt-1.5 text-[11px] text-amber-400 flex items-center gap-1">
+                            <span>⚠</span>
+                            <span>{domainMismatch}</span>
+                        </p>
+                    )}
+                    {!protocolError && !domainMismatch && config.user_edited_url && (
                         <p className="mt-1 text-[11px] text-amber-500">
                             Custom URL — provider changes won't overwrite until you select a different provider.
                         </p>
@@ -480,18 +556,19 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
                         <label className="block">
                             <span className="text-xs text-slate-400">Default model</span>
                             <p className="text-[11px] text-slate-600 mt-0.5">
-                                Used when no per-stage model is selected. <code className="font-mono">gpt-4o-mini</code> is the default.
+                                Used when no per-stage model is selected. <code className="font-mono">{providerDefaultModel}</code> is{' '}
+                                the default{currentProvider !== "custom" ? ` for ${currentProvider}` : ''}.
                             </p>
 
                             {showCloudModelDropdown ? (
                                 <div className="flex gap-2 items-start mt-2">
                                     <div className="flex-1">
                                         <select
-                                            value={config.openai_model || "gpt-4o-mini"}
+                                            value={config.openai_model || providerDefaultModel}
                                             onChange={(e) => setConfig((c) => ({ ...c, openai_model: e.target.value }))}
                                             className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400"
                                         >
-                                            <option value="gpt-4o-mini">gpt-4o-mini (default)</option>
+                                            <option value={providerDefaultModel}>{providerDefaultModel} (default)</option>
                                             {allModelOptions.map((opt) => (
                                                 <option key={opt.value} value={opt.value}>
                                                     {opt.label}
@@ -518,9 +595,9 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
                                 <div className="flex gap-2 items-start mt-2">
                                     <input
                                         type="text"
-                                        value={config.openai_model || "gpt-4o-mini"}
+                                        value={config.openai_model || providerDefaultModel}
                                         onChange={(e) => setConfig((c) => ({ ...c, openai_model: e.target.value }))}
-                                        placeholder="gpt-4o-mini"
+                                        placeholder={providerDefaultModel}
                                         className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-blue-400 font-mono"
                                     />
                                     <button
@@ -583,10 +660,58 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
                                 )}
                             </div>
                         </div>
+
+                        {/* ── Cloud: Test Connection ── */}
+                        <div className="pt-2">
+                            <button
+                                type="button"
+                                onClick={async () => {
+                                    setIsTesting(true);
+                                    setTestResult(null);
+                                    try {
+                                        const res = await fetch("/api/admin/openai-test-connection", {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({
+                                                api_key: apiKeyInput || undefined,
+                                                base_url: config.api_url || undefined,
+                                            }),
+                                        });
+                                        const data = await res.json();
+                                        if (data.reachable) {
+                                            const modelCount = data.available_models?.length ?? 0;
+                                            setTestResult({
+                                                ok: true,
+                                                message: `Connected ✅ — ${modelCount} model${modelCount !== 1 ? "s" : ""} available`
+                                                    + (data.inference_tested ? " (inference verified)" : ""),
+                                            });
+                                        } else {
+                                            setTestResult({
+                                                ok: false,
+                                                message: data.error || "Connection failed — check the URL and API key",
+                                            });
+                                        }
+                                    } catch {
+                                        setTestResult({ ok: false, message: "Network error — is the backend running?" });
+                                    } finally {
+                                        setIsTesting(false);
+                                    }
+                                }}
+                                disabled={isTesting}
+                                className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+                            >
+                                {isTesting ? "Testing…" : "🔌 Test Connection"}
+                            </button>
+                            {testResult && (
+                                <p className={`mt-2 text-[11px] ${testResult.ok ? "text-emerald-400" : "text-red-400"}`}>
+                                    {testResult.message}
+                                </p>
+                            )}
+                        </div>
                     </>
                 ) : (
                     <>
-                        {/* ── Local-specific: per-provider docs ──────── */}
+                    {/* ── Local-specific: per-provider docs ──────── */}
                         <div className="rounded-lg border border-slate-700/50 bg-slate-900/60 px-4 py-3 text-[11px] text-slate-500 leading-relaxed">
                             <p className="font-medium text-slate-400 mb-1">
                                 {currentProvider === "ollama"
@@ -636,6 +761,50 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
                             </p>
                         </div>
                     </>
+                )}
+
+                {/* ── Local: Test Connection ─────────────────────────── */}
+                {!isCloudMode && (
+                    <div className="pt-2">
+                        <button
+                            type="button"
+                            onClick={async () => {
+                                setIsTesting(true);
+                                setTestResult(null);
+                                try {
+                                    const res = await fetch("/api/ollama/status", { cache: "no-store" });
+                                    const data = await res.json();
+                                    if (data.reachable) {
+                                        const modelCount = data.available_models?.length ?? 0;
+                                        const activeModel = data.active_model || "";
+                                        setTestResult({
+                                            ok: true,
+                                            message: `Connected ✅ — ${modelCount} model${modelCount !== 1 ? "s" : ""} available`
+                                                + (activeModel ? ` (active: ${activeModel})` : ""),
+                                        });
+                                    } else {
+                                        setTestResult({
+                                            ok: false,
+                                            message: data.error || "Connection failed — is the local server running?",
+                                        });
+                                    }
+                                } catch {
+                                    setTestResult({ ok: false, message: "Network error — is the backend running?" });
+                                } finally {
+                                    setIsTesting(false);
+                                }
+                            }}
+                            disabled={isTesting}
+                            className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+                        >
+                            {isTesting ? "Testing…" : "🔌 Test Connection"}
+                        </button>
+                        {testResult && (
+                            <p className={`mt-2 text-[11px] ${testResult.ok ? "text-emerald-400" : "text-red-400"}`}>
+                                {testResult.message}
+                            </p>
+                        )}
+                    </div>
                 )}
 
                 {/* ── Advanced: env var fallback note ────────────────── */}

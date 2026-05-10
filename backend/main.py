@@ -161,12 +161,18 @@ async def _alpaca_poll_scheduler_loop():
 
 
 async def _telegram_bot_loop():
-    """Long-poll Telegram for /stop /start /status /help commands."""
+    """Long-poll Telegram for /stop /start /status /help commands.
+
+    Credentials are re-read from the OS keychain on every poll cycle, so
+    updating them via the admin UI takes effect without a backend restart.
+    When credentials are missing the loop sleeps and retries, allowing the
+    bot to start once credentials are saved in the admin UI.
+    """
     from services.secret_store import get_telegram_credentials
     from services.telegram_bot import initialize_offset, poll_and_dispatch
 
     offset = None
-    print("[telegram-bot] loop started")
+    print("[telegram-bot] loop started (will retry if credentials are missing)")
     backoff = 1
     max_backoff = 60
     while True:
@@ -176,15 +182,18 @@ async def _telegram_bot_loop():
             chat_id = (creds.get("chat_id")   or "").strip()
             authorized_user_id = (creds.get("authorized_user_id") or "").strip()
             if not token or not chat_id or not authorized_user_id:
-                # Credentials were removed at runtime — stop the loop
-                print("[telegram-bot] credentials removed, stopping bot loop")
-                return
+                # Credentials missing — sleep and retry so the bot picks up
+                # credentials saved in the admin UI without a restart.
+                print(f"[telegram-bot] waiting for credentials (retry in {backoff}s)")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                offset = None  # reset offset so we re-init when credentials appear
+                continue
+            backoff = 1  # reset backoff when credentials are present
             if offset is None:
                 offset = await asyncio.to_thread(initialize_offset, token)
                 print(f"[telegram-bot] initialized polling offset at {offset}")
-                backoff = 1  # reset backoff after successful init
             offset = await asyncio.to_thread(poll_and_dispatch, token, chat_id, authorized_user_id, offset)
-            backoff = 1  # reset backoff after successful poll
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -250,7 +259,12 @@ async def lifespan(app: FastAPI):
     admin_token_enabled = bool(os.getenv("ADMIN_API_TOKEN", "").strip())
     print(f"Local-first defaults: backend host={bind_host} | CORS={cors_origins}")
     if bind_host not in {"127.0.0.1", "localhost"}:
-        print("WARNING: Backend is configured to listen beyond localhost. Only do this on trusted networks.")
+        if not admin_token_enabled:
+            raise RuntimeError(
+                "Refusing to bind to 0.0.0.0 or external network without ADMIN_API_TOKEN. "
+                "Set ADMIN_API_TOKEN to a strong secret, or set HOST=127.0.0.1 for local-only access."
+            )
+        print("WARNING: Backend is configured to listen beyond localhost — admin token is required for all routes.")
     if "*" in cors_origins:
         print("WARNING: CORS_ORIGINS contains '*'. This is not recommended outside local development.")
     if not admin_token_enabled:
@@ -284,18 +298,18 @@ async def lifespan(app: FastAPI):
         
         print(f"[telegram-bot] startup: enabled={remote_control_enabled}, token_present={bool(token)}, chat_id_present={bool(chat_id)}, user_id_present={bool(user_id)}")
         
-        if remote_control_enabled and token and chat_id and user_id:
+        if remote_control_enabled:
+            # Always start the loop — it re-reads credentials from the OS keychain
+            # on every poll cycle, so saving credentials in the admin UI takes
+            # effect without a restart. If credentials are missing at boot the
+            # loop will back off and retry until they appear.
             telegram_bot_task = asyncio.create_task(_telegram_bot_loop())
-            print("[telegram-bot] remote control started (long-polling for /status /stop /start /snapshot /help)")
-        elif not remote_control_enabled:
-            print("[telegram-bot] skipped (disabled in admin settings)")
+            if token and chat_id and user_id:
+                print("[telegram-bot] remote control started (polling for /status /stop /start /snapshot /help)")
+            else:
+                print("[telegram-bot] remote control enabled but credentials missing — bot will start automatically once credentials are saved in admin UI")
         else:
-            missing = []
-            if not token: missing.append("bot_token")
-            if not chat_id: missing.append("chat_id")
-            if not user_id: missing.append("authorized_user_id")
-            print(f"[telegram-bot] skipped (incomplete credentials: missing {', '.join(missing)})")
-            print("[telegram-bot] Note: configure credentials in admin UI, then restart backend to enable polling")
+            print("[telegram-bot] skipped (disabled in admin settings)")
     except Exception as exc:
         import traceback
         print(f"[telegram-bot] startup error: {exc}")

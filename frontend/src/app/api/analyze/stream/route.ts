@@ -12,9 +12,17 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const apiUrl = getBackendApiUrl();
 
+    const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+    };
+    const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+    if (ADMIN_API_TOKEN) {
+        headers["X-Admin-Token"] = ADMIN_API_TOKEN;
+    }
+
     const backendResponse = await fetch(`${apiUrl}/api/v1/analyze/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(body),
     });
 

@@ -2,6 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { getBackendApiUrl } from "@/lib/backend-api";
 
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+
+function backendHeaders(init?: HeadersInit): Headers {
+    const headers = new Headers(init);
+    if (ADMIN_API_TOKEN) {
+        headers.set("X-Admin-Token", ADMIN_API_TOKEN);
+    }
+    return headers;
+}
+
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
@@ -9,9 +19,9 @@ export async function POST(request: NextRequest) {
         // Forward to backend API
         const response = await fetch(`${getBackendApiUrl()}/api/v1/analyze`, {
             method: "POST",
-            headers: {
+            headers: backendHeaders({
                 "Content-Type": "application/json",
-            },
+            }),
             body: JSON.stringify(body),
         });
 

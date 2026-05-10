@@ -12,9 +12,15 @@ function backendHeaders(init?: HeadersInit): Headers {
     return headers;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
     try {
-        const response = await fetch(`${getBackendApiUrl()}/api/v1/admin/models`, {
+        const url = new URL(request.url);
+        const baseUrlParam = url.searchParams.get("base_url");
+        let backendUrl = `${getBackendApiUrl()}/api/v1/admin/models`;
+        if (baseUrlParam) {
+            backendUrl += `?base_url=${encodeURIComponent(baseUrlParam)}`;
+        }
+        const response = await fetch(backendUrl, {
             cache: "no-store",
             headers: backendHeaders(),
         });
