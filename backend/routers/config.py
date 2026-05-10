@@ -46,13 +46,15 @@ from services.telegram_bot import verify_remote_control
 router = APIRouter()
 
 
-def _fetch_models_from_backends(config, override_base_url: Optional[str] = None) -> Dict[str, Any]:
+def _fetch_models_from_backends(config, override_base_url: Optional[str] = None, override_provider: Optional[str] = None) -> Dict[str, Any]:
     """Return {'local_models': [...], 'cloud_models': [...]} from all configured backends.
 
     Args:
         config: AppConfig instance from the database.
         override_base_url: If provided, overrides the DB-stored openai_base_url.
             Used when the frontend user has edited the URL but not yet saved.
+        override_provider: If provided, reads the API key for this provider.
+            Used when the frontend user has changed provider but not yet saved.
     """
     result: Dict[str, List[str]] = {"local_models": [], "cloud_models": []}
 
@@ -72,11 +74,15 @@ def _fetch_models_from_backends(config, override_base_url: Optional[str] = None)
         return str(getattr(config, "openai_base_url", "https://api.openai.com/v1") or "https://api.openai.com/v1")
 
     api_key = get_openai_api_key()
-    # Also try provider-specific key if the DB has a cloud_provider set
-    cloud_provider = str(getattr(config, "cloud_provider", "") or "").strip().lower()
-    if not api_key and cloud_provider and cloud_provider != "openai":
+    # Also try override_provider or the DB-stored cloud_provider
+    if override_provider and override_provider != "openai":
         from services.secret_store import get_cloud_api_key
-        api_key = get_cloud_api_key(cloud_provider)
+        api_key = get_cloud_api_key(override_provider)
+    elif not api_key:
+        cloud_provider = str(getattr(config, "cloud_provider", "") or "").strip().lower()
+        if cloud_provider and cloud_provider != "openai":
+            from services.secret_store import get_cloud_api_key
+            api_key = get_cloud_api_key(cloud_provider)
     if api_key:
         try:
             from services.openai_client import get_openai_status
@@ -145,10 +151,13 @@ async def get_admin_models(
     Query parameters:
       - base_url: override the DB-stored openai_base_url (for when the
         user has edited the URL in the UI but not yet saved config).
+      - provider: override the DB-stored cloud_provider (for when the
+        user has switched providers but not yet saved config).
     """
     config = get_or_create_app_config(db)
     base_url_override = request.query_params.get("base_url")
-    model_info = _fetch_models_from_backends(config, override_base_url=base_url_override)
+    provider_override = request.query_params.get("provider")
+    model_info = _fetch_models_from_backends(config, override_base_url=base_url_override, override_provider=provider_override)
     return {
         "local_models": model_info["local_models"],
         "cloud_models": model_info["cloud_models"],

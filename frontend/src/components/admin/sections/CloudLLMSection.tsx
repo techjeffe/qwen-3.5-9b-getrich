@@ -149,10 +149,14 @@ export function CloudLLMSection({ config, setConfig, isAdvancedMode }: CloudLLMS
         if (showLoading) setIsLoadingCloudModels(true);
         setCloudModelsError("");
         try {
-            // Pass the current API URL so the backend can use it instead of
-            // the stale DB-stored openai_base_url (which may not be saved yet).
-            const baseUrlParam = config.api_url ? `?base_url=${encodeURIComponent(config.api_url)}` : "";
-            const res = await fetch(`/api/admin/models${baseUrlParam}`, { cache: "no-store" });
+            // Pass the current API URL and provider so the backend can use them
+            // instead of stale DB-stored values that may not be saved yet.
+            const params = new URLSearchParams();
+            if (config.api_url) params.set("base_url", config.api_url);
+            // Include provider so the backend reads the right per-provider API key
+            if (currentProvider && currentProvider !== "custom") params.set("provider", currentProvider);
+            const qs = params.toString();
+            const res = await fetch(`/api/admin/models${qs ? `?${qs}` : ""}`, { cache: "no-store" });
             if (!res.ok) {
                 const payload = await res.json().catch(() => ({}));
                 setCloudModelsError(payload?.error || "Failed to load cloud models");

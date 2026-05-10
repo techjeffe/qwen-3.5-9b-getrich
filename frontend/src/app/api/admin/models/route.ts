@@ -15,11 +15,13 @@ function backendHeaders(init?: HeadersInit): Headers {
 export async function GET(request: Request) {
     try {
         const url = new URL(request.url);
+        const params = new URLSearchParams();
         const baseUrlParam = url.searchParams.get("base_url");
-        let backendUrl = `${getBackendApiUrl()}/api/v1/admin/models`;
-        if (baseUrlParam) {
-            backendUrl += `?base_url=${encodeURIComponent(baseUrlParam)}`;
-        }
+        const providerParam = url.searchParams.get("provider");
+        if (baseUrlParam) params.set("base_url", baseUrlParam);
+        if (providerParam) params.set("provider", providerParam);
+        const qs = params.toString();
+        const backendUrl = `${getBackendApiUrl()}/api/v1/admin/models${qs ? `?${qs}` : ""}`;
         const response = await fetch(backendUrl, {
             cache: "no-store",
             headers: backendHeaders(),
