@@ -394,10 +394,51 @@ export default function AdminPage() {
         const load = async () => {
             const response = await fetch("/api/config", { cache: "no-store" });
             if (!response.ok) return;
-            const nextConfig = normalizeConfigPayload(await response.json());
-            setConfig(nextConfig);
-            setSavedConfig(nextConfig);
-            setTimeZone(nextConfig.display_timezone || "");
+            const raw = await response.json();
+            const nextConfig = normalizeConfigPayload(raw);
+            // ── Derive new API selection fields from legacy backend fields ──
+            const legacyBackend = String(raw?.inference_backend || "ollama").trim().toLowerCase();
+            const isCloudLegacy = legacyBackend === "openai";
+            const legacyOllamaUrl = String(raw?.ollama_url || "").trim();
+            const legacyVllmUrl = String(raw?.vllm_url || "").trim();
+            const legacyOpenaiUrl = String(raw?.openai_base_url || "").trim();
+
+            const derivedApiMode: "cloud" | "local" = isCloudLegacy ? "cloud" : "local";
+
+            // Determine provider and URL from legacy fields
+            let derivedProvider = "";
+            let derivedUrl = "";
+
+            if (isCloudLegacy) {
+                derivedUrl = legacyOpenaiUrl || "https://api.openai.com/v1";
+                // Guess provider from URL
+                if (derivedUrl.includes("openrouter.ai")) derivedProvider = "openrouter";
+                else if (derivedUrl.includes("anthropic.com")) derivedProvider = "anthropic";
+                else if (derivedUrl.includes("googleapis.com") || derivedUrl.includes("generativelanguage")) derivedProvider = "google";
+                else if (derivedUrl.includes("openai.com")) derivedProvider = "openai";
+                else derivedProvider = "custom";
+            } else {
+                if (legacyBackend === "ollama") {
+                    derivedProvider = "ollama";
+                    derivedUrl = legacyOllamaUrl || "http://localhost:11434";
+                } else {
+                    // vllm or any local backend
+                    derivedProvider = "vllm";
+                    derivedUrl = legacyVllmUrl || "http://localhost:8000";
+                }
+            }
+
+            const finalConfig: AppConfig = {
+                ...nextConfig,
+                api_mode: derivedApiMode,
+                cloud_provider: isCloudLegacy ? derivedProvider : nextConfig.cloud_provider,
+                local_provider: isCloudLegacy ? nextConfig.local_provider : derivedProvider,
+                api_url: derivedUrl,
+                user_edited_url: derivedProvider === "custom",
+            };
+            setConfig(finalConfig);
+            setSavedConfig(finalConfig);
+            setTimeZone(finalConfig.display_timezone || "");
         };
         void load();
         void fetchUnexecuted();
@@ -751,11 +792,24 @@ export default function AdminPage() {
 
         setIsSaving(true);
         setStatus("");
+
+        // ── Map new API selection fields to legacy backend fields ──
+        const apiUrl = (config.api_url ?? "").trim();
+        const payload = {
+            ...config,
+            inference_backend: config.api_mode === "cloud"
+                ? "openai"
+                : config.local_provider === "ollama" ? "ollama" : "vllm",
+            openai_base_url: config.api_mode === "cloud" ? apiUrl : config.openai_base_url,
+            ollama_url: config.api_mode === "local" && config.local_provider === "ollama" ? apiUrl : config.ollama_url,
+            vllm_url: config.api_mode === "local" && config.local_provider !== "ollama" ? apiUrl : config.vllm_url,
+        };
+
         try {
             const response = await fetch("/api/config", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(config),
+                body: JSON.stringify(payload),
             });
             if (!response.ok) {
                 throw new Error("Failed to save config");

@@ -35,6 +35,12 @@ export type AppConfig = {
     vllm_url: string;
     openai_base_url: string;
     openai_model: string;
+    // ── Hierarchical API selection (UI state) ──
+    api_mode: "cloud" | "local";
+    cloud_provider: string;
+    local_provider: string;
+    api_url: string;
+    user_edited_url: boolean;
     red_team_enabled: boolean;
     risk_profile: string;
     risk_policy?: {
@@ -160,6 +166,11 @@ export const EMPTY_CONFIG: AppConfig = {
     vllm_url: "http://localhost:8000",
     openai_base_url: "https://api.openai.com/v1",
     openai_model: "gpt-4o-mini",
+    api_mode: "local",
+    cloud_provider: "openai",
+    local_provider: "ollama",
+    api_url: "http://localhost:11434",
+    user_edited_url: false,
     red_team_enabled: true,
     risk_profile: "standard",
     risk_policy: {
