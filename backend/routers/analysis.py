@@ -1197,9 +1197,9 @@ async def _pre_ingest_stream(
     dupes = 0
     fast_lane_ids = []
     fast_lane_syms = []
-    new_article_ids: List[int] = []
+    all_article_ids: List[int] = []
     if metadata is not None:
-        metadata["new_article_ids"] = new_article_ids
+        metadata["all_article_ids"] = all_article_ids
 
     kept.sort(key=lambda a: _coerce_utc(getattr(a, "published_date", None)) or _utc_now(), reverse=True)
     session = db
@@ -1216,9 +1216,9 @@ async def _pre_ingest_stream(
         fast_hit = check_fast_lane(summary_blob)
         row, is_new = _upsert_scraped_article(session, article, full_content, fast_hit)
         session.commit()
+        all_article_ids.append(int(row.id))
         if is_new:
             stored += 1
-            new_article_ids.append(int(row.id))
         else:
             dupes += 1
         if fast_hit:
@@ -1303,9 +1303,13 @@ async def analyze_market_stream(
             yield f"data: {json.dumps({'type': 'log', 'message': 'Phase 1/4: Ingesting queued articles and market context...'}, default=str)}\n\n"
             yield f"data: {json.dumps({'type': 'phase', 'phase': 1, 'label': 'Ingesting queued articles and market context'}, default=str)}\n\n"
 
-            selected_article_ids = ingestion_result.get("new_article_ids")
-            if selected_article_ids:
-                yield f"data: {json.dumps({'type': 'log', 'message': f'Using {len(selected_article_ids)} newly ingested live article(s) for this analysis run'}, default=str)}\n\n"
+            # Always load all unprocessed articles from the DB queue rather than
+            # restricting to only newly ingested ones. The pre-ingest step above
+            # ensures fresh articles exist in the queue, but most will be duplicates
+            # of what the background scheduler already stored. Restricting to only
+            # new article IDs starves the pipeline (e.g. 1 new article when 194 are
+            # available), causing all symbols to analyze the same article.
+            yield f"data: {json.dumps({'type': 'log', 'message': 'Loading all unprocessed articles from DB queue for analysis'}, default=str)}\n\n"
 
             task = asyncio.create_task(
                 pipeline.run(
@@ -1313,7 +1317,7 @@ async def analyze_market_stream(
                     db=db,
                     config=config,
                     prompt_overrides=prompt_overrides,
-                    article_ids=selected_article_ids or None,
+                    article_ids=None,
                     trigger_source="stream",
                 )
             )

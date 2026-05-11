@@ -1166,11 +1166,24 @@ class SentimentEngine:
             if any(term in blob for term in expanded_terms):
                 keyword_relevant.append(post)
 
-        filtered = keyword_relevant or posts  # never return empty
-        print(
-            f"Stage 1 keyword filter: {len(keyword_relevant)}/{len(posts)} articles matched"
-            f" | using {'keyword matches' if keyword_relevant else 'all articles (no keyword hits)'}"
-        )
+        # Minimum coverage threshold: if keyword matching retains fewer than 10% of
+        # articles, fall back to the full pool. This prevents the pipeline from
+        # collapsing to 1 article when 332 were fetched — the proxy terms are
+        # intentionally narrow and may miss general market news that Stage 2's
+        # per-symbol specialist can still analyze.
+        MIN_COVERAGE_RATIO = 0.10
+        if keyword_relevant and len(keyword_relevant) / max(1, len(posts)) >= MIN_COVERAGE_RATIO:
+            filtered = keyword_relevant
+            print(
+                f"Stage 1 keyword filter: {len(keyword_relevant)}/{len(posts)} articles matched"
+                f" | using keyword matches"
+            )
+        else:
+            filtered = posts
+            print(
+                f"Stage 1 keyword filter: {len(keyword_relevant)}/{len(posts)} articles matched"
+                f" | below {MIN_COVERAGE_RATIO:.0%} coverage — using all {len(posts)} articles to avoid starvation"
+            )
 
         # Build per-symbol article subsets and exposure-quality hints in one pass.
         # posts_by_symbol[sym] contains only articles that matched sym's own proxy

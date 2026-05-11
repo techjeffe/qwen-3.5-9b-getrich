@@ -51,12 +51,15 @@ class ScrapedArticle(Base):
     published_at = Column(DateTime(timezone=True), nullable=True)
     discovered_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
     processed = Column(Boolean, nullable=False, default=False)
+    processed_at = Column(DateTime(timezone=True), nullable=True)
     fast_lane_triggered = Column(Boolean, nullable=False, default=False)
+    content_hash = Column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_scraped_articles_processed", "processed"),
         Index("ix_scraped_articles_published_at", "published_at"),
         Index("ix_scraped_articles_discovered_at", "discovered_at"),
+        Index("ix_scraped_articles_content_hash", "content_hash"),
     )
 
 

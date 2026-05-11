@@ -208,14 +208,34 @@ def migrate():
                     published_at DATETIME,
                     discovered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     processed BOOLEAN NOT NULL DEFAULT 0,
-                    fast_lane_triggered BOOLEAN NOT NULL DEFAULT 0
+                    processed_at DATETIME,
+                    fast_lane_triggered BOOLEAN NOT NULL DEFAULT 0,
+                    content_hash VARCHAR(64)
                 )
             """))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scraped_articles_processed ON scraped_articles (processed)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scraped_articles_published_at ON scraped_articles (published_at)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scraped_articles_discovered_at ON scraped_articles (discovered_at)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scraped_articles_content_hash ON scraped_articles (content_hash)"))
             conn.commit()
             print("scraped_articles table created.")
+        else:
+            # Add new columns to existing scraped_articles table
+            existing_sa_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(scraped_articles)")).fetchall()]
+            for column_name, column_type in [
+                ("processed_at", "DATETIME"),
+                ("content_hash", "VARCHAR(64)"),
+            ]:
+                if column_name not in existing_sa_cols:
+                    print(f"Adding {column_name} to scraped_articles...")
+                    conn.exec_driver_sql(f"ALTER TABLE scraped_articles ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+            # Add content_hash index if missing
+            existing_indexes = [row[0] for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='index'")).fetchall()]
+            if "ix_scraped_articles_content_hash" not in existing_indexes:
+                print("Creating index ix_scraped_articles_content_hash...")
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scraped_articles_content_hash ON scraped_articles (content_hash)"))
+                conn.commit()
 
         # ── paper_trades table ────────────────────────────────────────────────
         if "paper_trades" not in tables:

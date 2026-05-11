@@ -494,12 +494,22 @@ async def fetch_article_text(url: str, fallback_text: str = "") -> str:
     return _clean_extracted_text(extracted or fallback_text, fallback_text)
 
 
+def _compute_content_hash(title: str, content: str) -> str:
+    """SHA256 of normalized title + first 500 chars of content for dedup."""
+    import hashlib
+    normalized = " ".join((title or "").lower().split()) + "|" + " ".join((content or "")[:500].lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _upsert_scraped_article(
     db: Session,
     article: NewsArticle,
     full_content: str,
     fast_lane_triggered: bool,
 ) -> Tuple[ScrapedArticle, bool]:
+    content_hash = _compute_content_hash(article.title or "", full_content or article.summary or "")
+
+    # Check URL first (exact duplicate)
     existing = db.query(ScrapedArticle).filter(ScrapedArticle.url == article.link).first()
     if existing:
         if full_content and (not existing.full_content or len(full_content) > len(existing.full_content)):
@@ -513,9 +523,21 @@ def _upsert_scraped_article(
         if article.published_date and existing.published_at is None:
             existing.published_at = _coerce_utc(article.published_date)
         existing.fast_lane_triggered = bool(existing.fast_lane_triggered or fast_lane_triggered)
+        if not existing.content_hash:
+            existing.content_hash = content_hash
         db.add(existing)
         db.flush()
         return existing, False
+
+    # Check content hash for near-duplicate (same story, different URL)
+    if content_hash:
+        hash_match = db.query(ScrapedArticle).filter(
+            ScrapedArticle.content_hash == content_hash,
+            ScrapedArticle.processed == False,
+        ).first()
+        if hash_match:
+            # Same story already in queue — skip
+            return hash_match, False
 
     row = ScrapedArticle(
         source=str(article.source or "unknown"),
@@ -527,6 +549,7 @@ def _upsert_scraped_article(
         discovered_at=_utc_now(),
         processed=False,
         fast_lane_triggered=bool(fast_lane_triggered),
+        content_hash=content_hash,
     )
     db.add(row)
     db.flush()
@@ -638,9 +661,12 @@ async def run_ingestion_cycle(db: Optional[Session] = None) -> Dict[str, Any]:
                 fast_lane_article_ids.append(int(row.id))
                 fast_lane_symbols.extend(_resolve_fast_lane_symbols(summary_blob, tracked_symbols))
 
+        # Fast-lane analysis is disabled from the scheduler to prevent
+        # it from marking articles as processed before the stream endpoint runs.
+        # Analysis should only be triggered by the user clicking "Analyze".
         if fast_lane_article_ids:
             deduped_symbols = sorted({symbol.upper() for symbol in fast_lane_symbols if symbol})
-            asyncio.create_task(trigger_fast_lane(sorted(set(fast_lane_article_ids)), deduped_symbols))
+            print(f"Fast-lane articles detected ({len(fast_lane_article_ids)}), but analysis deferred to manual trigger")
 
         return {
             "total_feed_articles": len(articles),

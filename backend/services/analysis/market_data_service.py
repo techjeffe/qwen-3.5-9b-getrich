@@ -137,13 +137,20 @@ class MarketDataService:
         article_ids: Optional[List[int]] = None,
         trigger_source: str = "api",
     ) -> Tuple[List[Any], Dict[str, Any]]:
-        """Load pending scraped articles from the DB-backed ingestion queue."""
+        """Load scraped articles from the DB within the configured age window."""
         from database.models import ScrapedArticle
+        from datetime import datetime, timezone, timedelta
 
-        query = db.query(ScrapedArticle).filter(ScrapedArticle.processed.is_(False))
         if article_ids:
             normalized_ids = sorted({int(article_id) for article_id in article_ids})
-            query = query.filter(ScrapedArticle.id.in_(normalized_ids))
+            query = db.query(ScrapedArticle).filter(ScrapedArticle.id.in_(normalized_ids))
+        else:
+            # Load recent articles by time window (12 hours) instead of by processed flag.
+            # This makes articles reusable across multiple analysis runs until they fall
+            # out of the window naturally — no DB clears needed between runs.
+            age_hours = int(getattr(config, "article_retention_hours", 12) or 12)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+            query = db.query(ScrapedArticle).filter(ScrapedArticle.discovered_at >= cutoff)
 
         rows = (
             query.order_by(

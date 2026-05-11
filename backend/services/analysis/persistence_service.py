@@ -294,6 +294,7 @@ class PersistenceService:
             )
             db.add(analysis)
             db.flush()
+
             persist_recommendation_trades(
                 db=db,
                 analysis_id=analysis.id,
