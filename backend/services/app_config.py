@@ -949,8 +949,6 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
         config.risk_policy = _normalize_risk_policy(payload.get("risk_policy"))
     else:
         config.risk_policy = _normalize_risk_policy(getattr(config, "risk_policy", {}))
-    if "web_research_enabled" in payload:
-        config.web_research_enabled = bool(payload.get("web_research_enabled"))
     if "allow_extended_hours_trading" in payload:
         config.allow_extended_hours_trading = bool(payload.get("allow_extended_hours_trading"))
     if "remote_snapshot_enabled" in payload:

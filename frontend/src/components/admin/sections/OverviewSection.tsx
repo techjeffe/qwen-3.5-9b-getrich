@@ -244,29 +244,7 @@ export function OverviewSection({ config, setConfig, isAdvancedMode, riskOptions
                 )}
             </div>
 
-            {/* 4. Light Web Research */}
-            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-                <label className="flex items-start gap-3 cursor-pointer">
-                    <input
-                        type="checkbox"
-                        checked={config.web_research_enabled}
-                        onChange={(e) => setConfig((c) => ({ ...c, web_research_enabled: e.target.checked }))}
-                        className="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    <span className="block">
-                        <span className="text-sm font-semibold text-slate-200">Light Web Research</span>
-                        <span className="block mt-1 text-xs text-slate-400 leading-relaxed">
-                            Fetch a few recent trusted headlines per active symbol and inject them into the specialist prompt.
-                            Intentionally lightweight — useful for custom names like NVDA without pulling a huge feed universe.
-                        </span>
-                        <span className="block mt-2 text-[11px] text-slate-500">
-                            Snapshot reruns reuse the saved web context so model comparisons stay fair.
-                        </span>
-                    </span>
-                </label>
-            </div>
-
-            {/* 5. Red-team — always visible */}
+            {/* 4. Red-team — always visible */}
             <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
                 <label className="flex items-start gap-3 cursor-pointer">
                     <input

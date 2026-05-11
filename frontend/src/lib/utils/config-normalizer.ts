@@ -56,7 +56,6 @@ export type AppConfig = {
             };
         };
     };
-    web_research_enabled: boolean;
     allow_extended_hours_trading: boolean;
     hold_overnight: boolean;
     trail_on_window_expiry: boolean;
@@ -186,7 +185,6 @@ export const EMPTY_CONFIG: AppConfig = {
             },
         },
     },
-    web_research_enabled: false,
     allow_extended_hours_trading: true,
     hold_overnight: false,
     trail_on_window_expiry: true,

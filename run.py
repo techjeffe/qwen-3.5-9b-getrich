@@ -38,7 +38,7 @@ if __name__ == "__main__":
     )
     args, _ = parser.parse_known_args()
 
-    enable_reload = _env_flag("UVICORN_RELOAD", default=(sys.platform != "win32"))
+    enable_reload = _env_flag("UVICORN_RELOAD", default=True)
     log_level = "debug" if args.verbose else "info"
 
     if args.verbose:
