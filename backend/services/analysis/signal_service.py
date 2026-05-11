@@ -60,6 +60,21 @@ class SignalService:
         self._continuous_entry_enabled = continuous_entry_enabled
         self._regime_adaptation_enabled = regime_adaptation_enabled
         self._hold_decay_enabled = hold_decay_enabled
+        self._crazy = logic_config.get("crazy", {})
+
+    # ── Crazy profile helpers ────────────────────────────────────────
+
+    def _crazy_entry_thresholds(self) -> dict:
+        """Return entry threshold overrides for crazy profile, or empty dict."""
+        return dict(self._crazy.get("entry_thresholds") or {})
+
+    def _crazy_continuous_entry(self) -> dict:
+        """Return continuous entry overrides for crazy profile, or empty dict."""
+        return dict(self._crazy.get("continuous_entry") or {})
+
+    def _crazy_conviction(self) -> dict:
+        """Return conviction threshold overrides for crazy profile, or empty dict."""
+        return dict(self._crazy.get("conviction") or {})
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -104,10 +119,17 @@ class SignalService:
         short_recommendations = 0
         hold_recommendations = 0
         previous_recommendations = self._recommendations_by_underlying(previous_signal)
+        is_crazy = str(risk_profile or "").lower().strip() == "crazy"
         _et = self._L["entry_thresholds"]
+        _crazy_et = self._crazy_entry_thresholds()
         is_closed_hysteresis = stability_mode == "closed_market_hysteresis"
-        entry_threshold = _et["closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["normal"])
-        keep_threshold = _et["keep_closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["keep_normal"])
+        # Crazy profile uses its own entry thresholds
+        if is_crazy and _crazy_et:
+            entry_threshold = _crazy_et["closed_market"] if is_closed_hysteresis else (entry_threshold_override or _crazy_et["normal"])
+            keep_threshold = _crazy_et["keep_closed_market"] if is_closed_hysteresis else (entry_threshold_override or _crazy_et["keep_normal"])
+        else:
+            entry_threshold = _et["closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["normal"])
+            keep_threshold = _et["keep_closed_market"] if is_closed_hysteresis else (entry_threshold_override or _et["keep_normal"])
 
         # ── Regime adaptation: adjust entry threshold based on volatility ──
         _ra = self._L.get("regime_adaptation", {})
@@ -121,6 +143,9 @@ class SignalService:
 
         # ── Continuous entry config ──
         _ce = self._L.get("continuous_entry", {})
+        _crazy_ce = self._crazy_continuous_entry()
+        if is_crazy and _crazy_ce:
+            _ce = {**_ce, **_crazy_ce}
         _ce_enabled = self._continuous_entry_enabled if self._continuous_entry_enabled is not None else _ce.get("enabled", True)
 
         for sym, result in sentiment_results.items():
@@ -282,12 +307,29 @@ class SignalService:
         elif short_recommendations > 0 and long_recommendations == 0:
             signal_type = "SHORT"
         elif recommendations:
+            # Multi-leg signal: both longs and shorts exist. Use net direction
+            # to determine the portfolio-level signal_type, but keep ALL valid
+            # recommendations so the paper_trading engine can execute each leg
+            # independently. Previously this branch picked a single winner,
+            # which suppressed valid opposing signals (e.g. USO LONG was dropped
+            # when LUNR SHORT had slightly higher conviction).
+            net_direction = sum(
+                float(sentiment_results[rec["underlying_symbol"]].get("directional_score", 0.0))
+                for rec in recommendations
+            )
+            if net_direction > 0.15:
+                signal_type = "LONG"
+            elif net_direction < -0.15:
+                signal_type = "SHORT"
+            else:
+                signal_type = "HOLD"
+            # Pick the strongest recommendation for entry_symbol display purposes
+            # only — all recommendations remain in the list for execution.
             strongest_recommendation = max(
                 recommendations,
                 key=lambda rec: abs(float(sentiment_results[rec["underlying_symbol"]].get("directional_score", 0.0)))
                 * float(sentiment_results[rec["underlying_symbol"]].get("confidence", 0.0)),
             )
-            signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
             strongest_symbol = strongest_recommendation["underlying_symbol"]
             strongest_execution_symbol = strongest_recommendation["symbol"]
         else:
@@ -326,6 +368,9 @@ class SignalService:
                 break
 
         _cv = self._L["conviction"]
+        _crazy_cv = self._crazy_conviction()
+        if is_crazy and _crazy_cv:
+            _cv = {**_cv, **_crazy_cv}
         if conviction_level_from_engine:
             conviction_level = conviction_level_from_engine
         else:
@@ -367,6 +412,18 @@ class SignalService:
             and current_posts_count < previous_posts_count * 0.4
         ):
             data_gap_hold = True
+
+        # ── Diagnostic logging ──
+        print(f"[signal] Blue-team signal: {signal_type}, conviction={conviction_level}, confidence={confidence_score:.3f}, risk_profile={risk_profile}")
+        if recommendations:
+            for rec in recommendations:
+                print(f"[signal]   → {rec.get('underlying_symbol', '?')} {rec.get('action', '?')} "
+                      f"@{rec.get('symbol', '?')} {rec.get('leverage', '?')} "
+                      f"size={rec.get('size_pct', '?')}% "
+                      f"thesis={rec.get('thesis', '?')} "
+                      f"ramp={rec.get('ramp_stage', 'N/A')}")
+        else:
+            print(f"[signal]   No recommendations generated")
 
         return TradingSignal(
             signal_type=signal_type,
@@ -500,6 +557,17 @@ class SignalService:
             elif sell_recommendations and not buy_recommendations:
                 signal_type = "SHORT"
             else:
+                # Multi-leg consensus: both longs and shorts exist. Use net
+                # signed confidence to determine portfolio-level signal_type.
+                # All recommendations are preserved for independent execution.
+                net_signed = sum(signed_scores)
+                if net_signed > 0.15:
+                    signal_type = "LONG"
+                elif net_signed < -0.15:
+                    signal_type = "SHORT"
+                else:
+                    signal_type = "HOLD"
+                # Pick strongest for display purposes only
                 strongest_recommendation = max(
                     recommendations,
                     key=lambda rec: abs(float(next(
@@ -511,7 +579,6 @@ class SignalService:
                         0.0,
                     ))),
                 )
-                signal_type = str(strongest_recommendation.get("thesis") or "HOLD").upper()
                 strongest_execution_symbol = strongest_recommendation["symbol"]
             confidence_score = max(computed_confidences) if computed_confidences else 0.0
         else:
