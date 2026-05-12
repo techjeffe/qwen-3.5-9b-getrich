@@ -303,6 +303,8 @@ class PaperTrade(Base):
     trailing_stop_price = Column(Float, nullable=True)         # set when HOLD fires; position closes when price crosses this level
     best_price_seen = Column(Float, nullable=True)             # high-water mark (LONG) or low-water mark (SHORT) for trailing stop
 
+    original_amount = Column(Float, nullable=True)             # initial entry amount before any accumulation; used to cap accumulation at max_multiplier × original
+
     __table_args__ = (
         Index("ix_paper_trades_underlying", "underlying"),
         Index("ix_paper_trades_entered_at", "entered_at"),
@@ -397,6 +399,8 @@ class AppConfig(Base):
     continuous_entry_enabled = Column(Boolean, nullable=True, default=None)
     regime_adaptation_enabled = Column(Boolean, nullable=True, default=None)
     hold_decay_enabled = Column(Boolean, nullable=True, default=None)
+    accumulate_on_confirmation_enabled = Column(Boolean, nullable=True, default=None)
+    accumulate_max_multiplier = Column(Float, nullable=True, default=None)
 
     # ── Alpaca brokerage execution ────────────────────────────────────────────
     alpaca_execution_mode         = Column(String(10),  nullable=False, default="off")  # off | paper | live

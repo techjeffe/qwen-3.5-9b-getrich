@@ -76,6 +76,13 @@ class RSSFeedParser:
     ):
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+        })
         self.feeds = dict(feeds or self.GEOPOLITICAL_FEEDS)
         self.feed_labels = {str(key): str(value).strip() for key, value in (feed_labels or {}).items() if str(value).strip()}
         

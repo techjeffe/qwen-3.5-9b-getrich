@@ -99,6 +99,8 @@ def migrate():
             ("continuous_entry_enabled", "BOOLEAN"),
             ("regime_adaptation_enabled", "BOOLEAN"),
             ("hold_decay_enabled", "BOOLEAN"),
+            ("accumulate_on_confirmation_enabled", "BOOLEAN"),
+            ("accumulate_max_multiplier", "REAL"),
         ]:
             if column_name not in existing_cols:
                 print(f"Adding {column_name} to app_config...")
@@ -281,6 +283,7 @@ def migrate():
                 ("close_reason",        "VARCHAR(40)"),
                 ("trailing_stop_price", "REAL"),
                 ("best_price_seen",     "REAL"),
+                ("original_amount",     "REAL"),
             ]:
                 if column_name not in existing_pt_cols:
                     print(f"Adding {column_name} to paper_trades...")

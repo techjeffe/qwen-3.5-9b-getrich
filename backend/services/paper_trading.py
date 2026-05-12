@@ -678,6 +678,90 @@ def process_signals(
         )
 
         if position_unchanged:
+            # ── Accumulation on re-confirmation ────────────────────────
+            # When enabled, re-confirmed signals add additional shares up to
+            # max_multiplier × original_amount. The entry price is blended.
+            _accumulate_enabled = True
+            _accum_max_mult = 5.0
+            _ac_cfg = _L.get("accumulate_on_confirmation", {})
+            if _ac_cfg:
+                _accumulate_enabled = bool(_ac_cfg.get("enabled", True))
+                _accum_max_mult = float(_ac_cfg.get("max_multiplier", 5.0))
+            if _app_config is not None:
+                try:
+                    _ac_override = getattr(_app_config, "accumulate_on_confirmation_enabled", None)
+                    if _ac_override is not None:
+                        _accumulate_enabled = bool(_ac_override)
+                    _ac_mult_override = getattr(_app_config, "accumulate_max_multiplier", None)
+                    if _ac_mult_override is not None:
+                        _accum_max_mult = max(1.0, float(_ac_mult_override))
+                except Exception:
+                    pass
+
+            if _accumulate_enabled and entry_price > 0:
+                # Ensure original_amount is set (first time or legacy position)
+                _orig = float(getattr(open_pos, "original_amount", None) or open_pos.amount or 0)
+                if open_pos.original_amount is None:
+                    open_pos.original_amount = _orig
+                _cur_amount = float(open_pos.amount or 0)
+                _max_amount = _orig * _accum_max_mult
+
+                # Compute the new desired size from the signal's size_pct
+                _new_size_pct = float(rec.get("size_pct", "100.0") or "100.0") / 100.0
+                _new_suggested = _compute_vol_normalized_amount(
+                    _base_amount, conviction_level, _atr_pct
+                ) * _new_size_pct
+                _new_suggested = max(_new_suggested, 1.0)
+
+                # Only accumulate if the new signal suggests a larger position
+                # and we haven't hit the cap yet
+                _accum_amount = 0.0
+                if _new_suggested > _cur_amount and _cur_amount < _max_amount:
+                    _accum_amount = min(_new_suggested - _cur_amount, _max_amount - _cur_amount)
+                    _accum_amount = max(_accum_amount, 1.0)
+
+                    # Cap by alpaca_max_position_usd if configured
+                    _max_pos_usd = None
+                    if _app_config is not None:
+                        try:
+                            _max_pos_usd = getattr(_app_config, "alpaca_max_position_usd", None)
+                            if _max_pos_usd is not None:
+                                _max_pos_usd = float(_max_pos_usd)
+                        except Exception:
+                            _max_pos_usd = None
+                    if _max_pos_usd is not None and _max_pos_usd > 0:
+                        _accum_amount = min(_accum_amount, max(0.0, _max_pos_usd - _cur_amount))
+
+                    # Cap by portfolio cap remaining
+                    if _portfolio_cap is not None:
+                        _cap_remaining = max(0.0, _portfolio_cap - _open_exposure)
+                        _accum_amount = min(_accum_amount, _cap_remaining)
+
+                    if _accum_amount > 0:
+                        _accum_shares = round(_accum_amount / entry_price, 6)
+                        # Blend entry price: (old_amount * old_price + new_amount * new_price) / (old_amount + new_amount)
+                        _new_total_amount = _cur_amount + _accum_amount
+                        _new_entry_price = round(
+                            (_cur_amount * open_pos.entry_price + _accum_amount * entry_price) / _new_total_amount, 4
+                        ) if _new_total_amount > 0 else entry_price
+
+                        open_pos.amount = _new_total_amount
+                        open_pos.shares = round(open_pos.shares + _accum_shares, 6)
+                        open_pos.entry_price = _new_entry_price
+
+                        if _portfolio_cap is not None:
+                            _open_exposure += _accum_amount
+
+                        action_summary["accumulated_amount"] = round(_accum_amount, 2)
+                        action_summary["accumulated_shares"] = round(_accum_shares, 6)
+                        action_summary["total_amount"] = round(_new_total_amount, 2)
+                        action_summary["blended_entry_price"] = _new_entry_price
+                        print(
+                            f"[paper] {underlying} {signal_type}: accumulated "
+                            f"${_accum_amount:.2f} ({_accum_shares:.6f} shares) "
+                            f"→ total ${_new_total_amount:.2f}, blended entry ${_new_entry_price:.4f}"
+                        )
+
             # Optionally reset the holding window when the thesis is re-confirmed
             if _cv.get("reset_window_on_confirmation", True):
                 _type_rank = {"VOLATILE_EVENT": 0, "SCALP": 1, "SWING": 2, "POSITION": 3}
@@ -700,12 +784,14 @@ def process_signals(
                 # Thesis re-confirmed: clear any trailing stop
                 open_pos.trailing_stop_price = None
                 open_pos.best_price_seen = None
-                action_summary["action"] = "held"
+                action_summary["action"] = "accumulated" if action_summary.get("accumulated_amount", 0) > 0 else "held"
                 action_summary["reason"] = "window_reset" if new_rank >= old_rank else "window_shortened"
                 action_summary["holding_window_until"] = _utc_iso(new_window)
+                if action_summary.get("accumulated_amount", 0) > 0:
+                    action_summary["reason"] = "accumulated_" + action_summary["reason"]
             else:
-                action_summary["action"] = "held"
-                action_summary["reason"] = "same_ticker_leverage_direction"
+                action_summary["action"] = "accumulated" if action_summary.get("accumulated_amount", 0) > 0 else "held"
+                action_summary["reason"] = "accumulated" if action_summary.get("accumulated_amount", 0) > 0 else "same_ticker_leverage_direction"
             actions.append(action_summary)
             continue
 
@@ -863,6 +949,7 @@ def process_signals(
                 trading_type=trading_type,
                 holding_period_hours=round(holding_minutes / 60, 2),
                 holding_window_until=window_until,
+                original_amount=_amount,
             )
             db.add(new_trade)
             db.flush()  # get new_trade.id

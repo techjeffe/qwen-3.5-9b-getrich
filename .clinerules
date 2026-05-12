@@ -1,0 +1,5 @@
+Plan before edits. Inspect first, propose a plan, do not edit files yet.
+Make the smallest safe change that satisfies the requirements.
+Treat generated code as a draft, inspect every change before merge.
+If we can test locally, do so to ensure bad code does not make it through.
+Never commit secrets, tokens to Git

@@ -272,6 +272,43 @@ All timing values are in **minutes** (`holding_minutes`) so SCALP and SWING trad
 
 ---
 
+## Accumulation on Re-Confirmation
+
+When `accumulate_on_confirmation` is enabled (default: on), re-confirmed signals (same ticker, same leverage, same direction) **add additional shares** instead of simply holding. This allows the system to build larger positions when multiple analysis runs confirm the same thesis.
+
+### How It Works
+
+1. On the first entry, `original_amount` is recorded on the PaperTrade row.
+2. On each subsequent re-confirmation, the system computes what a **fresh entry** would be using the current signal's `size_pct` (from continuous entry sigmoid) and volatility-normalized sizing.
+3. If the fresh entry amount exceeds the current position amount, the difference is added as additional shares.
+4. The entry price is **blended** (weighted average of old and new prices).
+5. The position is capped at `max_multiplier × original_amount` (default: 5×).
+
+### Caps (in order of application)
+
+| Cap | Source | Description |
+|---|---|---|
+| `max_multiplier` | `accumulate_on_confirmation.max_multiplier` in logic_config.json (or Admin UI) | Never exceed this multiple of the original entry amount |
+| `alpaca_max_position_usd` | Admin → Alpaca settings | Per-position dollar cap |
+| Portfolio cap | `vol_sizing.portfolio_cap_usd` | Total open exposure across all symbols |
+
+### When Accumulation Does NOT Happen
+
+- Signal strength is declining (new `size_pct` < current position allocation)
+- Position has already hit the max multiplier cap
+- Alpaca max position cap would be exceeded
+- Portfolio cap would be exceeded
+- Accumulation is disabled via Admin UI toggle
+
+### Configuration
+
+| Setting | Default | Admin-editable |
+|---|---|---|
+| `accumulate_on_confirmation_enabled` | `true` | Yes (Admin → Trading Logic) |
+| `accumulate_max_multiplier` | `5.0` | Yes (Admin → Trading Logic) |
+
+---
+
 ## Position Sizing
 
 ### Volatility-Normalized Sizing (Default)

@@ -76,6 +76,8 @@ class AlpacaBroker:
                 payload["notional"] = str(round(notional, 2))
             elif qty is not None:
                 payload["qty"] = str(round(qty, 6))
+        if limit_price is not None and order_type == "limit":
+            payload["limit_price"] = str(round(limit_price, 2))
         if client_order_id:
             payload["client_order_id"] = client_order_id
         return self._post("/v2/orders", payload)
@@ -172,6 +174,9 @@ class AlpacaBroker:
 
     def _post(self, path: str, body: Dict) -> Any:
         r = httpx.post(self._base + path, headers=self._headers, json=body, timeout=10)
+        if r.status_code >= 400:
+            detail = f"{r.status_code} {r.text[:2000]}"
+            raise httpx.HTTPStatusError(detail, request=r.request, response=r)
         r.raise_for_status()
         return r.json()
 
@@ -749,12 +754,19 @@ def _same_trading_day_as_now(ts: Optional[datetime]) -> bool:
     return ts.astimezone(_ET).date() == datetime.now(_ET).date()
 
 
-def _get_entry_conviction_block_reason(paper_trade, event: str) -> Optional[str]:
-    """Check if the conviction level blocks this trade entry."""
+def _get_entry_conviction_block_reason(paper_trade, event: str, risk_profile: Optional[str] = None) -> Optional[str]:
+    """Check if the conviction level blocks this trade entry.
+
+    Crazy profile allows LOW conviction entries (matching paper_trading.py logic).
+    All other profiles block LOW conviction entries unconditionally.
+    """
     if event != "open":
         return None
     conviction = str(getattr(paper_trade, "conviction_level", "MEDIUM") or "MEDIUM").upper()
     if conviction == "LOW":
+        # Crazy profile allows LOW conviction entries
+        if risk_profile and str(risk_profile).strip().lower() == "crazy":
+            return None
         return "entry rule: low conviction blocked"
     return None
 
@@ -909,10 +921,14 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
     """
     execution_mode = str(getattr(config, "alpaca_execution_mode", "off") or "off").strip().lower()
     if execution_mode not in {"paper", "live"}:
+        _sym = str(getattr(paper_trade, "execution_ticker", "") or getattr(paper_trade, "underlying", "") or "?").upper()
+        print(f"[alpaca] skipping {event} for {_sym}: alpaca_execution_mode='{execution_mode}' (must be 'paper' or 'live')")
         return
 
     broker = get_broker_from_keychain(mode=execution_mode)
     if broker is None:
+        _sym = str(getattr(paper_trade, "execution_ticker", "") or getattr(paper_trade, "underlying", "") or "?").upper()
+        print(f"[alpaca] skipping {event} for {_sym}: broker could not be initialized from keychain (mode={execution_mode})")
         return
 
     symbol       = str(getattr(paper_trade, "execution_ticker", "") or getattr(paper_trade, "underlying", "")).upper()
@@ -942,7 +958,10 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
         return
 
     # ── Entry conviction gate ───────────────────────────────────────────
-    conviction_block = _get_entry_conviction_block_reason(paper_trade, event)
+    conviction_block = _get_entry_conviction_block_reason(
+        paper_trade, event,
+        risk_profile=getattr(config, "risk_profile", None),
+    )
     if conviction_block:
         side_hint = "buy" if (event == "open" and not direct_short) else "sell"
         _record_alpaca_order_skip(
@@ -1078,7 +1097,7 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
                 print(f"[alpaca] skipping {event} for {symbol}: {pdt_block_reason}")
                 return
 
-    elif event == "close":
+    if event == "close":
         # Guard: only close if a live open order was actually placed for this trade.
         # A skipped or failed open (direct short disabled, circuit breaker, etc.)
         # produces only an error row, so _has_live_open_order returns False and we
@@ -1089,8 +1108,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
                 "no successful open order on record"
             )
             return
-    else:
-        return
 
     # ── Build order parameters ───────────────────────────────────────────────
     ext_hours  = _is_extended_hours_now(config)
@@ -1146,6 +1163,12 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             return
     else:
         use_notional = notional
+        if order_type == "limit" and entry_price > 0:
+            limit_price = round(
+                entry_price * (1 + slippage) if side == "buy" else entry_price * (1 - slippage),
+                2,
+            )
+            limit_price = max(0.01, limit_price)
 
     client_order_id = f"gr-{paper_id}-{event[:1]}-{int(_time.time())}"
 
@@ -1164,6 +1187,12 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
         _record_alpaca_order(
             db, paper_id, side, symbol, use_notional, qty,
             response, broker.mode, ext_hours, limit_price, open_raw_context,
+        )
+        print(
+            f"[alpaca] {event} {side} {symbol}: "
+            f"order_id={response.get('id')} status={response.get('status')} "
+            f"qty={response.get('qty')} filled_qty={response.get('filled_qty')} "
+            f"filled_avg_price={response.get('filled_avg_price')}"
         )
     except Exception as exc:
         _record_alpaca_order_error(

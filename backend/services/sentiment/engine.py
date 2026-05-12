@@ -1505,20 +1505,27 @@ class SentimentEngine:
             "event_type" in data and "confirmed" in data
         )
 
-        print(f"DEBUG _parse_response: is_extraction_format={is_extraction_format}, data_keys={list(data.keys())}, data_preview={str(data)[:500]}")
+        # Extract symbol early for debug logging (safe — dict .get() never throws)
+        sym_keys = list((data.get("symbol_relevance") or {}).keys())
+        symbol_for_scoring = sym_keys[0] if sym_keys else ""
+
+        # Always print a compact debug line with the symbol, regardless of format
+        print(f"DEBUG _parse_response [{symbol_for_scoring or '?'}]: is_extraction_format={is_extraction_format}, data_preview={str(data)[:300]}")
 
         # Determine if we're using a cloud backend for cloud-model-specific overrides
         _is_cloud = getattr(self, "inference_backend", "ollama") in ("openai", "vllm")
 
-        if is_extraction_format:
-            # New path: LLM extracted facts, Python computes scores
-            # We need the symbol to score — pull it from symbol_relevance keys or fall back
-            sym_keys = list((data.get("symbol_relevance") or {}).keys())
-            symbol_for_scoring = sym_keys[0] if sym_keys else ""
+        # Always compute and print scores (unconditional, error-tolerant)
+        try:
             tech_indicators = getattr(self, "_last_technical_indicators", None) or {}
             computed = self.compute_symbol_scores(data, symbol_for_scoring, technical_indicators=tech_indicators, cloud_backend=_is_cloud)
             print(f"DEBUG _parse_response computed scores for {symbol_for_scoring}: {computed}")
+        except Exception as e:
+            print(f"DEBUG _parse_response [{symbol_for_scoring or '?'}]: SCORING ERROR — {e}")
+            computed = None
 
+        if is_extraction_format and computed is not None:
+            # New path: LLM extracted facts, Python computes scores
             bluster = {
                 "is_bluster": computed["is_bluster"],
                 "bluster_score": computed["bluster_score"],

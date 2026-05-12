@@ -35,6 +35,11 @@
     "_comment_shrink_existing": "When an existing position's score stays above keep_floor, shrink proportionally instead of closing. Below keep_floor, close entirely.",
     "keep_floor": 0.10
   },
+  "accumulate_on_confirmation": {
+    "_comment": "When enabled, re-confirmed signals (same ticker/leverage/direction) add additional shares up to max_multiplier × base_amount. The entry price is blended (weighted average).",
+    "enabled": true,
+    "max_multiplier": 5.0
+  },
   "reentry_cooldown_minutes": 120,
   "min_same_day_exit_edge_pct": 0.5,
   "stop_loss_pct": 2.0,
@@ -87,6 +92,18 @@
     "max_total_modifier": 0.15
   },
   "sentiment_scoring": {
+    "event_base_scores": {
+      "monetary_policy": 0.82,
+      "regulatory": 0.74,
+      "fiscal": 0.68,
+      "trade_policy": 0.72,
+      "geopolitical": 0.58,
+      "macro_data": 0.52,
+      "earnings": 0.44,
+      "sector_news": 0.36,
+      "noise": 0.08,
+      "default": 0.30
+    },
     "unconfirmed_bluster_penalty": 0.15,
     "bluster_phrase_weight": 1.25,
     "substance_phrase_weight": 1.0,
@@ -99,54 +116,46 @@
       "BROAD": 0.4,
       "UNRELATED": 0.2
     },
-    "exposure_confidence_caps": {
-      "DIRECT": 0.91,
-      "INDIRECT": 0.78,
-      "BROAD": 0.62,
-      "UNRELATED": 0.5
+    "bluster_short_threshold": -0.60,
+    "short_directional_blend": {
+      "bluster_weight": 0.4,
+      "policy_weight": 0.6
     },
-    "event_base_scores": {
-      "monetary_policy": 0.82,
-      "regulatory": 0.74,
-      "trade_policy": 0.72,
-      "fiscal": 0.68,
-      "geopolitical": 0.58,
-      "macro_data": 0.52,
-      "earnings": 0.44,
-      "sector_news": 0.36,
-      "noise": 0.08,
-      "default": 0.30
-    },
+    "policy_min_score": 0.40,
+    "policy_signal_threshold": 0.40,
+    "direction_confidence_min": 0.50,
+    "directional_score_min_magnitude": 0.15,
+    "impact_severity_high": 0.70,
+    "impact_severity_medium": 0.40,
+    "bluster_detection_threshold": -0.15,
+    "policy_change_threshold": 0.40,
     "confidence_base": 0.40,
     "confidence_source_weight": 0.38,
     "confidence_irrelevance_penalty": 0.18,
     "confidence_unconfirmed_penalty": 0.08,
     "confidence_min": 0.28,
     "confidence_max": 0.91,
-    "bluster_short_threshold": -0.60,
-    "policy_signal_threshold": 0.40,
-    "direction_confidence_min": 0.50,
-    "bluster_detection_threshold": -0.20,
-    "policy_change_threshold": 0.40,
-    "directional_score_min_magnitude": 0.15,
-    "impact_severity_high": 0.60,
-    "impact_severity_medium": 0.35
-  },
-  "red_team": {
-    "confidence_base": 0.58,
-    "agreement_bonus": 0.15,
-    "disagreement_penalty": 0.22,
-    "evidence_bonus_per_item": 0.04,
-    "evidence_bonus_max": 0.20,
-    "risk_penalty_per_item": 0.028,
-    "risk_penalty_max": 0.14,
-    "source_bias_penalty": 0.10,
-    "confidence_min": 0.24,
-    "confidence_max": 0.84,
-    "hold_override_min_confidence": 0.58,
-    "hold_override_min_evidence_or_risks": 2,
-    "flip_override_min_confidence": 0.64,
-    "flip_override_min_evidence": 3,
+    "exposure_confidence_caps": {
+      "DIRECT": 0.91,
+      "INDIRECT": 0.80,
+      "BROAD": 0.70,
+      "UNRELATED": 0.50
+    },
+    "red_team": {
+      "base_confidence": 0.58,
+      "agree_bonus": 0.08,
+      "disagree_penalty": 0.22,
+      "evidence_per_item": 0.024,
+      "evidence_cap": 0.12,
+      "risk_per_item": 0.028,
+      "risk_cap": 0.14,
+      "source_bias_penalty": 0.10,
+      "override_min_confidence": 0.58,
+      "override_min_evidence_hold": 2,
+      "override_min_risks_hold": 2,
+      "override_min_confidence_flip": 0.64,
+      "override_min_evidence_flip": 3
+    },
     "stop_loss_by_urgency": {
       "HIGH": 3.5,
       "MEDIUM": 2.5,
@@ -154,103 +163,77 @@
     }
   },
   "signal_decay": {
-    "_comment": "Exponential decay on directional_score based on hours since previous analysis. decay_factor = max(min_decay_factor, 0.5^(age/half_life)). Prevents stale news from sustaining positions.",
-    "enabled": true,
-    "default_half_life_hours": 3.0,
-    "symbol_half_lives": {
-      "SPY": 2.0,
-      "QQQ": 2.0,
-      "USO": 4.0,
-      "BITO": 6.0,
-      "IBIT": 6.0
+    "half_life_hours": {
+      "SPY": 2,
+      "QQQ": 2,
+      "USO": 4,
+      "IBIT": 6,
+      "BITO": 6
     },
-    "min_decay_factor": 0.10,
-    "_comment_hold": "Separate (slower) decay for positions already held. When enabled, existing positions use hold_half_lives instead of entry half-lives. Keeps positions open longer on stale-but-directionally-correct signals.",
+    "default_half_life_hours": 3,
     "hold_decay_enabled": true,
-    "default_hold_half_life_hours": 6.0,
     "symbol_hold_half_lives": {
-      "SPY": 4.0,
-      "QQQ": 4.0,
-      "USO": 8.0,
-      "BITO": 12.0,
-      "IBIT": 12.0
-    }
-  },
-  "regime_adaptation": {
-    "_comment": "Adjust entry thresholds based on market volatility. When max ATR across symbols exceeds high_vol_atr, multiply threshold by high_vol_mult (harder to enter in high vol). When max ATR is below low_vol_atr, multiply by low_vol_mult (easier in quiet markets).",
-    "enabled": true,
-    "high_vol_atr_pct": 3.0,
-    "high_vol_multiplier": 1.25,
-    "low_vol_atr_pct": 1.0,
-    "low_vol_multiplier": 0.80
+      "SPY": 4,
+      "QQQ": 4,
+      "USO": 8,
+      "IBIT": 12,
+      "BITO": 12
+    },
+    "default_hold_half_life_hours": 6,
+    "min_decay_factor": 0.10
   },
   "conviction": {
     "high_score_threshold": 0.6,
     "high_confidence_threshold": 0.7,
-    "high_consensus_confidence": 0.75,
-    "medium_consensus_confidence": 0.45,
-    "_comment_holding": "Holding window in minutes. The position stays open at least this long before a HOLD signal can close it.",
     "holding_minutes": {
       "SCALP": 120,
       "SWING": 720,
       "POSITION": 4320,
       "VOLATILE_EVENT": 120
     },
-    "_comment_reset": "When a re-run confirms the same direction, reset (or extend) the holding window. Same/upgraded conviction resets to a full window; downgraded conviction shrinks the window. max_holding_minutes caps total hold time from original entry regardless of resets.",
-    "reset_window_on_confirmation": true,
     "max_holding_minutes": {
       "SCALP": 360,
       "SWING": 2160,
       "POSITION": 12960,
       "VOLATILE_EVENT": 360
     },
-    "_comment_expiry": "What happens when the holding window expires.",
-    "close_on_window_expiry": true,
-    "trail_on_window_expiry": true,
-    "close_expired_during_closed_hours": true,
-    "_comment_hold_signal": "Whether a HOLD signal is blocked from closing a position while the window is still active. true = window protects the position.",
     "hold_signal_respects_window": true,
-    "_comment_flip": "Whether a direction flip (LONG->SHORT or vice versa) overrides the window and closes+reopens immediately.",
-    "flip_overrides_window": true
+    "flip_overrides_window": true,
+    "close_on_window_expiry": true,
+    "close_expired_during_closed_hours": true,
+    "trail_on_window_expiry": true,
+    "reset_window_on_confirmation": true
   },
   "crazy": {
-    "_comment": "Overrides applied when risk_profile = 'crazy' (or used as a starting point for 'custom'). Each value replaces its top-level counterpart.",
     "entry_thresholds": {
       "normal": 0.35,
       "closed_market": 0.35,
-      "keep_normal": 0.22,
-      "keep_closed_market": 0.15
+      "keep_normal": 0.25,
+      "keep_closed_market": 0.20
     },
     "continuous_entry": {
       "sigmoid_midpoint": 0.35,
+      "sigmoid_steepness": 5.0,
+      "min_size_pct": 15.0,
+      "max_size_pct": 100.0,
       "skip_floor": 0.08,
       "keep_floor": 0.08
     },
     "conviction": {
-      "high_score_threshold": 0.50,
-      "high_confidence_threshold": 0.60
-    },
-    "materiality_gate": {
-      "min_posts_delta": 4,
-      "min_sentiment_delta": 0.18
-    },
-    "reentry_cooldown_minutes": 60,
-    "min_same_day_exit_edge_pct": 0.3,
-    "stop_loss_pct": 2.5,
-    "take_profit_pct": 5.0,
-    "vol_sizing": {
-      "conviction_scalars": {
-        "HIGH": 1.8,
-        "MEDIUM": 1.2,
-        "LOW": 0.7
+      "high_score_threshold": 0.5,
+      "high_confidence_threshold": 0.6,
+      "holding_minutes": {
+        "SCALP": 60,
+        "SWING": 360,
+        "POSITION": 2160,
+        "VOLATILE_EVENT": 60
+      },
+      "max_holding_minutes": {
+        "SCALP": 180,
+        "SWING": 1080,
+        "POSITION": 6480,
+        "VOLATILE_EVENT": 180
       }
-    },
-    "signal_decay": {
-      "default_half_life_hours": 4.0,
-      "default_hold_half_life_hours": 8.0
-    },
-    "regime_adaptation": {
-      "high_vol_multiplier": 1.10
     }
   }
 }

@@ -246,6 +246,25 @@ async def lifespan(app: FastAPI):
     get_price_cache_service()
     print("Price cache service initialized")
 
+    # ── Clear stale analysis locks from previous runs ────────────────────
+    try:
+        db = SessionLocal()
+        try:
+            from services.app_config import get_or_create_app_config
+            config = get_or_create_app_config(db)
+            if getattr(config, "analysis_lock_request_id", None) is not None:
+                config.analysis_lock_request_id = None
+                config.analysis_lock_acquired_at = None
+                config.analysis_lock_expires_at = None
+                db.add(config)
+                db.commit()
+                print("Cleared stale analysis lock from previous run")
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"Warning: could not clear stale analysis lock: {exc}")
+    # ─────────────────────────────────────────────────────────────────────
+
     try:
         from services.alpaca_broker import is_alpaca_configured, reconcile_on_startup
         if is_alpaca_configured():

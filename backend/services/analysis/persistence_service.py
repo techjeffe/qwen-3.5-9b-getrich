@@ -317,8 +317,33 @@ class PersistenceService:
                 recs_for_paper = []
                 _L = self._L
                 _final_signal = response.trading_signal
-                _final_conviction = str(getattr(_final_signal, "conviction_level", None) or "MEDIUM").upper()
                 _cv = _L["conviction"]
+
+                # Per-symbol conviction thresholds — use crazy overrides if applicable
+                _is_crazy = str(risk_profile or "").strip().lower() == "crazy"
+                _crazy_cv = _L.get("crazy", {}).get("conviction", {})
+                _high_score_threshold = float(_crazy_cv.get("high_score_threshold", _cv.get("high_score_threshold", 0.6)))
+                _high_confidence_threshold = float(_crazy_cv.get("high_confidence_threshold", _cv.get("high_confidence_threshold", 0.7)))
+                if not _is_crazy:
+                    _high_score_threshold = float(_cv.get("high_score_threshold", 0.6))
+                    _high_confidence_threshold = float(_cv.get("high_confidence_threshold", 0.7))
+
+                def _compute_symbol_conviction(sym: str, sym_signal_type: str) -> str:
+                    """Compute per-symbol conviction from its own sentiment scores.
+                    
+                    Each symbol's conviction is independent of the portfolio-level signal.
+                    HOLD signals always get LOW conviction.
+                    Directional signals use the symbol's own directional_score and confidence.
+                    """
+                    if sym_signal_type == "HOLD":
+                        return "LOW"
+                    sym_result = (sentiment_results or {}).get(sym, {})
+                    directional = float(sym_result.get("directional_score", 0.0) or 0.0)
+                    confidence = float(sym_result.get("confidence", 0.0) or 0.0)
+                    strongest_score = abs(directional) * confidence
+                    if strongest_score > _high_score_threshold and confidence > _high_confidence_threshold:
+                        return "HIGH"
+                    return "MEDIUM"
 
                 # Build paper trading entries from final recommendations
                 covered_syms: set = set()
@@ -336,7 +361,7 @@ class PersistenceService:
                         signal_type = "SHORT"
                     else:
                         signal_type = "HOLD"
-                    _conviction = _final_conviction if signal_type != "HOLD" else "LOW"
+                    _conviction = _compute_symbol_conviction(underlying, signal_type)
                     _trade_type = {"HIGH": "POSITION", "MEDIUM": "SWING", "LOW": "VOLATILE_EVENT"}.get(_conviction, "SWING")
                     _hold_mins = _cv["holding_minutes"].get(_trade_type, 720)
                     _atr_pct = 0.0

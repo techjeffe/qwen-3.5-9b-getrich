@@ -1050,6 +1050,11 @@ def update_app_config(db: Session, payload: Dict[str, Any]) -> AppConfig:
     if "hold_decay_enabled" in payload:
         val = payload.get("hold_decay_enabled")
         config.hold_decay_enabled = _coerce_bool(val, None) if val is not None else None
+    if "accumulate_on_confirmation_enabled" in payload:
+        val = payload.get("accumulate_on_confirmation_enabled")
+        config.accumulate_on_confirmation_enabled = _coerce_bool(val, None) if val is not None else None
+    if "accumulate_max_multiplier" in payload:
+        config.accumulate_max_multiplier = _normalize_trading_logic_float(payload.get("accumulate_max_multiplier"), 1.0, 100.0)
 
     db.add(config)
     db.commit()
@@ -1281,6 +1286,8 @@ def config_to_dict(config: AppConfig) -> Dict[str, Any]:
         "continuous_entry_enabled": getattr(config, "continuous_entry_enabled", None),
         "regime_adaptation_enabled": getattr(config, "regime_adaptation_enabled", None),
         "hold_decay_enabled": getattr(config, "hold_decay_enabled", None),
+        "accumulate_on_confirmation_enabled": getattr(config, "accumulate_on_confirmation_enabled", None),
+        "accumulate_max_multiplier": getattr(config, "accumulate_max_multiplier", None),
         # Alpaca brokerage execution settings
         "alpaca_execution_mode":         _normalize_alpaca_execution_mode(
             getattr(config, "alpaca_execution_mode", DEFAULT_ALPACA_EXECUTION_MODE)

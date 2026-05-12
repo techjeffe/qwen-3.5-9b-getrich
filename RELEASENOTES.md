@@ -1,4 +1,103 @@
+# Release Notes — May 12, 2026
+
+## Alpaca Broker Fixes — Limit Price, Silent Return Bug, Error Visibility
+
+Four fixes to the Alpaca order execution path that were preventing orders from being placed.
+
+**Limit price not sent for regular-hours limit orders (alpaca_broker.py):**
+
+- `place_order()` only included `limit_price` inside the `if extended_hours:` block. When `alpaca_order_type="limit"` during regular hours, the limit price was computed but never added to the HTTP payload, causing Alpaca to reject with `"limit orders require a limit price"` (code 40010001).
+- Fixed by adding a universal `if limit_price is not None and order_type == "limit"` block after the extended-hours branch, so limit prices are sent for both regular and extended hours.
+- `maybe_execute_alpaca_order()` now computes `entry_price ± slippage` for regular-hours limit opens, matching the existing extended-hours formula.
+
+**Error response body discarded (alpaca_broker.py):**
+
+- `_post()` called `r.raise_for_status()` which raised `httpx.HTTPStatusError`, but `str(exc)` only showed the status line — the actual Alpaca rejection reason in the response body was lost.
+- Fixed by checking `r.status_code >= 400` before `raise_for_status()`, extracting `r.text[:2000]` into the exception message so the full Alpaca error is visible in logs and stored in the `alpaca_orders` table.
+
+**Alpaca Order Success logging added (alpaca_broker.py):**
+
+- Added console output on successful order placement showing `order_id`, `status`, `qty`, `filled_qty`, and `filled_avg_price`.
+- Added debug prints for all previously silent return paths (execution mode check, broker initialization failure).
+
+**Files changed:** `backend/services/alpaca_broker.py`
+
+---
+
+## Per-Symbol Conviction + Crazy Profile Alpaca Fix
+
+Two fixes that ensure individual symbol signals are evaluated independently and that the crazy risk profile correctly bypasses conviction gates in the Alpaca broker.
+
+**Per-symbol conviction (persistence_service.py):**
+
+- Each symbol's conviction level is now computed from its own directional_score and confidence, not from the portfolio-level signal
+- Previously, when opposing signals (e.g. SPY SHORT + USO LONG) produced a net-neutral portfolio HOLD, all symbols inherited LOW conviction — blocking both from paper trading and Alpaca execution
+- Now SPY (directional=-0.576, confidence=0.772) gets MEDIUM conviction and USO (directional=0.58, confidence=0.758) gets MEDIUM conviction independently
+- HOLD signals still get LOW conviction; directional signals use the standard or crazy-profile conviction thresholds
+- Respects crazy profile conviction threshold overrides from logic_config.json
+
+**Crazy profile Alpaca gate fix (alpaca_broker.py):**
+
+- `_get_entry_conviction_block_reason` now accepts an optional `risk_profile` parameter
+- When `risk_profile="crazy"`, LOW conviction entries are allowed through (matching the existing paper_trading.py behavior)
+- The caller `maybe_execute_alpaca_order` passes `risk_profile` from config
+- Previously, paper trades opened correctly with LOW conviction under crazy profile, but the Alpaca broker gate unconditionally blocked them
+
+**Files changed:** `backend/services/alpaca_broker.py`, `backend/services/analysis/persistence_service.py`
+
+---
+
 # Release Notes — May 11, 2026
+
+## Concurrent Analysis Fix + Multi-Leg Signal Preservation
+
+Two bugs fixed in this release that were causing duplicate analyses and lost trading signals.
+
+**Concurrency lock:**
+
+- Added module-level `asyncio.Lock` in `pipeline_service.py` to serialize analysis pipeline runs
+- Prevents the frontend's two auto-run components (page.tsx + AnalysisContext.tsx) from triggering duplicate analyses that would interleave Stage 1/Stage 2 output
+- Lock is always released via try/finally on completion or error
+
+**Multi-leg signal preservation:**
+
+- When both long and short recommendations exist, uses net directional score to determine portfolio-level signal_type instead of picking a single winner
+- All valid recommendations are preserved in the list for independent execution by the paper_trading engine and Alpaca dispatch
+- Applied to both blue-team signal generation and red-team consensus
+
+**Files changed:** `backend/services/pipeline_service.py`, `backend/services/signal_service.py`, `backend/services/paper_trading.py`, `backend/config/logic_config.json`, `frontend/src/app/admin/page.tsx`, `frontend/src/lib/utils/config-normalizer.ts`
+
+---
+
+## News Pulls Enabled for Custom Symbols
+
+News pulls for custom quotes are now on by default. This improves the relevance of news articles for custom quotes, but may result in more news articles being pulled for users with a large number of custom quotes.
+
+**Files changed:** `backend/services/app_config.py`, `frontend/src/components/admin/sections/OverviewSection.tsx`, `frontend/src/lib/utils/config-normalizer.ts`, `run.py`
+
+---
+
+## Data Ingestion Pass-Through for Low Keyword Match
+
+When fewer than 10% of fetched articles have direct keyword matches for a symbol, the pipeline now passes all articles to the LLM instead of just the keyword matches. This prevents the pipeline from collapsing to 1 article when 332 were fetched — the proxy terms are intentionally narrow and may miss general market news that Stage 2's per-symbol specialist can still analyze.
+
+- Added `MIN_COVERAGE_RATIO = 0.10` threshold in `engine.py`
+- Added `content_hash` column to `scraped_articles` table for near-duplicate detection (same story, different URL)
+- Added `processed_at` column for tracking when articles are processed
+- Fast-lane analysis deferred to manual trigger to prevent scheduler from marking articles as processed before the stream endpoint runs
+- Article loading changed from "new articles only" to "all unprocessed within age window" (default 12 hours) to make articles reusable across multiple analysis runs
+
+**Files changed:** `backend/services/data_ingestion/worker.py`, `backend/services/sentiment/engine.py`, `backend/services/analysis/market_data_service.py`, `backend/routers/analysis.py`, `backend/database/models.py`, `backend/database/migrate.py`
+
+---
+
+## RSS Feed Changes — Removed NYT/WSJ
+
+Default RSS feeds changed because NYT and WSJ are blocked by bot detectors, even with cookies passed.
+
+**Files changed:** `backend/services/app_config.py`
+
+---
 
 ## Trafilatura Article Extraction Fix + Feed Updates
 
@@ -15,7 +114,74 @@ The article extraction pipeline was silently failing for every RSS feed source. 
 
 ---
 
+# Release Notes — May 10, 2026
+
+## Ollama URL Support for Remote Instances
+
+The Ollama backend URL configuration now supports both local and remote Ollama-compatible endpoints. Previously the URL was treated as strictly local. Users can now point the backend at Ollama instances running on other machines or cloud-hosted Ollama-compatible servers.
+
+**Files changed:** `backend/services/app_config.py`
+
+
+---
+
 # Release Notes — May 9, 2026
+
+## Comprehensive Decision Logging
+
+A new `decision_log.db` (separate SQLite file to avoid lock contention with the main trading DB) records every analysis decision in detail. This provides a complete audit trail of the reasoning pipeline.
+
+**9 new SQLAlchemy models in the decision log:**
+
+- `DecisionLogRun` — one row per full analysis run (timestamps, models used, config hash, article counts)
+- `DecisionLogSymbol` — one row per symbol per run (blue/red team scores, raw/blended scores, final signal, decay factors, regime adaptation state, materiality gate state)
+- `DecisionLogArticle` — articles considered per symbol (title, source, published_at, was_used, relevance_score)
+- `DecisionLogBlend` — prior runs that contributed to blended scores (prior run timestamp, weight, directional score)
+- `DecisionLogTechnical` — technical indicators evaluated per symbol
+- `DecisionLogTrade` — paper trade entries with size/leverage reasoning, holding window
+- `DecisionLogTradeEvent` — lifecycle events per trade (open, trailing_stop_set, close)
+- `DecisionLogDecisionDiff` — mid-position decision changes
+
+**Pipeline integration:**
+
+- `log_run_start` at analysis begin, per-symbol scores after signal generation, `run_complete` at end
+- Paper trading integration: trade entry logging with size/leverage reasoning, trailing stop set events, close events with P&L
+- `config_hash` (SHA256) computed from config values for version correlation
+- `decision_log.db` added to `.gitignore`
+
+**Files changed:** `backend/services/decision_logger.py` (new), `backend/services/paper_trading.py`, `.gitignore`
+
+---
+
+## Cloud Model Softening + Max Tokens Increase
+
+Cloud-hosted models (deepseek, gemma, etc.) tend to default to conservative "noise"/"UNRELATED" classifications even for articles that passed Stage 1 keyword filtering. Two fixes address this:
+
+**`SYMBOL_SPECIALIST_LEAN_HEADER` softening:**
+
+- "skeptical financial news analyst" → "thorough financial news analyst"
+- "Red-team stance" → "Analysis stance"
+- Added context: "Stage 1 keyword filtering confirmed this article contains terms relevant to {symbol}"
+- Added: "This is a quantitative analysis tool, not financial advice"
+- Explicit instruction: "Only use 'noise' for event_type if the article is truly about sports, entertainment, or celebrity news"
+
+**Cloud-model overrides in `compute_symbol_scores()`:**
+
+- When `cloud_backend=True` and `event_type="noise"` with zero substance/bluster counts, defaults to `event_type="macro_data"` (Stage 1 confirmed relevance)
+- When `cloud_backend=True` and `exposure_type="UNRELATED"`, downgrades to `BROAD` and marks as relevant (Stage 1 confirmed topic relevance)
+
+**Max tokens increased:**
+
+- `MAX_TOKENS` raised from 2048 → 8192 to prevent truncated analyses that produce wrong signals
+
+**OpenAI client improvements:**
+
+- Attempts `json_schema` (structured output) first, falls back to `force_json` if provider doesn't support it
+- Sends entire prompt as a single user message (matching how Ollama receives it) to fix cloud model output classification
+
+**Files changed:** `backend/services/sentiment/engine.py`, `backend/services/sentiment/prompts.py`, `backend/services/openai_client.py`
+
+---
 
 ## Cloud/Local Toggle — Reworked Provider Selection
 
