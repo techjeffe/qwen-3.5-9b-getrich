@@ -18,6 +18,7 @@ requests>=2.31.0
 feedparser>=6.0.10
 boto3>=1.35.0
 keyring>=25.4.1
+playwright>=1.59.0
 
 # Financial Data
 yfinance>=0.2.30
