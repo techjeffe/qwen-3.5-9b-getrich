@@ -1,3 +1,38 @@
+# Release Notes — May 20, 2026
+
+## PDT Protection Fix + Underlying Conflict Resolution
+
+Two fixes to the Alpaca execution path and paper trading simulation that were causing unnecessary trade blocks and conflicting positions.
+
+**PDT protection relaxed for closes (alpaca_broker.py):**
+
+- `_get_pdt_block_reason()` previously blocked same-day closes when `is_pdt_flagged` or `daytrade_count >= 3`
+- Changed to always allow closes — PDT only restricts new openings, not selling what you own
+- Added comment explaining the PDT rule clarification
+
+**Extended-hours close uses `close_position()` endpoint (alpaca_broker.py):**
+
+- Regular-hours closes now use Alpaca's `close_position()` endpoint which sells the exact remaining quantity including residual dust shares
+- Extended-hours closes still compute qty manually since `close_position()` is unavailable pre/post-market
+- Added success logging showing `order_id`, `status`, `qty`, `filled_qty`
+
+**Underlying conflict resolution (paper_trading.py):**
+
+- New `_resolve_underlying_conflicts()` function pre-scans all open positions and closes conflicting positions for the same underlying (e.g., SPXL bull + SPXS bear both open for SPY)
+- Conflicts detected via opposite `signal_type` (LONG vs SHORT) or via execution tickers mapping to opposite buckets in `INSTRUMENT_SPECS`
+- Older position is closed when a conflict is found
+- Runs unconditionally — even when market is closed — to prevent positions from accumulating across weekend/overnight runs
+- Also cleans up excess positions (>1 remaining for same underlying after conflict resolution)
+
+**Order dispatch ordering (paper_trading.py):**
+
+- `_dispatch_alpaca_orders()` now dispatches closes FIRST, then opens
+- Ensures that when a direction flip occurs, the old position is fully closed before the new one is opened, preventing simultaneous opposing positions in the Alpaca account
+
+**Files changed:** `backend/services/alpaca_broker.py`, `backend/services/paper_trading.py`
+
+---
+
 # Release Notes — May 12, 2026
 
 ## Alpaca Broker Fixes — Limit Price, Silent Return Bug, Error Visibility

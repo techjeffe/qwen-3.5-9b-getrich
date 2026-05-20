@@ -5,7 +5,7 @@ Auto-executes a configurable paper trade for every directional signal fired duri
 extended market hours (4:00am–8:00pm ET, Mon–Fri).
 
 Position lifecycle (mirrors what a real trader following every signal would do):
-- Same ticker + same leverage → hold, no change
+- Same ticker + same leverage + same direction → hold, no change
 - Different ticker OR different leverage OR direction flip → close old, open new
 - HOLD signal → close any open position (thesis gone), stay flat
 """
@@ -65,6 +65,128 @@ def _resolve_position_market_price(open_pos, quotes_by_symbol: Dict[str, Dict[st
         or {}
     )
     return float(price_data.get("current_price") or price_data.get("price") or 0.0)
+
+
+def _resolve_underlying_conflicts(
+    db,
+    quotes_by_symbol: Dict[str, Dict[str, Any]],
+    now: datetime,
+    alpaca_pending: list,
+) -> int:
+    """
+    Pre-scan all open positions and close any that are conflicting for the same
+    underlying (e.g., SPXL bull + SPXS bear both open for SPY).
+
+    Two positions conflict when they share the same `underlying` field but
+    represent opposing market directions — either via opposite signal_type
+    (LONG vs SHORT) or via execution tickers that map to opposite buckets
+    of the same underlying in INSTRUMENT_SPECS.
+
+    When a conflict is found, the older position is closed. Returns the
+    count of positions closed.
+
+    Runs unconditionally — even when the market is closed — to prevent
+    positions from accumulating across weekend/overnight runs.
+    """
+    from database.models import PaperTrade
+    from services.trading_instruments import INSTRUMENT_SPECS
+
+    open_positions = (
+        db.query(PaperTrade)
+        .filter(PaperTrade.exited_at.is_(None))
+        .order_by(PaperTrade.entered_at.asc())  # oldest first
+        .all()
+    )
+
+    # Group by underlying
+    by_underlying: Dict[str, List] = {}
+    for pos in open_positions:
+        key = str(getattr(pos, "underlying", "") or "").upper().strip()
+        if not key:
+            continue
+        by_underlying.setdefault(key, []).append(pos)
+
+    # ── Build bucket lookup: execution_ticker → (underlying, direction bucket) ──
+    _ticker_to_bucket: Dict[str, tuple[str, str]] = {}
+    for underlying, spec in INSTRUMENT_SPECS.items():
+        for bucket, tickers in spec.get("bull", {}).items():
+            _ticker_to_bucket[str(tickers).upper()] = (underlying.upper(), "bull")
+        for bucket, tickers in spec.get("bear", {}).items():
+            _ticker_to_bucket[str(tickers).upper()] = (underlying.upper(), "bear")
+
+    def _positions_oppose(a, b) -> bool:
+        """Return True if positions a and b are opposing market bets."""
+        # Same execution ticker — not opposing
+        if str(getattr(a, "execution_ticker", "") or "").upper() == str(getattr(b, "execution_ticker", "") or "").upper():
+            return False
+        # Check signal_type
+        sig_a = str(getattr(a, "signal_type", "") or "").upper()
+        sig_b = str(getattr(b, "signal_type", "") or "").upper()
+        if sig_a in ("LONG", "SHORT") and sig_b in ("LONG", "SHORT") and sig_a != sig_b:
+            return True
+        # Check ticker buckets (catches cases where signal_type is wrong but tickers are opposite)
+        tick_a = str(getattr(a, "execution_ticker", "") or "").upper()
+        tick_b = str(getattr(b, "execution_ticker", "") or "").upper()
+        info_a = _ticker_to_bucket.get(tick_a)
+        info_b = _ticker_to_bucket.get(tick_b)
+        if info_a and info_b and info_a[0] == info_b[0]:
+            return info_a[1] != info_b[1]  # one bull, one bear
+        return False
+
+    closed_count = 0
+    for underlying, positions in by_underlying.items():
+        if len(positions) < 2:
+            continue
+
+        # Check for opposing pairs within this group
+        to_close: set = set()
+        for i in range(len(positions)):
+            if id(positions[i]) in to_close:
+                continue
+            for j in range(i + 1, len(positions)):
+                if id(positions[j]) in to_close:
+                    continue
+                if _positions_oppose(positions[i], positions[j]):
+                    # Keep the newer one, close the older one
+                    older = positions[i]
+                    to_close.add(id(older))
+                    print(
+                        f"[paper] conflict: {underlying} has opposing positions "
+                        f"{positions[i].execution_ticker} ({positions[i].signal_type}) vs "
+                        f"{positions[j].execution_ticker} ({positions[j].signal_type}) — "
+                        f"closing older {older.execution_ticker}"
+                    )
+
+        # Also cleanup: if there are >1 remaining for the same underlying, keep the newest
+        if len(positions) - len(to_close) > 1:
+            # Keep the most recently entered, close the rest
+            remaining = [p for p in positions if id(p) not in to_close]
+            remaining.sort(key=lambda p: _safe_utc(p.entered_at) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            for extra in remaining[1:]:
+                to_close.add(id(extra))
+                print(
+                    f"[paper] cleanup: {underlying} has {len(remaining)} remaining positions after conflict resolution — "
+                    f"closing excess {extra.execution_ticker} (entered {_safe_utc(extra.entered_at)})"
+                )
+
+        for pos in positions:
+            if id(pos) not in to_close:
+                continue
+            exit_price = _resolve_position_market_price(pos, quotes_by_symbol)
+            if exit_price <= 0:
+                exit_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            if exit_price <= 0:
+                print(f"[paper] conflict: cannot close {pos.execution_ticker} — no price available")
+                continue
+            _close_position(pos, exit_price, now, db, reason="conflict_resolution")
+            alpaca_pending.append((pos, "close"))
+            closed_count += 1
+
+    if closed_count:
+        db.commit()
+        print(f"[paper] conflict resolution: closed {closed_count} conflicting position(s)")
+
+    return closed_count
 
 
 def market_status(allow_extended_hours: bool = True) -> Dict[str, Any]:
@@ -473,6 +595,14 @@ def process_signals(
     # Collect (paper_trade_obj, "open"|"close") for Alpaca dispatch after commit
     _alpaca_pending: list = []
 
+    # ── CONFLICT RESOLUTION (runs unconditionally, even when market is closed) ──
+    # Scan all open positions and close any that share the same underlying with
+    # opposing directions (e.g., SPXL bull + SPXS bear for SPY). This prevents
+    # positions from accumulating across weekend/overnight runs.
+    now = datetime.now(timezone.utc)
+    _resolve_underlying_conflicts(db, quotes_by_symbol, now, _alpaca_pending)
+    # ─────────────────────────────────────────────────────────────────────────────
+
     # Always check for expired windows first, even if market is closed.
     # Pass _alpaca_pending so actual window-expired closes are queued for Alpaca
     # dispatch at the end of this function alongside all other lifecycle events.
@@ -489,7 +619,6 @@ def process_signals(
             {"skipped": True, "reason": "market_closed", "session": session["label"]}
         ]
 
-    now = datetime.now(timezone.utc)
     actions: List[Dict[str, Any]] = [_expired_action(ea) for ea in expired_actions]
 
     # Portfolio cap — seed running exposure from Alpaca when connected so external
@@ -1137,13 +1266,24 @@ def close_positions_for_removed_symbols(db, removed_symbols: List[str]) -> List[
 
 
 def _dispatch_alpaca_orders(db, pending: list, config) -> None:
-    """Fire-and-forget Alpaca order dispatch after paper trades are committed."""
+    """Fire-and-forget Alpaca order dispatch after paper trades are committed.
+
+    Closes are dispatched FIRST, then opens. This ensures that when a direction
+    flip occurs, the old position is fully closed before the new one is opened,
+    preventing simultaneous opposing positions in the Alpaca account.
+    """
     if not pending or config is None:
         return
     try:
         from services.alpaca_broker import maybe_execute_alpaca_order
+        # Dispatch all closes first
         for trade, event in pending:
-            maybe_execute_alpaca_order(db, trade, event, config)
+            if event == "close":
+                maybe_execute_alpaca_order(db, trade, event, config)
+        # Then dispatch all opens
+        for trade, event in pending:
+            if event == "open":
+                maybe_execute_alpaca_order(db, trade, event, config)
     except ImportError:
         pass
     except Exception as exc:

@@ -912,12 +912,10 @@ def _get_pdt_block_reason(broker: "AlpacaBroker", paper_trade, event: str, convi
             )
         return None
 
-    if event == "close" and _same_trading_day_as_now(getattr(paper_trade, "entered_at", None)):
-        if is_pdt_flagged or daytrade_count >= 3:
-            return (
-                f"PDT protection: live account equity ${equity:.2f} with "
-                f"daytrade_count={daytrade_count} blocks same-day close"
-            )
+    if event == "close":
+        # Always allow closes — PDT only restricts new openings. You can always
+        # sell what you own regardless of day trade count.
+        return None
     return None
 
 
@@ -1119,6 +1117,29 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
             )
             return
 
+        # ── Full position close via Alpaca's endpoint ──
+        # Uses close_position() which tells Alpaca to sell the EXACT remaining
+        # quantity including any residual dust (e.g., 0.00003 shares from
+        # partial fills). This is safer than computing a qty ourselves.
+        try:
+            response = broker.close_position(symbol)
+            _record_alpaca_order(
+                db, paper_id, side, symbol, None, None,
+                response, broker.mode, False, None, None,
+            )
+            print(
+                f"[alpaca] close {side} {symbol}: "
+                f"order_id={response.get('id')} status={response.get('status')} "
+                f"qty={response.get('qty')} filled_qty={response.get('filled_qty')}"
+            )
+        except Exception as exc:
+            _record_alpaca_order_error(
+                db, paper_id, side, symbol, None,
+                str(exc), broker.mode,
+            )
+            print(f"[alpaca] close failed for {symbol} (non-fatal): {exc}")
+        return
+
     # ── Build order parameters ───────────────────────────────────────────────
     ext_hours  = _is_extended_hours_now(config)
     slippage   = float(getattr(config, "alpaca_limit_slippage_pct", 0.002) or 0.002)
@@ -1130,19 +1151,10 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
 
     if ext_hours:
         # Pre/post-market: Alpaca requires explicit extended_hours + limit + qty.
+        # For extended hours closes, Alpaca does NOT support close_position endpoint,
+        # so we fall back to computing qty.
         if event == "open" and entry_price > 0 and notional > 0:
             qty = round(notional / entry_price, 6)
-        elif event == "close":
-            managed_qty = _get_managed_trade_qty(db, paper_id, broker.mode)
-            preserved_manual_qty = _get_managed_trade_baseline_qty(db, paper_id, broker.mode)
-            closeable_live_qty = max(0.0, float(live_qty or 0.0) - preserved_manual_qty)
-            qty = min(managed_qty, closeable_live_qty)
-            if qty <= 0:
-                print(
-                    f"[alpaca] skipping close for {symbol} (paper_id={paper_id}): "
-                    "no app-managed quantity remains after preserving manual holdings"
-                )
-                return
         elif shares > 0:
             qty = shares
         elif entry_price > 0:
@@ -1160,17 +1172,6 @@ def maybe_execute_alpaca_order(db, paper_trade, event: str, config) -> None:
         )
         limit_price = max(0.01, limit_price)
         order_type = "limit"
-    elif event == "close":
-        managed_qty = _get_managed_trade_qty(db, paper_id, broker.mode)
-        preserved_manual_qty = _get_managed_trade_baseline_qty(db, paper_id, broker.mode)
-        closeable_live_qty = max(0.0, float(live_qty or 0.0) - preserved_manual_qty)
-        qty = min(managed_qty, closeable_live_qty)
-        if qty <= 0:
-            print(
-                f"[alpaca] skipping close for {symbol} (paper_id={paper_id}): "
-                "no app-managed quantity remains after preserving manual holdings"
-            )
-            return
     else:
         use_notional = notional
         if order_type == "limit" and entry_price > 0:
